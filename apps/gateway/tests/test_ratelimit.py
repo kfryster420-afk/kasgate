@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import get_settings
 from app.models import Settlement
 from app.proxy import lock_key
-from app.schemas import HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_SIGNATURE
+from app.schemas import HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_SIGNATURE, X402ErrorBody
 from tests.conftest import MERCHANT_ADDRESS, Seed, StubEngine, Upstream, make_asgi_client, make_signature_header
 
 TX = "cd" * 32
@@ -86,6 +86,15 @@ async def register(client: httpx.AsyncClient, index: int) -> int:
 # ---------------------------------------------------------------- limits come from settings
 
 
+async def test_v1_429_keeps_the_detail_body(client: httpx.AsyncClient, override_settings: SettingsOverride) -> None:
+    override_settings(rl_merchant_create_per_hour=1)
+    assert await register(client, 1) == 201
+    blocked = await client.post("/v1/merchants", json={"kaspa_address": new_address(2), "display_name": "x"})
+    assert blocked.status_code == 429
+    assert blocked.json() == {"detail": "rate limit exceeded; retry later"}
+    assert int(blocked.headers["retry-after"]) > 0
+
+
 async def test_merchant_limit_comes_from_settings(
     client: httpx.AsyncClient, override_settings: SettingsOverride
 ) -> None:
@@ -136,7 +145,11 @@ async def test_unpaid_proxy_requests_are_limited_per_ip(
     codes = [(await client.get("/p/weather")).status_code for _ in range(5)]
     assert codes == [402, 402, 402, 429, 429]
     blocked = await client.get("/p/weather")
+    assert blocked.status_code == 429
+    assert blocked.json()["error"] == "rate_limited"
+    assert blocked.json()["accepts"] is None
     assert 0 < int(blocked.headers["retry-after"]) <= 60
+    assert X402ErrorBody.model_validate(blocked.json()).error == "rate_limited"
     assert 0 < await redis.ttl("kasgate:rl:proxy_unpaid:ip:127.0.0.1") <= 60
     async with make_asgi_client(client, "10.2.2.2") as other:
         assert (await other.get("/p/weather")).status_code == 402
@@ -226,6 +239,10 @@ async def test_fail_closed_returns_503_when_redis_is_down(
     response = await client.request(method, path, json=body)
     assert response.status_code == 503
     assert response.headers["retry-after"] == "5"
+    if path.startswith("/p/"):
+        assert X402ErrorBody.model_validate(response.json()).error == "service_unavailable"
+    else:
+        assert response.json() == {"detail": "service temporarily unavailable"}
 
 
 async def test_fail_open_passes_when_redis_is_down(
@@ -254,6 +271,8 @@ async def test_paid_proxy_request_is_503_not_500_when_redis_is_down(
         response = await client.get("/p/weather", headers={HEADER_PAYMENT_SIGNATURE: make_signature_header(TX)})
         assert response.status_code == 503
         assert response.json()["error"] == "service_unavailable"
+        assert response.headers["retry-after"] == "5"
+        X402ErrorBody.model_validate(response.json())
     assert stub_engine.calls == []
     assert upstream.requests == []
     async with sessionmaker() as session:

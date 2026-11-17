@@ -21,6 +21,7 @@ from app.schemas import (
     HEADER_PAYMENT_SIGNATURE,
     PaymentRequired,
     PaymentResponse,
+    X402ErrorBody,
 )
 from tests.conftest import (
     MERCHANT_ADDRESS,
@@ -367,6 +368,7 @@ async def test_node_unavailable_is_503_and_releases_lock(
     response = await client.get("/p/weather", headers=pay())
     assert response.status_code == 503
     assert response.json()["error"] == "rpc_unavailable"
+    X402ErrorBody.model_validate(response.json())
     assert response.headers["retry-after"] == "5"
     assert await redis.get(lock_key(TX)) is None
 
@@ -377,6 +379,8 @@ async def test_unexpected_engine_crash_is_503_and_releases_lock(
     stub_engine.error = RuntimeError("boom")
     response = await client.get("/p/weather", headers=pay())
     assert response.status_code == 503
+    assert response.json()["error"] == "service_unavailable"
+    assert response.headers["retry-after"] == "5"
     assert await redis.get(lock_key(TX)) is None
 
 
@@ -422,6 +426,9 @@ async def test_redis_outage_fails_closed(
     monkeypatch.setattr(redis, "set", broken)
     response = await client.get("/p/weather", headers=pay())
     assert response.status_code == 503
+    assert response.json()["error"] == "service_unavailable"
+    assert response.headers["retry-after"] == "5"
+    X402ErrorBody.model_validate(response.json())
     assert stub_engine.calls == []
 
 
@@ -463,6 +470,9 @@ async def test_unrecorded_settlement_is_dead_lettered(
     with caplog.at_level("ERROR", logger="kasgate.proxy"):
         response = await client.get("/p/weather/x", headers=pay())
     assert response.status_code == 503
+    assert response.json()["error"] == "service_unavailable"
+    assert response.headers["retry-after"] == "5"
+    X402ErrorBody.model_validate(response.json())
     assert upstream.requests == []
     assert await redis.get(lock_key(TX)) is not None
     queued = await redis.lrange("kasgate:deadletter:settlements", 0, -1)
@@ -507,3 +517,25 @@ async def test_dead_letter_failure_logs_payload_and_still_returns_503(
     assert f'"txId": "{TX}"' in logged[0]
     assert '"merchantAmountSompi": 1970000000' in logged[0]
     assert await redis.get(lock_key(TX)) is not None
+
+
+async def test_unreadable_upstream_credentials_are_503_service_unavailable_before_payment(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    stub_engine: StubEngine,
+    redis: Any,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    from sqlalchemy import update
+
+    from app.models import Endpoint
+
+    async with sessionmaker() as session:
+        await session.execute(update(Endpoint).values(upstream_headers_encrypted=b"not-a-fernet-token"))
+        await session.commit()
+    response = await client.get("/p/weather", headers=pay())
+    assert response.status_code == 503
+    assert X402ErrorBody.model_validate(response.json()).error == "service_unavailable"
+    assert response.headers["retry-after"] == "5"
+    assert stub_engine.calls == []
+    assert await redis.get(lock_key(TX)) is None

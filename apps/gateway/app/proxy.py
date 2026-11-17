@@ -25,7 +25,7 @@ from typing import Annotated, Final, cast
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 from redis.asyncio import Redis
@@ -72,6 +72,7 @@ logger = logging.getLogger("kasgate.proxy")
 REPLAY_LOCK_PREFIX: Final = "kasgate:tx:"
 REPLAY_LOCK_TTL_SECONDS: Final = 600
 DEAD_LETTER_KEY: Final = "kasgate:deadletter:settlements"
+SERVICE_UNAVAILABLE_RETRY_SECONDS: Final = "5"
 UPSTREAM_TIMEOUT_SECONDS: Final = 30.0
 MAX_REQUEST_BODY_BYTES: Final = 10 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES: Final = 32 * 1024 * 1024
@@ -126,8 +127,13 @@ def _error(
     required: PaymentRequired | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
-    """x402 error response. `error` outside the X402ErrorBody vocabulary yields a plain `{error, message}` body."""
+    """x402 error response. `error` outside the X402ErrorBody vocabulary yields a plain `{error, message}` body.
+
+    Every 503 carries `Retry-After`; 429 callers pass the limiter's own `Retry-After`.
+    """
     out_headers = dict(headers or {})
+    if status_code == 503:
+        out_headers.setdefault("Retry-After", SERVICE_UNAVAILABLE_RETRY_SECONDS)
     if required is not None:
         out_headers[HEADER_PAYMENT_REQUIRED] = required.to_header()
     try:
@@ -225,9 +231,7 @@ async def _prepare_upstream(request: Request, endpoint: Endpoint, path_suffix: s
         merchant_headers = decrypt_headers(endpoint.upstream_headers_encrypted)
     except ValueError as exc:
         logger.error("endpoint %s has unreadable upstream headers: %s", endpoint.slug, exc)
-        raise RequestRejectedError(
-            503, "endpoint_misconfigured", "endpoint upstream credentials are unavailable"
-        ) from exc
+        raise RequestRejectedError(503, "service_unavailable", "endpoint upstream credentials are unavailable") from exc
     body = await _read_body(request)
     headers = build_upstream_headers(request.headers.items(), merchant_headers)
     return PreparedUpstream(url=url, headers=headers, body=body)
@@ -402,7 +406,15 @@ async def paywalled_proxy(
 ) -> Response:
     signature_header = request.headers.get(HEADER_PAYMENT_SIGNATURE)
     if not signature_header:
-        await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
+        try:
+            await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
+        except HTTPException as exc:
+            return _error(
+                exc.status_code,
+                "rate_limited" if exc.status_code == 429 else "service_unavailable",
+                str(exc.detail),
+                headers=dict(exc.headers or {}),
+            )
     row = (
         await session.execute(
             select(Endpoint, Merchant.kaspa_address)
@@ -426,7 +438,7 @@ async def paywalled_proxy(
         required = PaymentRequired.for_endpoint(endpoint.price_sompi, merchant_address)
     except ValueError as exc:
         logger.error("endpoint %s cannot be priced: %s", slug, exc)
-        return _error(503, "endpoint_misconfigured", "endpoint price is not currently payable")
+        return _error(503, "service_unavailable", "endpoint price is not currently payable")
 
     if not signature_header:
         return _error(402, "payment_required", "payment is required to access this resource", required=required)
