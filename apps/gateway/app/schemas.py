@@ -1,0 +1,539 @@
+import base64
+import binascii
+import ipaddress
+import re
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Annotated, Literal, Self
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    HttpUrl,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from app.config import (
+    BPS_DENOMINATOR,
+    NETWORK_ADDRESS_PREFIX,
+    PLATFORM_FEE_BPS,
+    SOMPI_PER_KAS,
+    KaspaNetwork,
+    get_settings,
+)
+from app.models import SettlementStatus
+
+HEADER_PAYMENT_REQUIRED = "PAYMENT-REQUIRED"
+HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
+HEADER_PAYMENT_RESPONSE = "PAYMENT-RESPONSE"
+
+PROXY_PATH_PREFIX = "/p"
+MAX_HEADER_BYTES = 131_072
+
+KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
+TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
+SOMPI_STR_RE = r"^[1-9][0-9]{0,18}$"
+
+HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+Sompi = Annotated[int, Field(gt=0, le=9_223_372_036_854_775_807)]
+SompiStr = Annotated[str, Field(pattern=SOMPI_STR_RE)]
+UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
+
+
+def sompi_to_kas(sompi: int) -> str:
+    return format(Decimal(sompi) / Decimal(SOMPI_PER_KAS), "f")
+
+
+def validate_kaspa_address(value: str, network: str | None = None) -> str:
+    value = value.strip().lower()
+    if not KASPA_ADDRESS_RE.fullmatch(value):
+        raise ValueError("invalid Kaspa address")
+    target = network or get_settings().kaspa_network
+    prefix = NETWORK_ADDRESS_PREFIX[target]
+    if not value.startswith(f"{prefix}:"):
+        raise ValueError(f"address must use the '{prefix}:' prefix on {target}")
+    return value
+
+
+def validate_tx_id(value: str) -> str:
+    value = value.strip().lower()
+    if not TX_ID_RE.fullmatch(value):
+        raise ValueError("txId must be 64 lowercase hex characters")
+    return value
+
+
+class FeeSplit(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total_sompi: int
+    merchant_sompi: int
+    fee_sompi: int
+
+
+def compute_fee_split(total_sompi: int, min_output_sompi: int | None = None) -> FeeSplit:
+    """Output 0 (merchant) = total - fee; Output 1 (treasury) = ceil(total * 150 / 10_000).
+
+    Raises ValueError when either output would fall below the KIP-9 storage-mass floor.
+    """
+    floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
+    if total_sompi <= 0:
+        raise ValueError("total_sompi must be positive")
+    fee = (total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
+    merchant = total_sompi - fee
+    if fee < floor or merchant < floor:
+        raise ValueError(
+            f"price {total_sompi} sompi produces outputs below MIN_OUTPUT_SOMPI={floor}; "
+            f"minimum price is {min_price_sompi(floor)} sompi"
+        )
+    return FeeSplit(total_sompi=total_sompi, merchant_sompi=merchant, fee_sompi=fee)
+
+
+def min_price_sompi(min_output_sompi: int | None = None) -> int:
+    floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
+    by_fee = ((floor - 1) * BPS_DENOMINATOR) // PLATFORM_FEE_BPS + 1
+    by_merchant = floor + (floor * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
+    return max(by_fee, by_merchant)
+
+
+def _reject_private_host(url: HttpUrl) -> HttpUrl:
+    host = (url.host or "").strip("[]").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost") or host.endswith(".internal"):
+        raise ValueError("upstream_url may not target a local host")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return url
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        raise ValueError("upstream_url may not target a private or reserved IP")
+    return url
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ReadModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------------------------------------------------------------- x402 headers
+
+
+class X402Header(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    def to_header(self) -> str:
+        return base64.b64encode(self.model_dump_json().encode("utf-8")).decode("ascii")
+
+    @classmethod
+    def from_header(cls, value: str) -> Self:
+        if not value or len(value) > MAX_HEADER_BYTES:
+            raise ValueError("header missing or too large")
+        try:
+            raw = base64.b64decode(value.strip(), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("header is not valid Base64") from exc
+        return cls.model_validate_json(raw)
+
+
+class PlatformFee(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    feeTo: str
+    feeAmount: SompiStr
+
+    @field_validator("feeTo")
+    @classmethod
+    def _fee_to(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class PaymentRequired(X402Header):
+    """Body of the PAYMENT-REQUIRED header. `amount` is the TOTAL the payer sends across both outputs."""
+
+    x402Version: Literal[2] = 2
+    scheme: Literal["kaspa-exact-v1"] = "kaspa-exact-v1"
+    network: KaspaNetwork
+    asset: Literal["KAS"] = "KAS"
+    amount: SompiStr
+    payTo: str
+    platformFee: PlatformFee
+
+    @field_validator("payTo")
+    @classmethod
+    def _pay_to(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @model_validator(mode="after")
+    def _check_split(self) -> Self:
+        for addr in (self.payTo, self.platformFee.feeTo):
+            validate_kaspa_address(addr, self.network)
+        split = compute_fee_split(int(self.amount))
+        if int(self.platformFee.feeAmount) != split.fee_sompi:
+            raise ValueError(f"platformFee.feeAmount must be {split.fee_sompi} for amount {self.amount}")
+        return self
+
+    @property
+    def merchant_amount_sompi(self) -> int:
+        return int(self.amount) - int(self.platformFee.feeAmount)
+
+    @property
+    def fee_amount_sompi(self) -> int:
+        return int(self.platformFee.feeAmount)
+
+    @classmethod
+    def for_endpoint(cls, price_sompi: int, pay_to: str) -> Self:
+        settings = get_settings()
+        split = compute_fee_split(price_sompi)
+        return cls(
+            network=settings.kaspa_network,
+            amount=str(split.total_sompi),
+            payTo=pay_to,
+            platformFee=PlatformFee(feeTo=settings.kasgate_treasury_address, feeAmount=str(split.fee_sompi)),
+        )
+
+
+class PaymentSignature(X402Header):
+    """Body of the PAYMENT-SIGNATURE header. `rawTx` is the JSON-serialised signed Kaspa transaction."""
+
+    txId: str
+    rawTx: str = Field(min_length=2, max_length=100_000)
+    payerAddress: str
+
+    @field_validator("txId")
+    @classmethod
+    def _tx(cls, v: str) -> str:
+        return validate_tx_id(v)
+
+    @field_validator("payerAddress")
+    @classmethod
+    def _payer(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class PaymentResponse(X402Header):
+    txId: str
+    settled: Literal[True] = True
+    network: KaspaNetwork
+    usdValueAtSettlement: UsdDecimal
+
+    @field_validator("txId")
+    @classmethod
+    def _tx(cls, v: str) -> str:
+        return validate_tx_id(v)
+
+
+class X402ErrorBody(StrictModel):
+    error: Literal[
+        "payment_required",
+        "invalid_payment_header",
+        "payment_replayed",
+        "underpaid",
+        "invalid_fee_split",
+        "wrong_network",
+        "tx_rejected",
+        "rpc_unavailable",
+        "endpoint_not_found",
+        "method_not_allowed",
+        "upstream_error",
+    ]
+    message: str
+    accepts: PaymentRequired | None = None
+
+
+# ---------------------------------------------------------------- merchants
+
+
+class MerchantCreate(StrictModel):
+    kaspa_address: str
+    display_name: str = Field(min_length=1, max_length=120)
+    email: EmailStr | None = None
+
+    @field_validator("kaspa_address")
+    @classmethod
+    def _addr(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class MerchantRead(ReadModel):
+    id: uuid.UUID
+    kaspa_address: str
+    display_name: str
+    email: str | None
+    is_active: bool
+    created_at: datetime
+
+
+class MerchantCreated(BaseModel):
+    merchant: MerchantRead
+    api_key: str = Field(description="Shown once. Send as 'Authorization: Bearer <api_key>'.")
+
+
+class AuthChallengeRequest(StrictModel):
+    kaspa_address: str
+
+    @field_validator("kaspa_address")
+    @classmethod
+    def _addr(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class AuthChallenge(BaseModel):
+    kaspa_address: str
+    challenge: str = Field(description="Exact message the wallet must sign with sign_message.")
+    expires_at: datetime
+
+
+class AuthVerifyRequest(StrictModel):
+    kaspa_address: str
+    challenge: str = Field(min_length=16, max_length=512)
+    public_key: str = Field(pattern=r"^(?:[0-9a-f]{64}|0[23][0-9a-f]{64})$")
+    signature: str = Field(pattern=r"^[0-9a-f]{128}$")
+
+    @field_validator("kaspa_address")
+    @classmethod
+    def _addr(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @field_validator("public_key", mode="before")
+    @classmethod
+    def _lower(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _normalise_signature(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        v = v.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{128}", v):
+            return v.lower()
+        try:
+            raw = base64.b64decode(v, validate=True)
+        except (binascii.Error, ValueError):
+            return v
+        if len(raw) == 65:
+            raw = raw[1:]
+        return raw.hex() if len(raw) == 64 else v
+
+
+# ---------------------------------------------------------------- endpoints
+
+
+def _default_methods() -> list[HttpMethod]:
+    return ["GET"]
+
+
+class EndpointCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    slug: Annotated[str, Field(pattern=SLUG_RE)] | None = None
+    description: str | None = Field(default=None, max_length=2000)
+    category: str | None = Field(default=None, max_length=60)
+    upstream_url: HttpUrl
+    upstream_headers: dict[str, str] = Field(default_factory=dict, max_length=20)
+    price_sompi: Sompi
+    allowed_methods: list[HttpMethod] = Field(default_factory=_default_methods, min_length=1, max_length=5)
+    is_public_listed: bool = True
+
+    @field_validator("upstream_url")
+    @classmethod
+    def _url(cls, v: HttpUrl) -> HttpUrl:
+        return _reject_private_host(v)
+
+    @field_validator("price_sompi")
+    @classmethod
+    def _price(cls, v: int) -> int:
+        compute_fee_split(v)
+        return v
+
+    @field_validator("allowed_methods")
+    @classmethod
+    def _methods(cls, v: list[str]) -> list[str]:
+        return sorted(set(v))
+
+
+class EndpointUpdate(StrictModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    category: str | None = Field(default=None, max_length=60)
+    upstream_url: HttpUrl | None = None
+    upstream_headers: dict[str, str] | None = Field(default=None, max_length=20)
+    price_sompi: Sompi | None = None
+    allowed_methods: list[HttpMethod] | None = Field(default=None, min_length=1, max_length=5)
+    is_active: bool | None = None
+    is_public_listed: bool | None = None
+
+    @field_validator("upstream_url")
+    @classmethod
+    def _url(cls, v: HttpUrl | None) -> HttpUrl | None:
+        return None if v is None else _reject_private_host(v)
+
+    @field_validator("price_sompi")
+    @classmethod
+    def _price(cls, v: int | None) -> int | None:
+        if v is not None:
+            compute_fee_split(v)
+        return v
+
+    @field_validator("allowed_methods")
+    @classmethod
+    def _methods(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else sorted(set(v))
+
+
+class EndpointRead(ReadModel):
+    id: uuid.UUID
+    merchant_id: uuid.UUID
+    slug: str
+    name: str
+    description: str | None
+    category: str | None
+    upstream_url: str
+    price_sompi: int
+    allowed_methods: list[str]
+    is_active: bool
+    is_public_listed: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def price_kas(self) -> str:
+        return sompi_to_kas(self.price_sompi)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def proxy_url(self) -> str:
+        return f"{get_settings().public_base_url}{PROXY_PATH_PREFIX}/{self.slug}"
+
+
+# ---------------------------------------------------------------- analytics & tax
+
+
+class SettlementRead(ReadModel):
+    id: uuid.UUID
+    tx_id: str
+    endpoint_id: uuid.UUID
+    merchant_id: uuid.UUID
+    network: str
+    payer_address: str
+    merchant_address: str
+    treasury_address: str
+    amount_sompi: int
+    merchant_amount_sompi: int
+    fee_amount_sompi: int
+    kas_usd_rate: Decimal | None
+    usd_value_at_settlement: Decimal | None
+    status: SettlementStatus
+    failure_reason: str | None
+    request_method: str
+    request_path: str
+    upstream_status_code: int | None
+    created_at: datetime
+    settled_at: datetime | None
+
+
+class DailyRevenue(BaseModel):
+    day: date
+    call_count: int
+    gross_sompi: int
+    merchant_sompi: int
+    fee_sompi: int
+    usd_value: Decimal
+
+
+class EndpointRevenue(BaseModel):
+    endpoint_id: uuid.UUID
+    slug: str
+    name: str
+    call_count: int
+    merchant_sompi: int
+    usd_value: Decimal
+
+
+class MerchantAnalytics(BaseModel):
+    merchant_id: uuid.UUID
+    network: KaspaNetwork
+    period_start: datetime
+    period_end: datetime
+    total_calls: int
+    gross_sompi: int
+    merchant_sompi: int
+    fee_sompi: int
+    usd_value: Decimal
+    daily: list[DailyRevenue]
+    by_endpoint: list[EndpointRevenue]
+
+
+TAX_CSV_COLUMNS: tuple[str, ...] = (
+    "settled_at_utc",
+    "tx_id",
+    "network",
+    "endpoint_slug",
+    "payer_address",
+    "gross_kas",
+    "merchant_kas",
+    "platform_fee_kas",
+    "kas_usd_rate",
+    "usd_value_at_settlement",
+)
+
+
+class TaxReportRow(BaseModel):
+    settled_at_utc: datetime
+    tx_id: str
+    network: str
+    endpoint_slug: str
+    payer_address: str
+    gross_kas: str
+    merchant_kas: str
+    platform_fee_kas: str
+    kas_usd_rate: Decimal | None
+    usd_value_at_settlement: Decimal | None
+
+    def as_csv_row(self) -> list[str]:
+        data = self.model_dump(mode="json")
+        return ["" if data[c] is None else str(data[c]) for c in TAX_CSV_COLUMNS]
+
+
+# ---------------------------------------------------------------- public directory
+
+
+class DirectoryEntry(BaseModel):
+    slug: str
+    name: str
+    description: str | None
+    category: str | None
+    merchant_display_name: str
+    pay_to: str
+    price_sompi: int
+    price_kas: str
+    allowed_methods: list[str]
+    proxy_url: str
+
+
+class DirectoryManifest(BaseModel):
+    manifest_version: Literal[1] = 1
+    x402_version: Literal[2] = 2
+    scheme: Literal["kaspa-exact-v1"] = "kaspa-exact-v1"
+    asset: Literal["KAS"] = "KAS"
+    network: KaspaNetwork
+    gateway_base_url: str
+    platform_fee_bps: int = PLATFORM_FEE_BPS
+    min_output_sompi: int
+    generated_at: datetime
+    endpoints: list[DirectoryEntry]
+
+
+class HealthStatus(BaseModel):
+    status: Literal["ok", "degraded"]
+    network: KaspaNetwork
+    database: bool
+    redis: bool
+    kaspa_rpc: bool

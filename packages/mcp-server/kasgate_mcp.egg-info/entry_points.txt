@@ -1,0 +1,2 @@
+[console_scripts]
+kasgate-mcp = kasgate_mcp.server:main

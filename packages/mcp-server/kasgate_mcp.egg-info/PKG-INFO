@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: kasgate-mcp
+Version: 0.1.0
+Summary: MCP server (stdio) that lets AI agents browse and pay for KasGate endpoints with a capped KAS budget.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: mcp>=1.27
+Requires-Dist: httpx<1.0,>=0.27
+Requires-Dist: kasgate-client>=0.1.0
+Provides-Extra: test
+Requires-Dist: pytest>=8; extra == "test"
+Requires-Dist: pytest-asyncio>=0.24; extra == "test"
+Requires-Dist: pydantic-settings<3.0,>=2.6; extra == "test"
+Requires-Dist: email-validator<3.0,>=2.2; extra == "test"
+Requires-Dist: sqlalchemy[asyncio]<2.1,>=2.0.36; extra == "test"
+
+# kasgate-mcp
+
+Stdio MCP server for KasGate. Tools:
+
+| tool | purpose |
+| --- | --- |
+| `list_directory` | `GET /v1/directory`: the public catalog of paid endpoints. |
+| `quote_endpoint(slug)` | `GET /v1/quote/{slug}`: price and fee split, nothing is paid. |
+| `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. |
+
+Environment: `KASGATE_BUYER_PRIVATE_KEY` (hex, required for paid calls), `KASGATE_GATEWAY_URL` (default
+`http://localhost:8000`), `KASGATE_NETWORK` (default `kaspa:testnet-10`), `KASGATE_RPC_URL` (optional),
+`KASGATE_MAX_PRICE_KAS` (hard ceiling per call, default `20`; `max_price_kas` can only lower it).
+
+```json
+{"mcpServers": {"kasgate": {"command": "kasgate-mcp", "env": {"KASGATE_BUYER_PRIVATE_KEY": "<hex>", "KASGATE_GATEWAY_URL": "http://localhost:8000"}}}}
+```
+
+Works with mcp 2.x (`MCPServer`) and falls back to mcp 1.x (`FastMCP`).
