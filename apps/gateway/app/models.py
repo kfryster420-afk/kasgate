@@ -135,6 +135,8 @@ class Settlement(Base):
     request_method: Mapped[str] = mapped_column(String(10), nullable=False)
     request_path: Mapped[str] = mapped_column(Text, nullable=False)
     upstream_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payment_nonce: Mapped[str] = mapped_column(String(32), nullable=False)
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -143,6 +145,7 @@ class Settlement(Base):
 
     __table_args__ = (
         Index("ix_settlements_tx_id", "tx_id", unique=True),
+        Index("ix_settlements_payment_nonce", "payment_nonce", unique=True),
         Index("ix_settlements_merchant_created", "merchant_id", "created_at"),
         Index("ix_settlements_endpoint_created", "endpoint_id", "created_at"),
         Index("ix_settlements_payer_address", "payer_address"),
@@ -150,4 +153,6 @@ class Settlement(Base):
         CheckConstraint("merchant_amount_sompi > 0 AND fee_amount_sompi > 0", name="outputs_positive"),
         CheckConstraint("merchant_amount_sompi + fee_amount_sompi = amount_sompi", name="split_sums_to_total"),
         CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
+        CheckConstraint("payment_nonce ~ '^[0-9a-f]{32}$'", name="payment_nonce_hex32"),
+        CheckConstraint("delivery_attempts >= 1", name="delivery_attempts_positive"),
     )

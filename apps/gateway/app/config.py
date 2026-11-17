@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     cors_origins: list[str] = ["http://localhost:3000"]
     payment_max_age_seconds: int = Field(default=120, ge=10, le=3600)
+    settlement_mode: Literal["accepted", "mempool"] = "accepted"
+    settlement_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
+    redelivery_window_seconds: int = Field(default=600, ge=0, le=3600)
+    redelivery_max_attempts: int = Field(default=3, ge=0, le=10)
+    session_ttl_seconds: int = Field(default=604_800, ge=300)
     kas_usd_price_url: str = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd"
     rate_limit_enabled: bool = True
     rate_limit_fail_closed: bool = True
@@ -53,6 +58,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"KASGATE_TREASURY_ADDRESS must start with '{self.address_prefix}:' on {self.kaspa_network}"
             )
+        if self.kaspa_network == "kaspa:mainnet" and not self.public_base_url.startswith("https://"):
+            raise ValueError("PUBLIC_BASE_URL must use https:// on kaspa:mainnet")
         if self.public_base_url.endswith("/"):
             self.public_base_url = self.public_base_url.rstrip("/")
         return self

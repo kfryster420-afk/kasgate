@@ -2,11 +2,13 @@ import base64
 import binascii
 import ipaddress
 import re
+import secrets
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Self
 
+from kaspa import Address
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -33,12 +35,17 @@ HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
 HEADER_PAYMENT_RESPONSE = "PAYMENT-RESPONSE"
 
 PROXY_PATH_PREFIX = "/p"
-MAX_HEADER_BYTES = 131_072
+MAX_HEADER_BYTES = 40_960
+MAX_RAW_TX_CHARS = 24_000
+PAYMENT_PAYLOAD_PREFIX = "kasgate:v1:"
+NONCE_RE = r"^[0-9a-f]{32}$"
+AUTH_PURPOSE = "Sign in to the KasGate merchant dashboard. This does not authorise any payment."
+REGISTER_PURPOSE = "Register this address as a KasGate merchant. This does not authorise any payment."
 
 KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
 TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
-SOMPI_STR_RE = r"^[1-9][0-9]{0,18}$"
+SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 Sompi = Annotated[int, Field(gt=0, le=9_223_372_036_854_775_807)]
@@ -54,6 +61,8 @@ def validate_kaspa_address(value: str, network: str | None = None) -> str:
     value = value.strip().lower()
     if not KASPA_ADDRESS_RE.fullmatch(value):
         raise ValueError("invalid Kaspa address")
+    if not Address.validate(value):
+        raise ValueError("invalid Kaspa address checksum")
     target = network or get_settings().kaspa_network
     prefix = NETWORK_ADDRESS_PREFIX[target]
     if not value.startswith(f"{prefix}:"):
@@ -109,9 +118,45 @@ def _reject_private_host(url: HttpUrl) -> HttpUrl:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return url
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+    if not ip.is_global or ip.is_multicast:
         raise ValueError("upstream_url may not target a private or reserved IP")
     return url
+
+
+def normalise_signature(v: object) -> object:
+    """Accept 128-hex Schnorr, or Base64 of 64 bytes / 65 bytes (leading header byte dropped)."""
+    if not isinstance(v, str):
+        return v
+    v = v.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{128}", v):
+        return v.lower()
+    try:
+        raw = base64.b64decode(v, validate=True)
+    except (binascii.Error, ValueError):
+        return v
+    if len(raw) == 65:
+        raw = raw[1:]
+    return raw.hex() if len(raw) == 64 else v
+
+
+def new_payment_nonce() -> str:
+    return secrets.token_hex(16)
+
+
+def payment_payload(nonce: str) -> bytes:
+    """Exact bytes the payer must put in the transaction payload to bind the tx to one 402 challenge."""
+    return f"{PAYMENT_PAYLOAD_PREFIX}{nonce}".encode("ascii")
+
+
+def build_auth_challenge(purpose: str, domain: str, address: str, nonce: str, expires_at: datetime) -> str:
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {purpose}\n"
+        f"Address: {address}\n"
+        f"Nonce: {nonce}\n"
+        f"Expires: {expires_at.isoformat()}"
+    )
 
 
 class StrictModel(BaseModel):
@@ -164,6 +209,8 @@ class PaymentRequired(X402Header):
     amount: SompiStr
     payTo: str
     platformFee: PlatformFee
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    expiresAt: datetime
 
     @field_validator("payTo")
     @classmethod
@@ -188,10 +235,12 @@ class PaymentRequired(X402Header):
         return int(self.platformFee.feeAmount)
 
     @classmethod
-    def for_endpoint(cls, price_sompi: int, pay_to: str) -> Self:
+    def for_endpoint(cls, price_sompi: int, pay_to: str, nonce: str, expires_at: datetime) -> Self:
         settings = get_settings()
         split = compute_fee_split(price_sompi)
         return cls(
+            nonce=nonce,
+            expiresAt=expires_at,
             network=settings.kaspa_network,
             amount=str(split.total_sompi),
             payTo=pay_to,
@@ -203,8 +252,9 @@ class PaymentSignature(X402Header):
     """Body of the PAYMENT-SIGNATURE header. `rawTx` is the JSON-serialised signed Kaspa transaction."""
 
     txId: str
-    rawTx: str = Field(min_length=2, max_length=100_000)
+    rawTx: str = Field(min_length=2, max_length=MAX_RAW_TX_CHARS)
     payerAddress: str
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
 
     @field_validator("txId")
     @classmethod
@@ -234,6 +284,7 @@ class X402ErrorBody(StrictModel):
         "payment_required",
         "invalid_payment_header",
         "payment_replayed",
+        "payment_expired",
         "underpaid",
         "invalid_fee_split",
         "wrong_network",
@@ -253,9 +304,24 @@ class X402ErrorBody(StrictModel):
 
 
 class MerchantCreate(StrictModel):
+    """Registration requires a wallet signature over a challenge from POST /v1/auth/challenge?purpose=register."""
+
     kaspa_address: str
     display_name: str = Field(min_length=1, max_length=120)
     email: EmailStr | None = None
+    challenge: str = Field(min_length=16, max_length=512)
+    public_key: str = Field(pattern=r"^(?:[0-9a-f]{64}|0[23][0-9a-f]{64})$")
+    signature: str = Field(pattern=r"^[0-9a-f]{128}$")
+
+    @field_validator("public_key", mode="before")
+    @classmethod
+    def _lower_pub(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _sig(cls, v: object) -> object:
+        return normalise_signature(v)
 
     @field_validator("kaspa_address")
     @classmethod
@@ -274,11 +340,20 @@ class MerchantRead(ReadModel):
 
 class MerchantCreated(BaseModel):
     merchant: MerchantRead
-    api_key: str = Field(description="Shown once. Send as 'Authorization: Bearer <api_key>'.")
+    api_key: str = Field(
+        description="Long-lived automation key (kg_...). Shown once. 'Authorization: Bearer <api_key>'."
+    )
+
+
+class SessionIssued(BaseModel):
+    merchant: MerchantRead
+    session_token: str = Field(description="Dashboard session (kgs_...), 7-day TTL. Does NOT rotate the api_key.")
+    expires_at: datetime
 
 
 class AuthChallengeRequest(StrictModel):
     kaspa_address: str
+    purpose: Literal["login", "register"] = "login"
 
     @field_validator("kaspa_address")
     @classmethod
@@ -311,18 +386,7 @@ class AuthVerifyRequest(StrictModel):
     @field_validator("signature", mode="before")
     @classmethod
     def _normalise_signature(cls, v: object) -> object:
-        if not isinstance(v, str):
-            return v
-        v = v.strip()
-        if re.fullmatch(r"[0-9a-fA-F]{128}", v):
-            return v.lower()
-        try:
-            raw = base64.b64decode(v, validate=True)
-        except (binascii.Error, ValueError):
-            return v
-        if len(raw) == 65:
-            raw = raw[1:]
-        return raw.hex() if len(raw) == 64 else v
+        return normalise_signature(v)
 
 
 # ---------------------------------------------------------------- endpoints
@@ -437,6 +501,8 @@ class SettlementRead(ReadModel):
     request_method: str
     request_path: str
     upstream_status_code: int | None
+    payment_nonce: str
+    delivery_attempts: int
     created_at: datetime
     settled_at: datetime | None
 

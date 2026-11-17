@@ -103,3 +103,36 @@ GET /v1/settlements: limit 1..200 (default 50), offset >= 0
 FastAPI validation errors stay as {"detail": [...]}; x402 errors use X402ErrorBody.
 Proxy path is /p/{slug} (never /v1/{slug}); quotes /v1/quote/{slug}.
 Pricing: fixed sompi only for the MVP (no USD-pegged pricing).
+
+## CONTRACT v2 — security revision after 05 red-team (supersedes earlier lines where they conflict)
+Payment binding (GAP-1, GAP-7, GAP-6 TOCTOU):
+- PaymentRequired gains `nonce` (32 lowercase hex, schemas.new_payment_nonce()) and `expiresAt` (UTC, now + PAYMENT_MAX_AGE_SECONDS).
+  Build: PaymentRequired.for_endpoint(price_sompi, pay_to, nonce, expires_at).
+- Gateway stores the exact issued challenge: Redis `kasgate:nonce:{nonce}` = PaymentRequired JSON + endpoint slug, EX payment_max_age_seconds.
+- PaymentSignature gains `nonce`. The signed tx `payload` MUST equal schemas.payment_payload(nonce) = b"kasgate:v1:" + nonce.
+- On the paid retry the gateway loads `required` FROM THE NONCE (never recomputes), checks slug matches, consumes it atomically (GETDEL) only after
+  successful settlement. Missing/expired nonce -> 402 `payment_expired` with a fresh PAYMENT-REQUIRED.
+- Settlement.payment_nonce is UNIQUE. "Already in mempool/accepted" is success ONLY when the payload nonce is valid and unconsumed.
+Pre-lock verification (GAP-11): run engine.verify() (network-free, finalize()-recomputed id, payload, outputs) BEFORE taking kasgate:tx:{txId}.
+Settlement finality (GAP-2): settings.settlement_mode "accepted" (default) = submit, then wait until the tx is accepted by the virtual chain
+  (subscribe_virtual_chain_changed or poll), up to settlement_timeout_seconds (8 s); timeout -> 503 rpc_unavailable, lock released, nonce kept.
+  "mempool" = old behaviour, testnet demos only. Reject any replacement (submit_transaction_replacement is never used by the gateway).
+Inputs (GAP-4): engine fetches each input's real UTXO entry from the node (get_utxos_by_addresses(payerAddress) + mempool) and uses node values/scripts
+  for mass and for payer attribution; mismatch -> invalid_payment_header.
+Redelivery (GAP-5): same txId + same nonce + same slug, Settlement exists, upstream_status_code is NULL or >= 500, within redelivery_window_seconds and
+  delivery_attempts < redelivery_max_attempts -> re-forward upstream, increment delivery_attempts, return PAYMENT-RESPONSE. Otherwise 409.
+Transport (GAP-6): PUBLIC_BASE_URL must be https on mainnet (enforced in Settings). SDK keeps pinned fee_to/expected_pay_to options.
+Headers (GAP-8): rawTx max 24_000 chars, MAX_HEADER_BYTES 40_960; uvicorn runs with --h11-max-incomplete-event-size 65536.
+SSRF (GAP-9): schema rejects any literal IP that is not ip.is_global (covers 100.64.0.0/10, ::1, ULA) and *.localhost/*.internal.
+  Runtime guard (03) resolves DNS at request time, pins the resolved IP for the connection, rejects non-global IPs (nip.io, localtest.me), no redirects.
+Addresses (GAP-10): validate_kaspa_address now checks the bech32 checksum via kaspa.Address.validate.
+Auth (GAP-12/13/14):
+- Challenge text = schemas.build_auth_challenge(purpose, domain=host of PUBLIC_BASE_URL, address, nonce, expires_at); purposes AUTH_PURPOSE / REGISTER_PURPOSE.
+- AuthChallengeRequest gains purpose "login" | "register". Redis key kasgate:auth:{purpose}:{addr}:{nonce}.
+- POST /v1/merchants now REQUIRES challenge + public_key + signature (purpose=register) -> proves address ownership.
+- POST /v1/auth/verify now returns SessionIssued{merchant, session_token "kgs_...", expires_at} and DOES NOT rotate api_key.
+  Sessions: Redis kasgate:session:{sha256(token)} -> merchant_id, EX session_ttl_seconds. Bearer accepts kg_ (api key) or kgs_ (session).
+  Only POST /v1/merchants/me/rotate-key rotates the api key. Web dashboard cookie holds the session_token.
+- Challenge rate limit is per-IP only (per-address limit removed: it allowed victim lockout).
+Amounts (GAP-15): SompiStr max 18 digits. /healthz stays public but only returns status+network to unauthenticated callers is NOT required for MVP.
+Error codes: + payment_expired (402).
