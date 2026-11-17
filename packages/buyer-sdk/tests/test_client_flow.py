@@ -7,6 +7,7 @@ import base64
 import json
 
 import httpx
+import kasgate_client as sdk
 import kaspa
 import pytest
 from app import schemas as gw
@@ -21,8 +22,6 @@ from conftest import (
     challenge,
     make_utxo,
 )
-
-import kasgate_client as sdk
 from kasgate_client import KasGateClient, KasGateSyncClient, receipt_of
 
 KAS = 100_000_000

@@ -9,13 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import kaspa
-
 from kasgate_client import PaymentSignature
 
 NETWORK_IDS = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}

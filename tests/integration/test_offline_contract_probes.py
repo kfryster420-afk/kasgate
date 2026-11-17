@@ -16,6 +16,7 @@ from app.schemas import (
     compute_fee_split,
     min_price_sompi,
 )
+
 from conftest import OFFLINE_PAYER_KEY, address_for_key
 
 PAYER = address_for_key(OFFLINE_PAYER_KEY)

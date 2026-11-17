@@ -24,12 +24,12 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 import pytest
 from app.config import get_settings
-from app.security import RateLimit
+
 from conftest import address_for_key
 
 ENABLED = os.environ.get("KASGATE_RATE_LIMIT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
@@ -45,6 +45,13 @@ pytestmark = [
         ),
     ),
 ]
+
+
+class RateLimit(NamedTuple):
+    route: str
+    limit: int
+    window_seconds: int
+
 
 _settings = get_settings()
 RATE_LIMIT_CREATE_MERCHANT = RateLimit("merchants", _settings.rl_merchant_create_per_hour, 3600)

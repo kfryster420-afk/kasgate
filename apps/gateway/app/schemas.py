@@ -239,6 +239,8 @@ class X402ErrorBody(StrictModel):
         "wrong_network",
         "tx_rejected",
         "rpc_unavailable",
+        "service_unavailable",
+        "rate_limited",
         "endpoint_not_found",
         "method_not_allowed",
         "upstream_error",

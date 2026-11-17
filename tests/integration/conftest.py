@@ -45,7 +45,6 @@ for path in (GATEWAY_DIR, SDK_DIR, Path(__file__).resolve().parent):
         sys.path.insert(0, str(path))
 
 from app.schemas import TAX_CSV_COLUMNS, min_price_sompi  # noqa: E402,F401
-
 from kasgate_client import PaymentRequired  # noqa: E402
 
 GATEWAY_URL = os.environ.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip("/")

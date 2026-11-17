@@ -91,7 +91,7 @@ async def test_missing_signature_returns_402_with_challenge(
     assert body["accepts"]["amount"] == str(PRICE_SOMPI)
     assert stub_engine.calls == []
     assert upstream.requests == []
-    assert await redis.keys("*") == []
+    assert [key for key in await redis.keys("*") if not key.startswith("kasgate:rl:")] == []
 
 
 @pytest.mark.parametrize(

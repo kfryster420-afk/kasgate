@@ -6,12 +6,11 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import unquote
 from decimal import Decimal
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
-
 from kasgate_client import (
     DEFAULT_MAX_PRICE_SOMPI,
     KasGateClient,

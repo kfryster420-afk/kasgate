@@ -15,6 +15,7 @@ from app.security import (
     new_login_challenge,
     parse_login_challenge,
 )
+
 from conftest import OFFLINE_PAYER_KEY, address_for_key
 
 OTHER_KEY = "e7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"

@@ -9,9 +9,9 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from app.schemas import TAX_CSV_COLUMNS
-from conftest import create_endpoint
-
 from kasgate_client import PaymentRequired, compute_fee_split
+
+from conftest import create_endpoint
 
 pytestmark = pytest.mark.live
 

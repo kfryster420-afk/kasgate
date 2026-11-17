@@ -13,9 +13,6 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import RPC_URL, merchant_fee_outputs
-from txforge import ForgedPayment
-
 from kasgate_client import (
     KasGateClient,
     PaymentRequired,
@@ -23,6 +20,9 @@ from kasgate_client import (
     PriceCapExceededError,
     receipt_of,
 )
+
+from conftest import RPC_URL, merchant_fee_outputs
+from txforge import ForgedPayment
 
 pytestmark = [pytest.mark.live, pytest.mark.funded]
 

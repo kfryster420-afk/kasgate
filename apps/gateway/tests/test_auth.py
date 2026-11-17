@@ -7,7 +7,6 @@ from typing import Any
 import httpx
 import pytest
 from kaspa import PrivateKey, sign_message
-from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -26,7 +25,6 @@ from tests.conftest import (
     MERCHANT_KEY,
     OTHER_ADDRESS,
     OTHER_KEY,
-    PAYER_ADDRESS,
     Seed,
     make_asgi_client,
 )
@@ -469,30 +467,3 @@ async def test_verify_is_limited_to_10_per_minute_per_ip(client: httpx.AsyncClie
     assert codes[0] == 401
     assert codes[-1] == 429
     assert codes.count(429) == 2
-
-
-async def test_rate_limiter_fails_open_when_redis_is_down(
-    client: httpx.AsyncClient, redis: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class BrokenPipeline:
-        async def __aenter__(self) -> "BrokenPipeline":
-            return self
-
-        async def __aexit__(self, *exc: object) -> None:
-            return None
-
-        def incr(self, *args: Any) -> None:
-            return None
-
-        def expire(self, *args: Any, **kwargs: Any) -> None:
-            return None
-
-        def ttl(self, *args: Any) -> None:
-            return None
-
-        async def execute(self) -> None:
-            raise RedisConnectionError("down")
-
-    monkeypatch.setattr(redis, "pipeline", lambda *a, **k: BrokenPipeline())
-    response = await client.post("/v1/merchants", json={"kaspa_address": PAYER_ADDRESS, "display_name": "x"})
-    assert response.status_code == 201

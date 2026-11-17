@@ -14,10 +14,10 @@ from app.config import get_settings
 from app.kaspa_engine import KaspaEngine, PaymentVerificationError
 from app.schemas import PaymentRequired as GatewayPaymentRequired
 from app.schemas import PaymentSignature as GatewayPaymentSignature
+from kasgate_client.transaction import build_payment_transaction
+
 from conftest import OFFLINE_PAYER_KEY, address_for_key
 from txforge import forge_payment, tamper_raw_tx
-
-from kasgate_client.transaction import build_payment_transaction
 
 KAS = 100_000_000
 MERCHANT_KEY = "c7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"

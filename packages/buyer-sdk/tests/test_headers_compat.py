@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import random
 
+import kasgate_client as sdk
 import pytest
 from app import schemas as gw
 from conftest import MERCHANT, OTHER, PAYER, PRICE, TREASURY, challenge
-
-import kasgate_client as sdk
 
 TX_ID = "ab" * 32
 

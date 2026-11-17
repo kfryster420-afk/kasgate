@@ -39,7 +39,7 @@ PAYMENT-RESPONSE  -> PaymentResponse{txId, settled:true, network, usdValueAtSett
 Every model has .to_header() and Cls.from_header(value) (raises ValueError).
 Error JSON body: X402ErrorBody{error, message, accepts: PaymentRequired|null}
 error codes: payment_required, invalid_payment_header, payment_replayed, underpaid, invalid_fee_split,
-wrong_network, tx_rejected, rpc_unavailable, endpoint_not_found, method_not_allowed, upstream_error
+wrong_network, tx_rejected, rpc_unavailable, service_unavailable, rate_limited, endpoint_not_found, method_not_allowed, upstream_error
 
 ## HTTP status mapping
 no header -> 402 + PAYMENT-REQUIRED + body error=payment_required
@@ -47,6 +47,8 @@ bad header / underpaid / invalid_fee_split / wrong_network / tx_rejected -> 402 
 replayed txId (Redis lock held or tx_id already in settlements) -> 409 error=payment_replayed
 unknown/inactive slug -> 404 endpoint_not_found; method not in allowed_methods -> 405 method_not_allowed
 rpc_unavailable (RpcUnavailableError) -> 503, release the Redis replay lock
+Redis down on /p/* -> 503 service_unavailable (Retry-After: 5); rate limit hit on /p/* -> 429 rate_limited (Retry-After)
+/v1/* keeps FastAPI {"detail": "..."} bodies for 429/503
 header that fails schema validation on network/address prefix -> 402 wrong_network
 upstream failure after settlement -> 502 upstream_error, PAYMENT-RESPONSE still set, settlement stays SETTLED
 

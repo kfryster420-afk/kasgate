@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import kaspa
 import pytest
+
 from conftest import address_for_key
 
 pytestmark = pytest.mark.live
