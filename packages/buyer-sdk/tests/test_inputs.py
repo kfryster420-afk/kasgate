@@ -181,7 +181,7 @@ async def test_client_pays_the_minimum_price_with_a_big_enough_second_utxo(
     assert len(tx.inputs) == 2 and tx.outputs[2].value >= MIN_CHANGE
 
 
-# ---------------------------------------------------------------- the exact Generator call (confirmed by 02)
+# ---------------------------------------------------------------- the exact Generator call
 
 
 def test_generator_is_called_exactly_as_the_contract_specifies(monkeypatch) -> None:

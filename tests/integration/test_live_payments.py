@@ -225,7 +225,7 @@ def test_expired_challenge_is_payment_expired(proxy_url, quote, forge) -> None:
     assert challenge_of(response).nonce != quote.nonce
 
 
-# ---------------------------------------------------------------- CONTRACT v2.6: payerProof closes front-running (GAP-1)
+# ---------------------------------------------------------------- CONTRACT v2.6: payerProof closes front-running
 
 FRONT_RUNNER_KEY = "e7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"
 
@@ -536,7 +536,7 @@ def _create_failing_endpoint(gateway_url: str, auth: dict[str, str], price: int)
 
 @funded
 def test_front_runner_cannot_claim_the_victims_settled_payment(proxy_url, quote, real_forge) -> None:
-    """GAP-1 (closed by CONTRACT v2.6) with real funds: a third party presents the victim's signed tx first, with their
+    """Front-running (closed by CONTRACT v2.6) with real funds: a third party presents the victim's signed tx first, with their
     own key's payerProof, from another path and method. They get 402; the victim then still gets the resource."""
     forged = real_forge(merchant_fee_outputs(quote))
     thief = asyncio.run(send(proxy_url + "/thief/path", _front_runner_header(forged), method="POST"))

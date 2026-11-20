@@ -211,7 +211,7 @@ def test_garbage_raw_tx_is_an_invalid_header_not_a_crash(engine, required, raw) 
 
 
 def test_unsigned_transaction_passes_the_offline_verifier_and_relies_on_the_node() -> None:
-    """Documents GAP-3: verify() never checks signature scripts; only node submission does."""
+    """Documents a known layering: verify() never checks signature scripts; only node submission does."""
     required = make_required()
     engine = KaspaEngine(get_settings())
     forged = forge_tx(exact(required))
@@ -227,7 +227,7 @@ def test_unsigned_transaction_passes_the_offline_verifier_and_relies_on_the_node
 
 
 def test_inflated_embedded_utxo_amount_passes_offline_and_relies_on_the_node() -> None:
-    """Documents GAP-4: inputs[].utxo is attacker-supplied and used for the mass check and payer attribution."""
+    """Documents that inputs[].utxo is attacker-supplied and used for the mass check and payer attribution."""
     required = make_required()
     engine = KaspaEngine(get_settings())
     forged = forge_tx(exact(required), utxos=[utxo(0, 25 * KAS)])
@@ -289,7 +289,7 @@ def test_payload_cannot_be_swapped_after_signing(engine, required) -> None:
 
 def test_payload_swap_with_recomputed_id_still_fails_at_the_node_not_in_verify(engine, required) -> None:
     """Documents the layering: a payload rewrite plus recomputed id passes verify() (it does not check signature
-    scripts, see GAP-3) and is stopped only by node signature validation, which sighash-covers the payload."""
+    scripts, see the signature-script note above) and is stopped only by node signature validation, which sighash-covers the payload."""
     forged = forge_tx(exact(required), nonce=OTHER_NONCE)
     data = json.loads(forged.raw_tx)
     data["payload"] = payment_payload(NONCE).hex()
@@ -477,7 +477,7 @@ async def test_payment_from_seventeen_addresses_is_rejected() -> None:
     assert caught.value.code == "invalid_payment_header" and "16" in str(caught.value)
 
 
-# ---------------------------------------------------------------- CONTRACT v2: node-verified inputs (GAP-4 fix)
+# ---------------------------------------------------------------- CONTRACT v2: node-verified inputs (untrusted-UTXO fix)
 
 
 class FakeNodeEngine(KaspaEngine):
@@ -543,7 +543,7 @@ async def test_inflated_embedded_utxo_amount_is_caught_by_the_node_lookup(requir
         nonce=NONCE, payerProof=pp(forged.tx_id, NONCE),
     )
     engine = FakeNodeEngine(funds)
-    _, tx = engine.verify(signature, required)  # the offline pass cannot see the lie (GAP-3/4 layering)
+    _, tx = engine.verify(signature, required)  # the offline pass cannot see the lie (verify/resolve_inputs layering)
     with pytest.raises(PaymentVerificationError) as caught:
         await engine.resolve_inputs(signature, tx)
     assert caught.value.code == "invalid_payment_header"

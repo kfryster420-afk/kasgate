@@ -943,7 +943,7 @@ async def test_inactive_merchant_endpoint_is_404(
     assert (await client.get("/p/gone")).status_code == 404
 
 
-# ---------------------------------------------------------------- redelivery (CONTRACT v2, GAP-5)
+# ---------------------------------------------------------------- redelivery (CONTRACT v2)
 
 
 def _fail_upstream(upstream: Upstream, status: int | None = None) -> None:

@@ -1,23 +1,23 @@
-# KasGate Shared Contracts (owner: 01 - KasGate Architect)
+# KasGate Protocol Contracts
 
-Source of truth: apps/gateway/app/config.py, models.py, schemas.py. Never rename a field, class, header or route below. If you need a change, message 01 first.
+Source of truth: apps/gateway/app/config.py, models.py, schemas.py. Never rename a field, class, header or route below. Propose any change through an issue or pull request first.
 
 ## Monorepo
 ```
 kasgate/
-├── infra/                      docker-compose.yml, .env.example            (01)
-├── docs/                       CONTRACTS.md, work-orders/                   (01)
+├── infra/                      docker-compose.yml, .env.example
+├── docs/                       CONTRACTS.md, RUNBOOK.md
 ├── apps/gateway/               FastAPI gateway, Python 3.12
-│   ├── Dockerfile, requirements.txt                                         (01)
-│   ├── alembic.ini, alembic/env.py, alembic/versions/0001_initial.py        (03)
+│   ├── Dockerfile, requirements.txt
+│   ├── alembic.ini, alembic/env.py, alembic/versions/0001_initial.py
 │   └── app/
-│       ├── config.py, db.py, models.py, schemas.py                          (01)
-│       ├── kaspa_engine.py, oracle.py                                       (02)
-│       ├── security.py, proxy.py, api_routes.py, main.py                    (03)
-├── apps/web/                   Next.js 15 App Router + TS + Tailwind, Dockerfile (04)
-├── packages/buyer-sdk/         pyproject.toml, kasgate_client/              (05)
-├── packages/mcp-server/        pyproject.toml, kasgate_mcp/                 (05)
-└── tests/integration/          pytest suite against http://localhost:8000   (05)
+│       ├── config.py, db.py, models.py, schemas.py
+│       ├── kaspa_engine.py, oracle.py
+│       ├── security.py, proxy.py, api_routes.py, main.py
+├── apps/web/                   Next.js 15 App Router + TS + Tailwind, Dockerfile
+├── packages/buyer-sdk/         pyproject.toml, kasgate_client/
+├── packages/mcp-server/        pyproject.toml, kasgate_mcp/
+└── tests/integration/          pytest suite against http://localhost:8000
 ```
 
 ## Protocol constants (app/config.py)
@@ -52,7 +52,7 @@ Redis down on /p/* -> 503 service_unavailable (Retry-After: 5); rate limit hit o
 header that fails schema validation on network/address prefix -> 402 wrong_network
 upstream failure after settlement -> 502 upstream_error, PAYMENT-RESPONSE still set, settlement stays SETTLED
 
-## Gateway routes (03 implements, 04/05 consume)
+## Gateway routes
 GET  /healthz                         -> HealthStatus
 ANY  /p/{slug} and /p/{slug}/{path:path}  paywalled proxy (PROXY_PATH_PREFIX="/p")
 POST /v1/merchants                    MerchantCreate{kaspa_address, display_name, email, challenge(purpose=register), public_key, signature} -> 201 MerchantCreated{merchant, api_key (once), session_token kgs_, expires_at}
@@ -70,7 +70,7 @@ GET  /v1/quote/{slug}                           -> PaymentRequired JSON (public,
 Auth: "Authorization: Bearer kg_<token_urlsafe(32)>"; DB stores sha256 hex in Merchant.api_key_hash.
 Slug auto-generated when omitted: slugify(name)[:55] + "-" + 6 hex chars.
 
-## Engine interface (02 implements in app/kaspa_engine.py, 03 calls)
+## Engine interface (app/kaspa_engine.py)
 class PaymentVerificationError(Exception): code: str (one of the error codes above), message: str
 @dataclass(frozen=True) class VerifiedPayment: tx_id, payer_address, total_sompi, merchant_sompi, fee_sompi
 class KaspaEngine:
@@ -79,15 +79,15 @@ class KaspaEngine:
     async def verify_and_submit(signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment
 module singleton: engine = KaspaEngine(get_settings())
 
-## Oracle interface (02 implements in app/oracle.py)
+## Oracle interface (app/oracle.py)
 class KasUsdOracle: __init__(settings, redis: redis.asyncio.Redis); async get_rate() -> Decimal (8 dp)
 Redis keys: kasgate:oracle:kas_usd (TTL 60 s), kasgate:oracle:kas_usd:last (no TTL, fallback)
 usd_value = (Decimal(total_sompi) / SOMPI_PER_KAS * rate).quantize(Decimal("0.00000001"))
 
 ## Redis keys
-kasgate:tx:{txId}  SET NX EX 600 replay lock (03)
+kasgate:tx:{txId}  SET NX EX 600 replay lock
 
-## Merchant login / key recovery (wallet-signature, non-custodial) — added after 04 review
+## Merchant login / key recovery (wallet-signature, non-custodial) — added after a web-app review
 POST /v1/auth/challenge   AuthChallengeRequest{kaspa_address} -> AuthChallenge{kaspa_address, challenge, expires_at}
                           challenge = "KasGate login\nAddress: {addr}\nNonce: {token_hex(16)}\nExpires: {iso}"; Redis kasgate:auth:{addr}:{nonce} EX 300, single use
 POST /v1/auth/verify      AuthVerifyRequest{kaspa_address, challenge, public_key, signature} -> 200 SessionIssued{merchant, session_token kgs_, expires_at} (api_key NOT rotated)
@@ -104,8 +104,8 @@ FastAPI validation errors stay as {"detail": [...]}; x402 errors use X402ErrorBo
 Proxy path is /p/{slug} (never /v1/{slug}); quotes /v1/quote/{slug}.
 Pricing: fixed sompi only for the MVP (no USD-pegged pricing).
 
-## CONTRACT v2 — security revision after 05 red-team (supersedes earlier lines where they conflict)
-Payment binding (GAP-1, GAP-7, GAP-6 TOCTOU):
+## CONTRACT v2 — security revision after red-team testing (supersedes earlier lines where they conflict)
+Payment binding (findings: mempool front-running, TOCTOU between quote and payment):
 - PaymentRequired gains `nonce` (32 lowercase hex, schemas.new_payment_nonce()) and `expiresAt` (UTC, now + PAYMENT_MAX_AGE_SECONDS).
   Build: PaymentRequired.for_endpoint(price_sompi, pay_to, nonce, expires_at).
 - Gateway stores the exact issued challenge: Redis `kasgate:nonce:{nonce}` = PaymentRequired JSON + endpoint slug, EX payment_max_age_seconds.
@@ -113,20 +113,20 @@ Payment binding (GAP-1, GAP-7, GAP-6 TOCTOU):
 - On the paid retry the gateway loads `required` FROM THE NONCE (never recomputes), checks slug matches, consumes it atomically (GETDEL) only after
   successful settlement. Missing/expired nonce -> 402 `payment_expired` with a fresh PAYMENT-REQUIRED.
 - Settlement.payment_nonce is UNIQUE. "Already in mempool/accepted" is success ONLY when the payload nonce is valid and unconsumed.
-Pre-lock verification (GAP-11): run engine.verify() (network-free, finalize()-recomputed id, payload, outputs) BEFORE taking kasgate:tx:{txId}.
-Settlement finality (GAP-2): settings.settlement_mode "accepted" (default) = submit, then wait until the tx is accepted by the virtual chain
+Pre-lock verification: run engine.verify() (network-free, finalize()-recomputed id, payload, outputs) BEFORE taking kasgate:tx:{txId}.
+Settlement finality: settings.settlement_mode "accepted" (default) = submit, then wait until the tx is accepted by the virtual chain
   (subscribe_virtual_chain_changed or poll), up to settlement_timeout_seconds (8 s); timeout -> 503 rpc_unavailable, lock released, nonce kept.
   "mempool" = old behaviour, testnet demos only. Reject any replacement (submit_transaction_replacement is never used by the gateway).
-Inputs (GAP-4): engine fetches each input's real UTXO entry from the node (get_utxos_by_addresses(payerAddress) + mempool) and uses node values/scripts
+Inputs (attacker-supplied UTXO values): engine fetches each input's real UTXO entry from the node (get_utxos_by_addresses(payerAddress) + mempool) and uses node values/scripts
   for mass and for payer attribution; mismatch -> invalid_payment_header.
-Redelivery (GAP-5): same txId + same nonce + same slug, Settlement exists, upstream_status_code is NULL or >= 500, within redelivery_window_seconds and
+Redelivery: same txId + same nonce + same slug, Settlement exists, upstream_status_code is NULL or >= 500, within redelivery_window_seconds and
   delivery_attempts < redelivery_max_attempts -> re-forward upstream, increment delivery_attempts, return PAYMENT-RESPONSE. Otherwise 409.
-Transport (GAP-6): PUBLIC_BASE_URL must be https on mainnet (enforced in Settings). SDK keeps pinned fee_to/expected_pay_to options.
-Headers (GAP-8): rawTx max 24_000 chars, MAX_HEADER_BYTES 40_960; uvicorn runs with --h11-max-incomplete-event-size 65536.
-SSRF (GAP-9): schema rejects any literal IP that is not ip.is_global (covers 100.64.0.0/10, ::1, ULA) and *.localhost/*.internal.
-  Runtime guard (03) resolves DNS at request time, pins the resolved IP for the connection, rejects non-global IPs (nip.io, localtest.me), no redirects.
-Addresses (GAP-10): validate_kaspa_address now checks the bech32 checksum via kaspa.Address.validate.
-Auth (GAP-12/13/14):
+Transport: PUBLIC_BASE_URL must be https on mainnet (enforced in Settings). SDK keeps pinned fee_to/expected_pay_to options.
+Headers: rawTx max 24_000 chars, MAX_HEADER_BYTES 40_960; uvicorn runs with --h11-max-incomplete-event-size 65536.
+SSRF: schema rejects any literal IP that is not ip.is_global (covers 100.64.0.0/10, ::1, ULA) and *.localhost/*.internal.
+  Runtime guard resolves DNS at request time, pins the resolved IP for the connection, rejects non-global IPs (nip.io, localtest.me), no redirects.
+Addresses: validate_kaspa_address now checks the bech32 checksum via kaspa.Address.validate.
+Auth (origin binding, single-use challenges, sessions):
 - Challenge text = schemas.build_auth_challenge(purpose, domain=host of PUBLIC_BASE_URL, address, nonce, expires_at); purposes AUTH_PURPOSE / REGISTER_PURPOSE.
 - AuthChallengeRequest gains purpose "login" | "register". Redis key kasgate:auth:{purpose}:{addr}:{nonce}.
 - POST /v1/merchants now REQUIRES challenge + public_key + signature (purpose=register) -> proves address ownership.
@@ -134,31 +134,31 @@ Auth (GAP-12/13/14):
   Sessions: Redis kasgate:session:{sha256(token)} -> merchant_id, EX session_ttl_seconds. Bearer accepts kg_ (api key) or kgs_ (session).
   Only POST /v1/merchants/me/rotate-key rotates the api key. Web dashboard cookie holds the session_token.
 - Challenge rate limit is per-IP only (per-address limit removed: it allowed victim lockout).
-Amounts (GAP-15): SompiStr max 18 digits. /healthz stays public but only returns status+network to unauthenticated callers is NOT required for MVP.
+Amounts: SompiStr max 18 digits. /healthz stays public but only returns status+network to unauthenticated callers is NOT required for MVP.
 Error codes: + payment_expired (402).
 
-## CONTRACT v2.1 — fee floor (Kyle approved 2026-11-20)
+## CONTRACT v2.1 — fee floor (2026-11-20)
 - Treasury fee = max(ceil(total*150/10000), MIN_OUTPUT_SOMPI). Merchant = total - fee, must be >= MIN_OUTPUT_SOMPI.
 - ~~min price 0.4 KAS~~ SUPERSEDED by v2.3: min_price_sompi(floor) = 3*floor = 60_000_000 sompi (0.6 KAS).
 - Below 1_333_333_334 sompi the fee is the flat floor (0.2 KAS); above that it is 1.5% (ceil).
 - Engine: exact-value checks against PaymentRequired still apply; the ">= 1.5%" check stays valid because fee >= 1.5% always.
 - Clients (web lib/sompi.ts, buyer SDK) must replicate: fee = max(ceil(amount*150/10000), min_output_sompi) using DirectoryManifest.min_output_sompi.
 
-## CONTRACT v2.2 — answers to 04 (2026-11-20)
+## CONTRACT v2.2 — web app auth and session details (2026-11-20)
 - Registration and rotate-key return MerchantCreated WITH a session (session_token kgs_ + expires_at), so the web app never stores a kg_ key in a cookie.
 - Challenge "Domain:" = urlsplit(PUBLIC_BASE_URL).netloc lowercased (host, plus :port only when the URL has one). Exactly one form; clients compare exact string.
   The web app's public URL that users see must therefore equal PUBLIC_BASE_URL's netloc (in local dev: localhost:8000 vs the web on :3000 → web compares with NEXT_PUBLIC_GATEWAY_URL netloc, which must equal PUBLIC_BASE_URL).
 - SompiStr 18-digit cap stands (max 999_999_999_999_999_999 sompi ≫ total KAS supply).
 - KasWare signature format: script-signed (kaspa sign_message) registration verified live on tn10; real KasWare 0.11.6 (Chrome) schnorr signMessage verified live on tn10 for register + login (Nov 20, 2026); gateway normalisation (hex128 / Base64 64|65 bytes) is the contract.
 
-## CONTRACT v2.3 — storage-mass correction to the minimum price (2026-11-20, from 02's live testnet finding)
+## CONTRACT v2.3 — storage-mass correction to the minimum price (2026-11-20, from a live testnet finding)
 - At 0.4 KAS the two 0.2 KAS outputs use the entire 100_000 standard storage mass; any change output makes the tx non-standard.
 - Merchant output must be >= 2*MIN_OUTPUT_SOMPI. min_price_sompi(floor) = 3*floor = 60_000_000 sompi (0.6 KAS). Fee rule unchanged.
 - Verified with kaspa.calculate_storage_mass: at >= 0.6 KAS a single-input payment with change >= ~0.3 KAS stays <= 100_000.
 - Buyer SDK MUST select inputs so change is 0 or >= 30_000_000 sompi (add another UTXO when needed); never emit small change.
 - Payments drawing from more than 16 payer addresses' UTXOs are rejected (invalid_payment_header).
 
-## CONTRACT v2.4 — answers to 03 (2026-11-20)
+## CONTRACT v2.4 — proxy, nonce and session details (2026-11-20)
 - /v1/quote issues a stored, payable nonce and counts against the unpaid per-IP limit. Every /p response that mints a challenge counts as an unpaid hit.
 - kasgate:noncelock:{nonce} NX EX 600 is part of the contract (taken before kasgate:tx:{txId}); the unique payment_nonce index is the backstop.
 - Slug mismatch on a paid retry -> 402 invalid_payment_header + fresh challenge (no new code).
@@ -172,7 +172,7 @@ Error codes: + payment_expired (402).
 - Sompi int fields (e.g. EndpointCreate/Read.price_sompi) are capped at MAX_SOMPI = 999_999_999_999_999_999 (18 digits), same as SompiStr. 19 digits -> 422.
 - Representation is intentional: CRUD int fields (price_sompi) are JSON numbers, so clients must parse them big-int safe; x402 header amounts and SettlementRead/tax sompi fields stay strings.
 
-## CONTRACT v2.6 — payer proof (closes 05 GAP-1, mempool front-running)
+## CONTRACT v2.6 — payer proof (closes the mempool front-running finding)
 - PaymentSignature gains `payerProof`: 128-hex Schnorr kaspa.sign_message(schemas.payer_proof_message(nonce, txId), payer_private_key)
   where payer_proof_message = "kasgate:v1:{nonce}:{txId}" (Base64 64/65-byte forms normalised to hex like auth signatures).
 - payerAddress must be a P2PK Schnorr address (script 0x20 <32-byte x-only pubkey> 0xac). Engine verify(): extract the x-only pubkey from
@@ -182,7 +182,7 @@ Error codes: + payment_expired (402).
 - Payers MUST spend P2PK Schnorr UTXOs (kaspa:q... addresses); script-hash (P2SH) and ECDSA payers are refused with invalid_payment_header.
 - The proof binds nonce and txId (not method/path); the nonce itself is already bound to the endpoint that issued it.
 
-## Notes from the funded tn10 run (05, 7b5dc28)
+## Notes from the funded testnet-10 run
 - Node RPC UTXO entries return scriptPublicKey as a hex string "<u16 BE version><script>" (e.g. "0000"+"20<xonly>ac"), not only the dict form; parsers MUST accept both.
 - A paid call whose upstream fails (5xx/connection error) is NOT refunded on-chain; buyers retry with the same PAYMENT-SIGNATURE within redelivery_window_seconds (max redelivery_max_attempts).
 - Test/dev hosts with synthetic DNS (every name -> 198.18.0.1) are correctly blocked by the SSRF guard; use an IP-literal public upstream such as https://1.1.1.1/cdn-cgi/trace for funded tests.

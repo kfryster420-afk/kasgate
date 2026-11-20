@@ -1,4 +1,4 @@
-"""GAP-1 closed by CONTRACT v2.6: a mempool observer cannot claim someone else's signed payment.
+"""Front-running closed by CONTRACT v2.6: a mempool observer cannot claim someone else's signed payment.
 
 The victim signs a valid payment and presents it with a `payerProof`. A front-runner who copied the transaction out of
 the mempool has everything EXCEPT the victim's key, so whatever header they build must be refused with 402

@@ -1,4 +1,4 @@
-# KasGate Phase 4 runbook
+# KasGate runbook
 
 How to configure, start, fund, exercise, test and ship KasGate: the x402 v2 (`kaspa-exact-v1`) pay-per-call gateway on Kaspa. Every command and variable here exists in this repository. The protocol itself is in [`CONTRACTS.md`](CONTRACTS.md).
 
@@ -404,7 +404,7 @@ KASGATE_GATEWAY_URL=http://localhost:8000 pytest -rs
 
 ### 6.3 Funded end-to-end (testnet-10 only)
 
-The suite refuses to run payments on mainnet. Requirements: a gateway with `kaspa_rpc:true` and `RATE_LIMIT_ENABLED=false`, and a funded, split payer key ([section 4](#4-testnet-10-wallet)). On hosts with synthetic DNS (for example a sandbox where every hostname resolves to `198.18.0.1`) the SSRF guard correctly blocks hostname upstreams AFTER the payment has settled, which wastes coins. Use an IP-literal public upstream:
+The suite refuses to run payments on mainnet. Requirements: a gateway with `kaspa_rpc:true` and `RATE_LIMIT_ENABLED=false`, and a funded, split payer key ([section 4](#4-testnet-10-wallet)). On hosts with synthetic DNS (for example a sandbox or test network where every hostname resolves to `198.18.0.1`) the SSRF guard correctly blocks hostname upstreams AFTER the payment has settled, which wastes coins. Use an IP-literal public upstream:
 
 ```bash
 cd tests/integration
@@ -532,7 +532,7 @@ Public nodes are the current choice. Run your own `kaspad` later for reliability
 | Gateway exits with `PUBLIC_BASE_URL must use https:// on kaspa:mainnet`. | Mainnet requires an HTTPS public URL. |
 | After signing in you are bounced back to `/login` on a non-localhost plain-http host. | The session cookie is `Secure` and the browser drops it. Use HTTPS, or set `KASGATE_COOKIE_SECURE=false` for a plain-http test host only. |
 | `503 rpc_unavailable` on a paid call; `/healthz` shows `"kaspa_rpc": false`. | The gateway has no live node connection, or the transaction was not accepted within `SETTLEMENT_TIMEOUT_SECONDS`. Nothing is lost: the replay lock is released and the same signature can be re-presented (it is not a 409). With the public Resolver, wait and retry; check `docker compose logs gateway` for connect attempts and egress rules for WebSocket traffic. With your own node, check it is synced (see `infra/node/README.md`) and that `KASPA_RPC_URL` is `ws://` plus the Borsh port. |
-| Paid call returns `502 upstream_error` after the payment settled. | The upstream refused, timed out or failed. If the host runs a sandbox with synthetic DNS, or the upstream resolves to a private/non-public IP, the SSRF guard blocks it (see next row). Otherwise fix the upstream and re-present the same `PAYMENT-SIGNATURE` within `REDELIVERY_WINDOW_SECONDS`. |
+| Paid call returns `502 upstream_error` after the payment settled. | The upstream refused, timed out or failed. If the host has synthetic DNS (every name resolves to one fixed address), or the upstream resolves to a private/non-public IP, the SSRF guard blocks it (see next row). Otherwise fix the upstream and re-present the same `PAYMENT-SIGNATURE` within `REDELIVERY_WINDOW_SECONDS`. |
 | Upstream is blocked by the SSRF guard (works in curl, fails through KasGate). | The gateway resolves the upstream host at request time and refuses any address that is not globally routable (private ranges, `100.64.0.0/10`, loopback, link-local, ULA, names like nip.io that resolve to them), and does not follow redirects. Use a public upstream or a public IP literal (for example `https://1.1.1.1/cdn-cgi/trace` for tests). A host whose DNS answers `198.18.0.1` for every name will fail every hostname upstream after payment. |
 | SDK raises `TransactionBuildError` or `DustChangeError` ("InsufficientFundsError"). | The payer has no combination of UTXOs that pays price + network fee and leaves change of 0 or at least 0.3 KAS. Typical with one UTXO only slightly above the price, or two UTXOs that each almost cover it (for example two of 0.603 KAS at the 0.6 KAS price). Fix: fund more, or split the balance ([section 4.4](#44-split-the-balance-into-several-utxos-advisable)). The SDK fails closed rather than donate dust to the miner. |
 | `402 invalid_payment_header` on a payment the SDK built. | The payer address is not P2PK Schnorr (`kaspatest:q...` / `kaspa:q...`), the `payerProof` is wrong, the payment draws from more than 16 payer addresses, or no input is spent from `payerAddress`. Use a plain Schnorr key. |
@@ -547,7 +547,7 @@ Public nodes are the current choice. Run your own `kaspad` later for reliability
 
 ## 10. Verified results
 
-Funded testnet-10 run (05, on the real Kaspa engine with the public Resolver, `SETTLEMENT_MODE=accepted`, rate limits off):
+Funded testnet-10 run (on the real Kaspa engine with the public Resolver, `SETTLEMENT_MODE=accepted`, rate limits off):
 
 * **Funded tier (`-m funded`): 11 passed, 1 skipped** in about 155 s. The skipped test is the small-change probe, which needs a payer UTXO of about 1 KAS or less.
 * **Full integration suite against the live gateway: 316 passed, 4 skipped, 3 deselected** (199 s), plus the slow challenge-expiry test (`payment_expired`, about 122 s) and the node-down test (`503 rpc_unavailable`, the lock released so a retry is not a 409).
@@ -569,4 +569,4 @@ Offline suites on the commit this runbook was written against:
 | MCP server (`packages/mcp-server`) | 83 passed |
 | Integration, offline tier (`tests/integration`, no gateway running) | 210 passed, 113 skipped (live tests), 3 deselected |
 
-Verified on Nov 20, 2026 (UTC+7): a merchant registration and a login signed by the real KasWare 0.11.6 Chrome extension on Testnet 10 (address kaspatest:qr347rhlq8u5qdx9m2yyvx9c242t44f2qwwtujtej38ufk6w9pdusnkmycha3), both accepted by the gateway. The mainnet switch ([section 7](#7-production-checklist)) has not been exercised.
+Verified on 2026-11-20: a merchant registration and a login signed by the real KasWare 0.11.6 Chrome extension on Testnet 10 (address kaspatest:qr347rhlq8u5qdx9m2yyvx9c242t44f2qwwtujtej38ufk6w9pdusnkmycha3), both accepted by the gateway. The mainnet switch ([section 7](#7-production-checklist)) has not been exercised.

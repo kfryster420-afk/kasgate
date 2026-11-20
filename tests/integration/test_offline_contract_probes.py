@@ -1,8 +1,8 @@
 """Offline probes of apps/gateway/app/schemas.py and the upstream guard in app/security.py (CONTRACT v2 / v2.1).
 
-Every GAP that CONTRACT v2 closed (GAP-8, 9, 10) is now a plain regression test. `xfail(strict=True)` is reserved for
-gaps that are still open: such a test asserts the SECURE behaviour, fails today, and turns into a hard failure the day
-the gap is fixed so the marker must then be removed.
+Every finding that CONTRACT v2 closed (header limits, SSRF, address checksum) is now a plain regression test.
+`xfail(strict=True)` is reserved for findings that are still open: such a test asserts the SECURE behaviour, fails today, and turns into a hard failure the day
+the finding is fixed so the marker must then be removed.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def endpoint(url: str) -> EndpointCreate:
         "http://metadata.google.internal",
         "http://foo.localhost",
         "http://example.com@127.0.0.1",
-        "http://100.64.0.1",  # GAP-9: carrier-grade NAT 100.64.0.0/10
+        "http://100.64.0.1",  # SSRF: carrier-grade NAT 100.64.0.0/10
         "http://100.127.255.254",
         "http://[fc00::1]",
         "http://[fd12:3456::1]",
@@ -73,7 +73,7 @@ def test_literal_private_upstreams_are_rejected(url: str) -> None:
         endpoint(url)
 
 
-# ---------------------------------------------------------------- GAP-9: DNS names are guarded at request time
+# ---------------------------------------------------------------- SSRF: DNS names are guarded at request time
 
 
 def _fake_dns(monkeypatch: pytest.MonkeyPatch, table: dict[str, list[str]]) -> None:
@@ -169,7 +169,7 @@ def test_forbidden_ip_classification(ip: str, forbidden: bool) -> None:
     assert security.is_forbidden_ip(ipaddress.ip_address(ip)) is forbidden
 
 
-# ---------------------------------------------------------------- GAP-10: bech32 checksum
+# ---------------------------------------------------------------- address validation: bech32 checksum
 
 
 def test_merchant_address_with_bad_checksum_is_rejected() -> None:
@@ -194,7 +194,7 @@ def test_valid_address_passes_the_checksum() -> None:
     assert merchant.kaspa_address == PAYER
 
 
-# ---------------------------------------------------------------- GAP-8: header and rawTx limits are consistent
+# ---------------------------------------------------------------- header limits: header and rawTx limits are consistent
 
 
 def test_gateway_limits_are_the_v2_values() -> None:

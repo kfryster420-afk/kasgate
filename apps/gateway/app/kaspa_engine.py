@@ -1,6 +1,6 @@
 """Kaspa RPC connection manager and dual-output UTXO payment verification engine (CONTRACT v2 / v2.1).
 
-Pipeline used by the proxy (03), see ``KaspaEngine`` for signatures:
+Pipeline used by the proxy, see ``KaspaEngine`` for signatures:
 
 1. ``verify(signature, required)``: PURE and network-free. Safe to call before the replay lock.
 2. ``await resolve_inputs(signature, tx)``: fetches every input's real UTXO entry from the node.

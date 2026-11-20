@@ -8,7 +8,7 @@ tests/integration/
   test_offline_engine.py         gateway KaspaEngine.verify vs SDK-built and forged txs (no services)
   test_offline_contract_probes.py  schema probes; xfail(strict) = documented gap that asserts the secure behaviour
   test_offline_auth.py           wallet-login primitives (challenge format, sign_message verification, Base64 sigs)
-  test_offline_frontrun.py       GAP-1 closed (v2.6): front-runner variants against the real engine's payerProof check
+  test_offline_frontrun.py       front-running closed (v2.6): front-runner variants against the real engine's payerProof check
   test_offline_secrets.py        the funded key loads from a file and can never be rendered as text
   test_live_catalog.py           402 challenge, registration rules, floor 422, tax CSV, directory/quote   [gateway]
   test_auth.py                   wallet register/login, replay, Base64, rotate-key, DELETE /v1/auth/session   [gateway]
@@ -31,7 +31,7 @@ pytest -rs tests/integration          # offline tests always run; live tests ski
 
 All host traffic reaches the gateway from one Docker bridge IP, and the default limits (5 merchant sign-ups per hour,
 10 auth calls per minute) would starve the suite. **Run the gateway with `RATE_LIMIT_ENABLED=false` in `infra/.env`**
-(owned by 01; this suite never edits it). Everything else uses the defaults in `infra/.env.example`.
+(this suite never edits it). Everything else uses the defaults in `infra/.env.example`.
 
 | variable | meaning |
 | --- | --- |
@@ -85,11 +85,11 @@ never run the normal suite against that low-limit configuration.
 
 ## Reading the results
 
-`xfail(strict=True)` tests assert the *secure* behaviour and currently fail on purpose: each one is tagged with a
-`GAP-n` id from the red-team report. When the gateway fixes a gap the test XPASSes and, being strict, fails the run so
+`xfail(strict=True)` tests assert the *secure* behaviour and currently fail on purpose: each one documents a
+finding from security testing. When the gateway fixes it the test XPASSes and, being strict, fails the run so
 the marker gets removed.
 
-## Funded runs from a sandboxed box
+## Funded runs from a sandboxed host
 
 The gateway's SSRF guard resolves the upstream host itself and refuses non-public addresses. A sandbox whose DNS answers
 with a fake range (for example `198.18.0.0/15`) therefore makes every hostname upstream fail with 502 AFTER the payment

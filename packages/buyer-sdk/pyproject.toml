@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "kasgate-client"
 version = "0.1.0"
 description = "Buyer-side x402 SDK: an httpx client that automatically pays KasGate HTTP 402 challenges in KAS."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27,<1.0",

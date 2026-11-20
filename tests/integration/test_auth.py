@@ -342,7 +342,7 @@ def test_tampered_or_forged_challenges_are_401(gateway_url: str, shared_account:
         "nonce": challenge.replace("Nonce: ", "Nonce: 0"),
         "whitespace": challenge + " ",
         "expiry": challenge.rsplit("Expires: ", 1)[0] + "Expires: 2999-01-01T00:00:00+00:00",
-        "domain": challenge.replace(f"Domain: {EXPECTED_DOMAIN}", "Domain: phish.example", 1),  # GAP-12: origin binding
+        "domain": challenge.replace(f"Domain: {EXPECTED_DOMAIN}", "Domain: phish.example", 1),  # origin binding
         "purpose": challenge.replace(AUTH_PURPOSE, REGISTER_PURPOSE, 1),
         "garbage": "not a login challenge, but long enough to pass length checks",
         "forged": (
