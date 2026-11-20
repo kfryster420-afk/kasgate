@@ -16,7 +16,7 @@ export async function GET(request: NextRequest, context: Context): Promise<NextR
   if (!isAuth(auth)) return auth;
   const { id } = await context.params;
   if (!isUuid(id)) return jsonError("Invalid endpoint id", 400);
-  const result = await gatewayRequest<EndpointRead>(`/v1/endpoints/${id}`, { apiKey: auth.apiKey });
+  const result = await gatewayRequest<EndpointRead>(`/v1/endpoints/${id}`, { bearer: auth.token });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
 }
 
@@ -33,7 +33,7 @@ export async function PATCH(request: NextRequest, context: Context): Promise<Nex
 
   const result = await gatewayRequest<EndpointRead>(`/v1/endpoints/${id}`, {
     method: "PATCH",
-    apiKey: auth.apiKey,
+    bearer: auth.token,
     body: stringifyWithIntegers(built.payload, ["price_sompi"]),
   });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
@@ -45,7 +45,7 @@ export async function DELETE(request: NextRequest, context: Context): Promise<Ne
   if (!isAuth(auth)) return auth;
   const { id } = await context.params;
   if (!isUuid(id)) return jsonError("Invalid endpoint id", 400);
-  const result = await gatewayRequest<undefined>(`/v1/endpoints/${id}`, { method: "DELETE", apiKey: auth.apiKey });
+  const result = await gatewayRequest<undefined>(`/v1/endpoints/${id}`, { method: "DELETE", bearer: auth.token });
   if (!result.ok) return fromGatewayFailure(result);
   return new NextResponse(null, { status: 204, headers: { "Cache-Control": "no-store" } });
 }

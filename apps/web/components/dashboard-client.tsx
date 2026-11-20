@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { defaultRange, type DateRange } from "@/lib/range";
 import { shortAddress } from "@/lib/format";
-import type { EndpointRead, MerchantCreated, MerchantRead } from "@/lib/types";
+import type { EndpointRead, MerchantKeyIssued, MerchantRead } from "@/lib/types";
 import { AnalyticsPanel } from "./analytics-panel";
 import { ApiKeyReveal } from "./api-key-reveal";
 import { EndpointsPanel } from "./endpoints-panel";
@@ -50,13 +50,13 @@ export function DashboardClient() {
 
   async function rotateKey() {
     const confirmed = window.confirm(
-      "Rotate your API key?\n\nThe current API key stops working immediately; update any scripts or services that use it. The new key is shown once. Your wallet session in this browser is not affected.",
+      "Rotate your API key?\n\nThe current API key stops working immediately; update any scripts or services that use it. The new key is shown once. This browser gets a fresh wallet session automatically.",
     );
     if (!confirmed) return;
     setRotating(true);
     setError(null);
     try {
-      const result = await apiFetch<MerchantCreated>("/api/merchant/rotate-key", { method: "POST" });
+      const result = await apiFetch<MerchantKeyIssued>("/api/merchant/rotate-key", { method: "POST" });
       setMerchant(result.merchant);
       setNewKey(result.api_key);
     } catch (e) {

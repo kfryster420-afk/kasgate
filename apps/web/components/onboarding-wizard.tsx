@@ -6,7 +6,7 @@ import { useState } from "react";
 import { ADDRESS_PREFIX, GATEWAY_PUBLIC_URL, NETWORK_LABEL } from "@/lib/config";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { curlCreateEndpoint, curlDiscover, curlPaid, curlRegisterMerchant, pythonSnippet } from "@/lib/snippets";
-import type { EndpointCreate, EndpointRead, MerchantCreate, MerchantCreated, MerchantRead } from "@/lib/types";
+import type { EndpointCreate, EndpointRead, MerchantCreate, MerchantKeyIssued, MerchantRead } from "@/lib/types";
 import { checkDisplayName, checkKaspaAddress, checkOptionalEmail } from "@/lib/validation";
 import { formatKas, formatSompi } from "@/lib/sompi";
 import { CodeBlock } from "./code-block";
@@ -93,7 +93,7 @@ export function OnboardingWizard({ initialMerchant }: { initialMerchant: Merchan
   );
 }
 
-function MerchantStep({ onDone }: { onDone: (created: MerchantCreated) => void }) {
+function MerchantStep({ onDone }: { onDone: (created: MerchantKeyIssued) => void }) {
   const [address, setAddress] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -116,7 +116,7 @@ function MerchantStep({ onDone }: { onDone: (created: MerchantCreated) => void }
     const body: MerchantCreate = { ...proof, kaspa_address: addressCheck.value, display_name: nameCheck.value };
     if (emailCheck.value) body.email = emailCheck.value;
     try {
-      const created = await apiFetch<MerchantCreated>("/api/merchants", { method: "POST", body });
+      const created = await apiFetch<MerchantKeyIssued>("/api/merchants", { method: "POST", body });
       onDone(created);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) throw new Error("That address or email is already registered. Sign in with your wallet instead.");
@@ -144,7 +144,7 @@ function MerchantStep({ onDone }: { onDone: (created: MerchantCreated) => void }
         </Field>
       </div>
       <p className="rounded-lg border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-500">
-        Registration signs a one-time message that authorises nothing but ownership of the address. You will then receive an automation API key, shown once. The browser session is kept in a secure httpOnly cookie, never in local storage.
+        Registration signs a one-time message that authorises nothing but ownership of the address. You will then receive an automation API key, shown once. Your browser session is a wallet session token kept in a secure httpOnly cookie; the API key is never stored in the browser.
       </p>
       <WalletProofPanel
         purpose="register"

@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { EXPECTED_AUTH_DOMAINS } from "@/lib/config";
+import { EXPECTED_AUTH_DOMAIN } from "@/lib/config";
 import { checkChallenge } from "@/lib/challenge";
 import { checkVerifyRequest } from "@/lib/server/auth-input";
 import { gatewayRequest } from "@/lib/server/gateway";
@@ -21,7 +21,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   if (!body) return jsonError("Request body must be a JSON object", 400);
   const checked = checkVerifyRequest(body);
   if (!checked.ok) return jsonError(checked.error, 422);
-  const refusal = checkChallenge(checked.value.challenge, { purpose: "login", address: checked.value.kaspa_address, domains: EXPECTED_AUTH_DOMAINS });
+  const refusal = checkChallenge(checked.value.challenge, { purpose: "login", address: checked.value.kaspa_address, domain: EXPECTED_AUTH_DOMAIN });
   if (refusal) return jsonError(refusal, 422, "challenge_rejected");
 
   const result = await gatewayRequest<SessionIssued>("/v1/auth/verify", { method: "POST", body: JSON.stringify(checked.value) });

@@ -43,8 +43,8 @@ export function parseChallenge(message: string): ParsedChallenge | null {
 export interface ChallengeExpectation {
   purpose: ChallengePurpose;
   address: string;
-  /** Acceptable Domain values (host or hostname of the gateway PUBLIC_BASE_URL). */
-  domains: readonly string[];
+  /** The exact Domain string (lowercased netloc of the gateway PUBLIC_BASE_URL); null means misconfigured, so refuse. */
+  domain: string | null;
   /** The `expires_at` field returned alongside the challenge (when known, it must equal the Expires line). */
   expiresAt?: string;
   now?: number;
@@ -54,8 +54,8 @@ export interface ChallengeExpectation {
 export function checkChallenge(message: string, expected: ChallengeExpectation): string | null {
   const parsed = parseChallenge(message);
   if (!parsed) return "Refusing to sign: the challenge is not in the KasGate format.";
-  if (expected.domains.length === 0 || !expected.domains.includes(parsed.domain.toLowerCase())) {
-    return `Refusing to sign: the challenge is for domain "${parsed.domain}", not this KasGate gateway (${expected.domains.join(" / ") || "unknown"}).`;
+  if (expected.domain === null || parsed.domain !== expected.domain) {
+    return `Refusing to sign: the challenge is for domain "${parsed.domain}", not this KasGate gateway (${expected.domain ?? "unknown"}).`;
   }
   if (parsed.purpose !== PURPOSE_TEXT[expected.purpose]) {
     return `Refusing to sign: the challenge purpose is not "${expected.purpose}" (it says "${parsed.purpose}").`;

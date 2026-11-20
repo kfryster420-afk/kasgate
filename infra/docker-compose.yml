@@ -60,13 +60,13 @@ services:
     build:
       context: ../apps/web
       args:
-        NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL}
+        NEXT_PUBLIC_GATEWAY_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
         NEXT_PUBLIC_KASPA_NETWORK: ${KASPA_NETWORK}
     restart: unless-stopped
     environment:
       GATEWAY_INTERNAL_URL: http://gateway:8000
       KASGATE_COOKIE_SECURE: ${KASGATE_COOKIE_SECURE:-true}
-      NEXT_PUBLIC_GATEWAY_URL: ${NEXT_PUBLIC_GATEWAY_URL}
+      NEXT_PUBLIC_GATEWAY_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
       NEXT_PUBLIC_KASPA_NETWORK: ${KASPA_NETWORK}
     depends_on:
       gateway:

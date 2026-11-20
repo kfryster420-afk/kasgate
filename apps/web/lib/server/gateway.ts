@@ -10,7 +10,8 @@ export type GatewayResult<T> =
 
 interface GatewayRequest {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
-  apiKey?: string;
+  /** Session token (`kgs_…`) sent as `Authorization: Bearer`. */
+  bearer?: string;
   /** Pre-serialised JSON body. */
   body?: string;
   query?: Record<string, string | number | undefined>;
@@ -30,7 +31,7 @@ function buildUrl(path: string, query?: GatewayRequest["query"]): string {
 
 function buildInit(req: GatewayRequest): RequestInit & { next?: { revalidate: number } } {
   const headers: Record<string, string> = { Accept: req.accept ?? "application/json" };
-  if (req.apiKey) headers.Authorization = `Bearer ${req.apiKey}`;
+  if (req.bearer) headers.Authorization = `Bearer ${req.bearer}`;
   if (req.body !== undefined) headers["Content-Type"] = "application/json";
   const init: RequestInit & { next?: { revalidate: number } } = {
     method: req.method ?? "GET",

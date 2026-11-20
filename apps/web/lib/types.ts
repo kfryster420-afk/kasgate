@@ -113,10 +113,23 @@ export interface MerchantRead {
   created_at: IsoDateTime;
 }
 
-/** Long-lived automation key (`kg_…`). Returned by register and rotate-key; shown to the user exactly once. */
+/**
+ * Returned by POST /v1/merchants and POST /v1/merchants/me/rotate-key (CONTRACT v2.2). `api_key` (`kg_…`) is the
+ * long-lived automation key, shown to the user exactly once. `session_token` (`kgs_…`) is the dashboard session that
+ * goes into the httpOnly cookie; `expires_at` is its expiry. Only the Next route handler ever sees `session_token`.
+ */
 export interface MerchantCreated {
   merchant: MerchantRead;
   api_key: string;
+  session_token: string;
+  expires_at: IsoDateTime;
+}
+
+/** What the browser receives after register / rotate: the key to show once, never the session token. */
+export interface MerchantKeyIssued {
+  merchant: MerchantRead;
+  api_key: string;
+  expires_at: IsoDateTime;
 }
 
 /** Wallet login result from the gateway. The session_token is consumed only by the Next route handler. */
@@ -127,7 +140,7 @@ export interface SessionIssued {
   expires_at: IsoDateTime;
 }
 
-/** What the browser receives after login or API-key sign-in: no credentials. */
+/** What the browser receives after wallet login: no credentials. */
 export interface SessionStarted {
   merchant: MerchantRead;
   expires_at: IsoDateTime | null;

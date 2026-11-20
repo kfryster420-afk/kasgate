@@ -9,6 +9,6 @@ export const dynamic = "force-dynamic";
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const auth = await requireSession(request);
   if (!isAuth(auth)) return auth;
-  const result = await gatewayRequest<MerchantRead>("/v1/merchants/me", { apiKey: auth.apiKey });
+  const result = await gatewayRequest<MerchantRead>("/v1/merchants/me", { bearer: auth.token });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
 }

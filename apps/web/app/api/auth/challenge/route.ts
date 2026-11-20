@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import type { NextResponse } from "next/server";
-import { EXPECTED_AUTH_DOMAINS } from "@/lib/config";
+import { EXPECTED_AUTH_DOMAIN } from "@/lib/config";
 import { checkChallenge } from "@/lib/challenge";
 import { gatewayRequest } from "@/lib/server/gateway";
 import { checkSameOrigin, fromGatewayFailure, jsonError, jsonOk, readJsonBody } from "@/lib/server/route";
@@ -30,7 +30,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const refusal = checkChallenge(result.data.challenge, {
     purpose,
     address: address.value,
-    domains: EXPECTED_AUTH_DOMAINS,
+    domain: EXPECTED_AUTH_DOMAIN,
     expiresAt: result.data.expires_at,
   });
   if (refusal) return jsonError(refusal, 502, "challenge_rejected");

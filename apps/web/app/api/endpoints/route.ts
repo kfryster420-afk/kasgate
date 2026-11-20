@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const auth = await requireSession(request);
   if (!isAuth(auth)) return auth;
-  const result = await gatewayRequest<EndpointRead[]>("/v1/endpoints", { apiKey: auth.apiKey });
+  const result = await gatewayRequest<EndpointRead[]>("/v1/endpoints", { bearer: auth.token });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
 }
 
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const result = await gatewayRequest<EndpointRead>("/v1/endpoints", {
     method: "POST",
-    apiKey: auth.apiKey,
+    bearer: auth.token,
     body: stringifyWithIntegers(built.payload, ["price_sompi"]),
   });
   return result.ok ? jsonOk(result.data, 201) : fromGatewayFailure(result);

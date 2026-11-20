@@ -13,7 +13,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const range = parseRange(request.nextUrl.searchParams);
   if (!range.ok) return jsonError(range.error, 422);
   const result = await gatewayRequest<MerchantAnalytics>("/v1/analytics", {
-    apiKey: auth.apiKey,
+    bearer: auth.token,
     query: { start: range.start, end: range.end },
   });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);

@@ -14,7 +14,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   if (!range.ok) return jsonError(range.error, 422);
 
   const upstream = await gatewayRaw("/v1/tax-report.csv", {
-    apiKey: auth.apiKey,
+    bearer: auth.token,
     accept: "text/csv",
     query: { start: range.start, end: range.end },
   });

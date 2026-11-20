@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { KASPA_UNAVAILABLE_MESSAGE } from "../errors";
 import type { ApiErrorBody } from "../types";
 import type { GatewayResult } from "./gateway";
-import { readApiKey } from "./session";
+import { readSessionToken } from "./session";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -38,17 +38,17 @@ export function checkSameOrigin(request: Request): NextResponse<ApiErrorBody> | 
   return jsonError("Cross-origin request rejected", 403);
 }
 
-export type AuthContext = { apiKey: string };
+export type AuthContext = { token: string };
 
-/** Resolves the session API key from the httpOnly cookie, or returns a 401 response. */
+/** Resolves the `kgs_` session token from the httpOnly cookie, or returns a 401 response. */
 export async function requireSession(request?: Request): Promise<AuthContext | NextResponse<ApiErrorBody>> {
   if (request && request.method !== "GET" && request.method !== "HEAD") {
     const blocked = checkSameOrigin(request);
     if (blocked) return blocked;
   }
-  const apiKey = await readApiKey();
-  if (!apiKey) return jsonError("Not signed in", 401);
-  return { apiKey };
+  const token = await readSessionToken();
+  if (!token) return jsonError("Not signed in", 401);
+  return { token };
 }
 
 export function isAuth(value: AuthContext | NextResponse): value is AuthContext {

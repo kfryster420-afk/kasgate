@@ -4,7 +4,7 @@ import { Loader2, LogIn, ShieldCheck, Wallet } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { apiFetch, errorMessage } from "@/lib/api-client";
 import { checkChallenge, parseChallenge } from "@/lib/challenge";
-import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAINS, NETWORK_LABEL } from "@/lib/config";
+import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, NETWORK_LABEL } from "@/lib/config";
 import { getKasware, isPublicKey, isSignatureToken } from "@/lib/kasware";
 import type { AuthChallenge, AuthChallengeRequest, AuthPurpose } from "@/lib/types";
 import { checkKaspaAddress } from "@/lib/validation";
@@ -65,7 +65,7 @@ export function WalletProofPanel({ purpose, address, onAddressChange, onProof, p
     if (!checked.ok) throw new Error(checked.error);
     const body: AuthChallengeRequest = { kaspa_address: checked.value, purpose };
     const result = await apiFetch<AuthChallenge>("/api/auth/challenge", { method: "POST", body });
-    const refusal = checkChallenge(result.challenge, { purpose, address: checked.value, domains: EXPECTED_AUTH_DOMAINS, expiresAt: result.expires_at });
+    const refusal = checkChallenge(result.challenge, { purpose, address: checked.value, domain: EXPECTED_AUTH_DOMAIN, expiresAt: result.expires_at });
     if (refusal) throw new Error(refusal);
     setChallenge(result);
     setSignature("");
@@ -130,7 +130,7 @@ export function WalletProofPanel({ purpose, address, onAddressChange, onProof, p
   async function submitManual(event: FormEvent) {
     event.preventDefault();
     if (!challenge) return;
-    const refusal = checkChallenge(challenge.challenge, { purpose, address: challenge.kaspa_address, domains: EXPECTED_AUTH_DOMAINS, expiresAt: challenge.expires_at });
+    const refusal = checkChallenge(challenge.challenge, { purpose, address: challenge.kaspa_address, domain: EXPECTED_AUTH_DOMAIN, expiresAt: challenge.expires_at });
     if (refusal) return setError(refusal);
     if (!isPublicKey(publicKey)) return setError("Public key must be 64 or 66 hex characters");
     if (!isSignatureToken(signature)) return setError("Paste the signature exactly as your wallet produced it");

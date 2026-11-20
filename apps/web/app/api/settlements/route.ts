@@ -21,7 +21,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const offset = intParam(params.get("offset"), 0, 0, 1_000_000);
   if (limit === null || offset === null) return jsonError("limit must be 1–200 and offset a non-negative integer", 422);
   const result = await gatewayRequest<SettlementRead[]>("/v1/settlements", {
-    apiKey: auth.apiKey,
+    bearer: auth.token,
     query: { limit, offset },
   });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
