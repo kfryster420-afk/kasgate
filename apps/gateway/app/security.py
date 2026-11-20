@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 import httpcore
@@ -23,7 +23,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from kaspa import PublicKey, verify_message
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,8 @@ SESSION_TOKEN_PREFIX = "kgs_"  # noqa: S105 - a token-type prefix, not a credent
 API_KEY_MIN_LENGTH = len(API_KEY_PREFIX) + 16
 API_KEY_MAX_LENGTH = 128
 SESSION_KEY_PREFIX = "kasgate:session:"
+SESSION_INDEX_PREFIX = "kasgate:sessions:"
+SESSION_REVOKE_ATTEMPTS = 5
 
 HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     {
@@ -94,16 +96,92 @@ def generate_session_token() -> str:
     return f"{SESSION_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
 
 
+def session_digest(token: str) -> str:
+    return hash_api_key(token)
+
+
 def session_key(token: str) -> str:
-    return f"{SESSION_KEY_PREFIX}{hash_api_key(token)}"
+    return f"{SESSION_KEY_PREFIX}{session_digest(token)}"
+
+
+def session_index_key(merchant_id: uuid.UUID) -> str:
+    """`kasgate:sessions:{merchant_id}`: the set of that merchant's live session digests (for logout-all)."""
+    return f"{SESSION_INDEX_PREFIX}{merchant_id}"
+
+
+def _text(value: bytes | str) -> str:
+    return value.decode("ascii") if isinstance(value, bytes) else value
+
+
+async def prune_session_index(redis: Redis, merchant_id: uuid.UUID) -> list[str]:
+    """Drop members whose `kasgate:session:{digest}` key has expired or been deleted; return the live digests."""
+    index = session_index_key(merchant_id)
+    members = sorted(_text(member) for member in await cast(Awaitable[set[Any]], redis.smembers(index)))
+    if not members:
+        return []
+    async with redis.pipeline(transaction=False) as pipe:
+        for digest in members:
+            pipe.exists(f"{SESSION_KEY_PREFIX}{digest}")
+        flags = await pipe.execute()
+    live = [digest for digest, present in zip(members, flags, strict=True) if present]
+    stale = [digest for digest, present in zip(members, flags, strict=True) if not present]
+    if stale:
+        await cast(Awaitable[int], redis.srem(index, *stale))
+    return live
 
 
 async def create_session(redis: Redis, merchant_id: uuid.UUID) -> tuple[str, datetime]:
-    """Store `kasgate:session:{sha256(token)}` -> merchant id for `session_ttl_seconds`; return (token, expiry)."""
+    """Issue a `kgs_` session and index it; return (token, expiry).
+
+    One MULTI/EXEC stores `kasgate:session:{sha256(token)}` -> merchant id (EX `session_ttl_seconds`), adds the digest
+    to `kasgate:sessions:{merchant_id}` and re-arms that set's expiry to the same TTL. The new session always has the
+    longest remaining life, so the set never expires before any session it lists. Stale members are pruned on the way.
+    """
     ttl = get_settings().session_ttl_seconds
     token = generate_session_token()
-    await redis.set(session_key(token), str(merchant_id), ex=ttl)
+    index = session_index_key(merchant_id)
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.set(session_key(token), str(merchant_id), ex=ttl)
+        pipe.sadd(index, session_digest(token))
+        pipe.expire(index, ttl)
+        await pipe.execute()
+    try:
+        await prune_session_index(redis, merchant_id)
+    except RedisError:
+        logger.warning("could not prune the session index of %s", merchant_id, exc_info=True)
     return token, datetime.now(UTC) + timedelta(seconds=ttl)
+
+
+async def revoke_session(redis: Redis, merchant_id: uuid.UUID, token: str) -> None:
+    """Log out one session: delete `kasgate:session:{digest}` and remove the digest from the merchant's set."""
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.delete(session_key(token))
+        pipe.srem(session_index_key(merchant_id), session_digest(token))
+        await pipe.execute()
+
+
+async def revoke_all_sessions(redis: Redis, merchant_id: uuid.UUID) -> int:
+    """Delete every session of `merchant_id` and the index itself; return how many session keys existed.
+
+    The index is WATCHed while its members are read, so a session issued concurrently makes the MULTI/EXEC retry
+    instead of being left behind unlisted. Sessions that exist but are not in the set cannot occur: `create_session`
+    writes both in one transaction.
+    """
+    index = session_index_key(merchant_id)
+    async with redis.pipeline(transaction=True) as pipe:
+        for _ in range(SESSION_REVOKE_ATTEMPTS):
+            try:
+                await pipe.watch(index)
+                members = [_text(member) for member in await cast(Awaitable[set[Any]], pipe.smembers(index))]
+                pipe.multi()  # type: ignore[no-untyped-call]
+                for digest in members:
+                    pipe.delete(f"{SESSION_KEY_PREFIX}{digest}")
+                pipe.delete(index)
+                results = await pipe.execute()
+            except WatchError:
+                continue
+            return sum(int(count) for count in results[:-1])
+    raise RedisError("could not revoke sessions: the session index kept changing")
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -131,6 +209,13 @@ async def _merchant_for_session(token: str, session: AsyncSession, redis: Redis)
     except ValueError:
         return None
     return (await session.execute(select(Merchant).where(Merchant.id == merchant_id))).scalar_one_or_none()
+
+
+def get_bearer_token(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme)) -> str:
+    """The raw `Authorization: Bearer` token (401 when absent); used by routes that act on the credential itself."""
+    if credentials is None:
+        raise _unauthorized("missing bearer token")
+    return credentials.credentials.strip()
 
 
 async def get_current_merchant(

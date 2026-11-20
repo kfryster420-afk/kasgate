@@ -63,14 +63,41 @@ class DownRedis:
         return fail
 
 
+class _LimiterPipeline:
+    """A real pipeline that fails like a dead server only when it carries the rate limiter's INCR."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self._limiter = False
+
+    async def __aenter__(self) -> "_LimiterPipeline":
+        await self._real.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self._real.__aexit__(*exc)
+
+    def incr(self, *args: Any, **kwargs: Any) -> Any:
+        self._limiter = True
+        return self._real.incr(*args, **kwargs)
+
+    async def execute(self) -> Any:
+        if self._limiter:
+            raise RedisConnectionError("redis is down")
+        return await self._real.execute()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
 class LimiterDownRedis:
     """Redis that works for everything except the rate limiter's MULTI/EXEC pipeline."""
 
     def __init__(self, healthy: Any) -> None:
         self._healthy = healthy
 
-    def pipeline(self, *args: Any, **kwargs: Any) -> DownPipeline:
-        return DownPipeline()
+    def pipeline(self, *args: Any, **kwargs: Any) -> _LimiterPipeline:
+        return _LimiterPipeline(self._healthy.pipeline(*args, **kwargs))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._healthy, name)

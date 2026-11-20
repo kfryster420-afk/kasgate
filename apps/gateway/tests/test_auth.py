@@ -20,6 +20,9 @@ from app.security import (
     hash_api_key,
     new_auth_challenge,
     parse_auth_challenge,
+    prune_session_index,
+    session_digest,
+    session_index_key,
     session_key,
 )
 from tests.conftest import (
@@ -593,16 +596,70 @@ async def test_rotate_key_returns_new_key_and_a_session_and_kills_the_old_key(
     assert (await client.post("/v1/merchants/me/rotate-key", headers=bearer(seeded.api_key))).status_code == 401
 
 
-async def test_rotate_key_with_a_session_keeps_existing_sessions(client: httpx.AsyncClient) -> None:
+async def test_rotate_key_revokes_every_old_session_and_the_new_one_works(
+    client: httpx.AsyncClient, redis: Any
+) -> None:
     created = await register(client)
     issued = await login(client)
+    second_login = await login(client)
+    old_sessions = [created.session_token, issued.session_token, second_login.session_token]
+    index = session_index_key(created.merchant.id)
+    assert await redis.scard(index) == 3
+
     response = await client.post("/v1/merchants/me/rotate-key", headers=bearer(issued.session_token))
     assert response.status_code == 200
     rotated = MerchantCreated.model_validate(response.json())
+
+    for token in old_sessions:
+        assert (await client.get("/v1/merchants/me", headers=bearer(token))).status_code == 401
+        assert await redis.exists(session_key(token)) == 0
     assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 401
     assert (await client.get("/v1/merchants/me", headers=bearer(rotated.api_key))).status_code == 200
-    for token in (created.session_token, issued.session_token, rotated.session_token):
-        assert (await client.get("/v1/merchants/me", headers=bearer(token))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(rotated.session_token))).status_code == 200
+    # only the new session is left, and it is the only member of the rebuilt index
+    assert await redis.smembers(index) == {session_digest(rotated.session_token)}
+    assert await redis.keys("kasgate:session:*") == [session_key(rotated.session_token)]
+
+
+async def test_rotate_key_by_api_key_also_revokes_sessions_and_cleans_the_index(
+    client: httpx.AsyncClient, redis: Any
+) -> None:
+    created = await register(client)
+    index = session_index_key(created.merchant.id)
+    rotated = MerchantCreated.model_validate(
+        (await client.post("/v1/merchants/me/rotate-key", headers=bearer(created.api_key))).json()
+    )
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 401
+    assert await redis.smembers(index) == {session_digest(rotated.session_token)}
+    # rotating twice leaves exactly one session behind each time
+    again = MerchantCreated.model_validate(
+        (await client.post("/v1/merchants/me/rotate-key", headers=bearer(rotated.api_key))).json()
+    )
+    assert (await client.get("/v1/merchants/me", headers=bearer(rotated.session_token))).status_code == 401
+    assert await redis.smembers(index) == {session_digest(again.session_token)}
+
+
+async def test_rotate_key_leaves_other_merchants_sessions_alone(client: httpx.AsyncClient) -> None:
+    mine = await register(client, MERCHANT_KEY)
+    theirs = await register(client, OTHER_KEY)
+    await client.post("/v1/merchants/me/rotate-key", headers=bearer(mine.api_key))
+    assert (await client.get("/v1/merchants/me", headers=bearer(theirs.session_token))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(theirs.api_key))).status_code == 200
+
+
+async def test_rotate_key_revokes_sessions_before_the_new_key_exists(
+    client: httpx.AsyncClient, redis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = await register(client)
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RedisConnectionError("down")
+
+    monkeypatch.setattr(redis, "pipeline", broken)
+    response = await client.post("/v1/merchants/me/rotate-key", headers=bearer(created.api_key))
+    assert response.status_code == 503
+    monkeypatch.undo()
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200  # not rotated
 
 
 async def test_rotate_key_stores_only_the_hash(
@@ -618,6 +675,105 @@ async def test_rotate_key_stores_only_the_hash(
 
 async def test_rotate_key_requires_auth(client: httpx.AsyncClient) -> None:
     assert (await client.post("/v1/merchants/me/rotate-key")).status_code == 401
+
+
+# ---------------------------------------------------------------- session index and logout
+
+
+async def test_every_issued_session_is_indexed_with_a_matching_expiry(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    issued = await login(client)
+    index = session_index_key(created.merchant.id)
+    assert index == f"kasgate:sessions:{created.merchant.id}"
+    assert await redis.smembers(index) == {
+        session_digest(created.session_token),
+        session_digest(issued.session_token),
+    }
+    newest_ttl = await redis.ttl(session_key(issued.session_token))
+    assert await redis.ttl(index) >= newest_ttl - 1  # never shorter than the newest session
+
+
+async def test_index_expiry_follows_session_ttl_setting(
+    client: httpx.AsyncClient, redis: Any, override_settings: SettingsOverride
+) -> None:
+    override_settings(session_ttl_seconds=3600)
+    created = await register(client)
+    assert 3500 < await redis.ttl(session_index_key(created.merchant.id)) <= 3600
+
+
+async def test_stale_members_are_pruned_when_a_new_session_is_issued_and_on_read(
+    client: httpx.AsyncClient, redis: Any
+) -> None:
+    created = await register(client)
+    index = session_index_key(created.merchant.id)
+    await redis.delete(session_key(created.session_token))  # that session expired
+    await redis.sadd(index, "f" * 64)  # a digest that never existed
+    assert len(await redis.smembers(index)) == 2
+    assert await prune_session_index(redis, created.merchant.id) == []
+    assert await redis.smembers(index) == set()
+    await redis.sadd(index, "e" * 64)
+    issued = await login(client)  # issuing prunes too
+    assert await redis.smembers(index) == {session_digest(issued.session_token)}
+
+
+async def test_logout_invalidates_only_that_session(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    other = await login(client)
+    response = await client.delete("/v1/auth/session", headers=bearer(created.session_token))
+    assert response.status_code == 204
+    assert response.content == b""
+    assert await redis.exists(session_key(created.session_token)) == 0
+    assert await redis.smembers(session_index_key(created.merchant.id)) == {session_digest(other.session_token)}
+    # the logged-out token is dead; the other session and the API key are untouched
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 401
+    assert (await client.get("/v1/merchants/me", headers=bearer(other.session_token))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+
+
+async def test_logging_out_twice_is_401_the_second_time(client: httpx.AsyncClient) -> None:
+    created = await register(client)
+    assert (await client.delete("/v1/auth/session", headers=bearer(created.session_token))).status_code == 204
+    again = await client.delete("/v1/auth/session", headers=bearer(created.session_token))
+    assert again.status_code == 401
+    assert again.headers["www-authenticate"] == "Bearer"
+
+
+async def test_last_logout_leaves_no_index_behind(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    await client.delete("/v1/auth/session", headers=bearer(created.session_token))
+    assert await redis.keys("kasgate:session:*") == []
+    assert await redis.keys("kasgate:sessions:*") == []  # an emptied set is removed by Redis
+
+
+async def test_logout_with_an_api_key_is_400_and_changes_nothing(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    response = await client.delete("/v1/auth/session", headers=bearer(created.api_key))
+    assert response.status_code == 400
+    assert "rotate-key" in response.json()["detail"]
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 200
+    assert await redis.scard(session_index_key(created.merchant.id)) == 1
+
+
+async def test_logout_requires_credentials(client: httpx.AsyncClient) -> None:
+    assert (await client.delete("/v1/auth/session")).status_code == 401
+    assert (await client.delete("/v1/auth/session", headers=bearer("kgs_" + "a" * 43))).status_code == 401
+
+
+async def test_logout_fails_closed_when_redis_is_down(
+    client: httpx.AsyncClient, redis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = await register(client)
+    real_pipeline = redis.pipeline
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RedisConnectionError("down")
+
+    monkeypatch.setattr(redis, "pipeline", broken)
+    response = await client.delete("/v1/auth/session", headers=bearer(created.session_token))
+    assert response.status_code == 503
+    monkeypatch.setattr(redis, "pipeline", real_pipeline)
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 200
 
 
 # ---------------------------------------------------------------- bounds

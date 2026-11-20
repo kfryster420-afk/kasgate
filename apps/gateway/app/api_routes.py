@@ -53,15 +53,19 @@ from app.security import (
     RATE_LIMIT_AUTH_VERIFY,
     RATE_LIMIT_CREATE_MERCHANT,
     RATE_LIMIT_UNPAID_PROXY,
+    SESSION_TOKEN_PREFIX,
     auth_challenge_key,
     consume_wallet_proof,
     create_session,
     encrypt_headers,
     generate_api_key,
+    get_bearer_token,
     get_current_merchant,
     hash_api_key,
     limit_by_ip,
     new_auth_challenge,
+    revoke_all_sessions,
+    revoke_session,
     validate_upstream_headers,
 )
 
@@ -139,8 +143,17 @@ async def _issue_session(redis: Redis, merchant_id: uuid.UUID) -> tuple[str, dat
 
 
 async def _rotate_api_key(session: AsyncSession, redis: Redis, merchant: Merchant) -> MerchantCreated:
-    """Replace the API key (the old one stops working at once) and return it with a fresh `kgs_` session."""
+    """Revoke ALL sessions, replace the API key (the old one stops working at once), return it with a new session."""
     api_key = generate_api_key()
+    try:
+        await revoke_all_sessions(redis, merchant.id)  # every old session dies before the new key and session exist
+    except RedisError as exc:
+        logger.exception("could not revoke sessions")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="sessions are temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
     token, expires_at = await _issue_session(redis, merchant.id)
     merchant.api_key_hash = hash_api_key(api_key)
     await session.commit()
@@ -288,6 +301,41 @@ async def auth_verify(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="login is temporarily unavailable"
         ) from exc
     return SessionIssued(merchant=MerchantRead.model_validate(merchant), session_token=token, expires_at=expires_at)
+
+
+@router.delete(
+    "/auth/session",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["auth"],
+    responses={400: {"description": "the caller used an API key, not a dashboard session"}},
+)
+async def auth_logout(
+    merchant: CurrentMerchant,
+    token: Annotated[str, Depends(get_bearer_token)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> Response:
+    """Log out the `kgs_` session in the Authorization header; other sessions and the API key are untouched.
+
+    An API key is not a session, so there is nothing to log out: that is a 400 pointing at rotate-key, which is how
+    a `kg_` key is revoked.
+    """
+    if not token.startswith(SESSION_TOKEN_PREFIX):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "logout needs a dashboard session (kgs_...); revoke an API key with POST /v1/merchants/me/rotate-key"
+            ),
+        )
+    try:
+        await revoke_session(redis, merchant.id, token)
+    except RedisError as exc:
+        logger.exception("could not revoke session")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="sessions are temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------------- endpoints
