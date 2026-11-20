@@ -30,8 +30,13 @@ from app.schemas import (
 )
 
 from conftest import OFFLINE_PAYER_KEY, address_for_key
+from txforge import make_payer_proof
 
 PAYER = address_for_key(OFFLINE_PAYER_KEY)
+
+
+def pp(tx_id: str, nonce: str) -> str:
+    return make_payer_proof(OFFLINE_PAYER_KEY, nonce, tx_id)
 PRICE = 2_000_000_000
 NONCE = "0123456789abcdef" * 2
 
@@ -199,7 +204,7 @@ def test_gateway_limits_are_the_v2_values() -> None:
 
 def test_largest_legal_payment_signature_fits_in_the_header_cap() -> None:
     signature = PaymentSignature(
-        txId="ab" * 32, rawTx='{"x":"' + "a" * (MAX_RAW_TX_CHARS - 10) + '"}', payerAddress=PAYER, nonce=NONCE
+        txId="ab" * 32, rawTx='{"x":"' + "a" * (MAX_RAW_TX_CHARS - 10) + '"}', payerAddress=PAYER, nonce=NONCE, payerProof=pp("ab" * 32, NONCE)
     )
     header = signature.to_header()
     assert len(header) <= MAX_HEADER_BYTES
@@ -208,7 +213,7 @@ def test_largest_legal_payment_signature_fits_in_the_header_cap() -> None:
 
 def test_rawtx_one_char_over_the_limit_is_rejected() -> None:
     with pytest.raises(ValueError):
-        PaymentSignature(txId="ab" * 32, rawTx="x" * (MAX_RAW_TX_CHARS + 1), payerAddress=PAYER, nonce=NONCE)
+        PaymentSignature(txId="ab" * 32, rawTx="x" * (MAX_RAW_TX_CHARS + 1), payerAddress=PAYER, nonce=NONCE, payerProof=pp("ab" * 32, NONCE))
 
 
 def test_header_one_byte_over_the_cap_is_rejected() -> None:
@@ -220,7 +225,7 @@ def test_largest_legal_header_exceeds_the_default_h11_limit_so_front_proxies_mus
     """Info: uvicorn's h11 default (16 KiB) and nginx's 8 KiB per header line are below the 40 KiB cap; the gateway
     Dockerfile sets --h11-max-incomplete-event-size 65536 but any reverse proxy in front needs the same treatment."""
     signature = PaymentSignature(
-        txId="ab" * 32, rawTx='{"x":"' + "a" * (MAX_RAW_TX_CHARS - 10) + '"}', payerAddress=PAYER, nonce=NONCE
+        txId="ab" * 32, rawTx='{"x":"' + "a" * (MAX_RAW_TX_CHARS - 10) + '"}', payerAddress=PAYER, nonce=NONCE, payerProof=pp("ab" * 32, NONCE)
     )
     assert len(signature.to_header()) > 16 * 1024
 

@@ -26,3 +26,9 @@ async with KasGateClient(PRIVATE_KEY_HEX, network="kaspa:testnet-10", max_price_
 - **Inputs.** Change is either 0 or at least 30_000_000 sompi; the builder adds UTXOs rather than emit small change and
   raises `DustChangeError` (an `InsufficientFundsError`) instead of donating it to the miner. At most 16 distinct input
   addresses are used.
+- **Payer proof (v2.6).** `PAYMENT-SIGNATURE` carries `payerProof`, `kaspa.sign_message("kasgate:v1:<nonce>:<txId>", key)`
+  as 128 hex (`kasgate_client.payer_proof_message`), so a mempool observer cannot present your signed transaction as
+  their own. The SDK self-verifies the proof before sending.
+- **Known limitation.** Two equal UTXOs that each almost cover the payment (for example `[60.3M, 60.3M]` at the minimum
+  price) raise `TransactionBuildError`: `kaspa.Generator` cannot be made to spend both without a non-zero priority fee.
+  The SDK fails closed rather than donate to the miner; any extra UTXO resolves it.

@@ -11,11 +11,11 @@ import json
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import kaspa
-from kasgate_client import PaymentSignature, payment_payload
+from kasgate_client import PaymentSignature, payer_proof_message, payment_payload
 
 MIN_CHANGE_SOMPI = 30_000_000  # CONTRACT v2.3: change is 0 or >= 0.3 KAS, else the tx is non-standard (storage mass)
 NETWORK_IDS = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}
@@ -30,13 +30,20 @@ class ForgedPayment:
     spent_outpoints: tuple[tuple[str, int], ...] = ()
     nonce: str | None = None
     payload: bytes = b""
+    payer_key: str = field(default="", repr=False)  # signs payerProof; never rendered in reprs or failure output
 
     def signature(self, **overrides: str) -> PaymentSignature:
-        """PAYMENT-SIGNATURE body; `nonce` defaults to the one the tx payload was forged for."""
+        """PAYMENT-SIGNATURE body; `nonce` defaults to the one the tx payload was forged for.
+
+        CONTRACT v2.6: `payerProof` defaults to the payer key's proof over the (possibly overridden) nonce and txId, so
+        `header(nonce=...)` / `header(txId=...)` stay self-consistent; pass `payerProof=` to forge any other value.
+        """
         fields = {"txId": self.tx_id, "rawTx": self.raw_tx, "payerAddress": self.payer_address, "nonce": self.nonce}
         fields.update(overrides)
         if fields["nonce"] is None:
             raise ValueError("forge_payment(..., nonce=...) or header(nonce=...) is required (CONTRACT v2)")
+        if "payerProof" not in fields:
+            fields["payerProof"] = make_payer_proof(self.payer_key, fields["nonce"], fields["txId"])
         return PaymentSignature(**fields)
 
     def header(self, **overrides: str) -> str:
@@ -70,6 +77,13 @@ def fetch_utxos_sync(address: str, network: str, rpc_url: str | None) -> list[di
 
 def _amount(entry: dict[str, Any]) -> int:
     return int(entry.get("utxoEntry", entry)["amount"])
+
+
+def make_payer_proof(key_hex: str, nonce: str, tx_id: str) -> str:
+    """CONTRACT v2.6: Schnorr sign_message(payer_proof_message(nonce, txId)) by `key_hex`, 128 hex."""
+    if not key_hex:
+        raise ValueError("no payer key to sign payerProof with: pass payerProof= explicitly")
+    return kaspa.sign_message(payer_proof_message(nonce, tx_id), kaspa.PrivateKey(key_hex))
 
 
 def forge_payment(
@@ -118,6 +132,7 @@ def forge_payment(
         spent_outpoints=spent,
         nonce=nonce,
         payload=bytes.fromhex(tx.payload),
+        payer_key=private_key_hex,
     )
 
 
@@ -223,4 +238,5 @@ def forge_exact(
         spent_outpoints=spent,
         nonce=nonce,
         payload=bytes.fromhex(signed.payload),
+        payer_key=private_keys[0],
     )

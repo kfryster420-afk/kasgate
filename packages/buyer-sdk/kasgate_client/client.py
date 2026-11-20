@@ -44,6 +44,7 @@ from .protocol import (
     PaymentResponse,
     PaymentSignature,
     kas_to_sompi,
+    payer_proof_message,
     payment_payload,
 )
 from .transaction import BuiltPayment, build_payment_transaction
@@ -320,6 +321,22 @@ class KasGateClient:
             min_output_sompi=floor,
         )
 
+    def _payer_proof(self, nonce: str, tx_id: str) -> str:
+        """Schnorr proof that the payer key (not a mempool observer) presents this tx for this challenge (v2.6)."""
+        message = payer_proof_message(nonce, tx_id)
+        proof = kaspa.sign_message(message, self._private_key)
+        if not kaspa.verify_message(
+            message,
+            proof,
+            kaspa.PublicKey(
+                self._private_key.to_public_key().to_x_only_public_key().to_string()
+            ),
+        ):
+            raise TransactionBuildError(
+                "the payer proof does not verify against the payer key"
+            )
+        return proof
+
     def _signature_header(self, built: BuiltPayment, nonce: str) -> str:
         if len(built.raw_tx) > GATEWAY_MAX_RAW_TX_CHARS:
             raise TransactionBuildError(
@@ -330,6 +347,7 @@ class KasGateClient:
             rawTx=built.raw_tx,
             payerAddress=built.payer_address,
             nonce=nonce,
+            payerProof=self._payer_proof(nonce, built.tx_id),
         ).to_header()
         if len(header) > self.max_signature_header_bytes:
             raise TransactionBuildError(

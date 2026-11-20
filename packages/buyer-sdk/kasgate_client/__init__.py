@@ -40,6 +40,7 @@ from .protocol import (
     compute_fee_split,
     kas_to_sompi,
     min_price_sompi,
+    payer_proof_message,
     payment_payload,
     sompi_to_kas,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "compute_fee_split",
     "kas_to_sompi",
     "min_price_sompi",
+    "payer_proof_message",
     "payment_payload",
     "receipt_of",
     "sompi_to_kas",

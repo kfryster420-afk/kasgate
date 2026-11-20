@@ -52,19 +52,26 @@ def test_payment_required_identical_bytes_and_cross_decode(price: int) -> None:
     assert gw.PaymentRequired.from_header(decoded.to_header()) == gateway_model
 
 
+PROOF = "ab" * 64
+
+
 def test_payment_signature_identical_bytes_both_directions() -> None:
     raw_tx = json.dumps({"id": TX_ID, "inputs": [], "outputs": []})
     sdk_model = sdk.PaymentSignature(
-        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE
+        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE, payerProof=PROOF
     )
     gateway_model = gw.PaymentSignature(
-        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE
+        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE, payerProof=PROOF
     )
 
     assert sdk_model.to_header() == gateway_model.to_header()
     assert gw.PaymentSignature.from_header(sdk_model.to_header()).rawTx == raw_tx
     assert sdk.PaymentSignature.from_header(gateway_model.to_header()).txId == TX_ID
     assert sdk.PaymentSignature.from_header(gateway_model.to_header()).nonce == NONCE
+    assert (
+        sdk.PaymentSignature.from_header(gateway_model.to_header()).payerProof == PROOF
+    )
+    assert gw.PaymentSignature.from_header(sdk_model.to_header()).payerProof == PROOF
 
 
 def test_payment_response_identical_bytes_both_directions() -> None:
@@ -122,7 +129,11 @@ def test_signature_rejects_mainnet_payer_like_the_gateway() -> None:
     mainnet_payer = "kaspa:" + PAYER.split(":", 1)[1]
     raw_tx = "{}"
     sdk_model = sdk.PaymentSignature(
-        txId=TX_ID, rawTx=raw_tx, payerAddress=mainnet_payer, nonce=NONCE
+        txId=TX_ID,
+        rawTx=raw_tx,
+        payerAddress=mainnet_payer,
+        nonce=NONCE,
+        payerProof=PROOF,
     )
     with pytest.raises(ValueError):
         gw.PaymentSignature.from_header(sdk_model.to_header())
@@ -311,3 +322,52 @@ def test_kas_to_sompi_exact(value: object, expected: int) -> None:
 def test_kas_to_sompi_rejects_bad_values(value: object) -> None:
     with pytest.raises(ValueError):
         sdk.kas_to_sompi(value)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- CONTRACT v2.6: payerProof
+
+
+@pytest.mark.parametrize("nonce", [NONCE, "00" * 16, "ff" * 16])
+def test_payer_proof_message_matches_the_gateway_byte_for_byte(nonce: str) -> None:
+    for tx_id in (TX_ID, "00" * 32, "0f" * 32):
+        assert sdk.payer_proof_message(nonce, tx_id) == gw.payer_proof_message(
+            nonce, tx_id
+        )
+        assert sdk.payer_proof_message(nonce, tx_id) == f"kasgate:v1:{nonce}:{tx_id}"
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "ab" * 63, "ab" * 65, "zz" * 64, "AB" * 63 + "A", None, 5]
+)
+def test_proof_values_rejected_by_the_gateway_are_rejected_by_the_sdk(bad) -> None:
+    fields = {"txId": TX_ID, "rawTx": "{}", "payerAddress": PAYER, "nonce": NONCE}
+    with pytest.raises(ValueError):
+        gw.PaymentSignature(payerProof=bad, **fields)
+    with pytest.raises(ValueError):
+        sdk.PaymentSignature(payerProof=bad, **fields)
+
+
+def test_proof_is_required() -> None:
+    fields = {"txId": TX_ID, "rawTx": "{}", "payerAddress": PAYER, "nonce": NONCE}
+    with pytest.raises(ValueError):
+        gw.PaymentSignature(**fields)
+    with pytest.raises(ValueError):
+        sdk.PaymentSignature(**fields)
+
+
+def test_proof_encodings_normalise_like_the_gateway() -> None:
+    import base64
+
+    raw = bytes(range(64))
+    fields = {"txId": TX_ID, "rawTx": "{}", "payerAddress": PAYER, "nonce": NONCE}
+    for form in (
+        raw.hex(),
+        raw.hex().upper(),
+        base64.b64encode(raw).decode(),
+        base64.b64encode(b"\x00" + raw).decode(),
+    ):
+        assert (
+            sdk.PaymentSignature(payerProof=form, **fields).payerProof
+            == gw.PaymentSignature(payerProof=form, **fields).payerProof
+            == raw.hex()
+        )

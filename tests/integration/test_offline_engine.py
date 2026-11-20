@@ -19,7 +19,7 @@ from app.schemas import compute_fee_split, min_price_sompi, payment_payload
 from kasgate_client.transaction import build_payment_transaction
 
 from conftest import OFFLINE_PAYER_KEY, address_for_key
-from txforge import forge_exact, forge_payment, tamper_raw_tx
+from txforge import make_payer_proof, forge_exact, forge_payment, tamper_raw_tx
 
 KAS = 100_000_000
 MERCHANT_KEY = "c7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"
@@ -31,7 +31,7 @@ TREASURY = get_settings().kasgate_treasury_address
 NETWORK = "kaspa:testnet-10"
 PRICE = 2_000_000_000
 FLOOR = get_settings().min_output_sompi
-MIN_PRICE = min_price_sompi(FLOOR)  # CONTRACT v2.1: 40_000_000
+MIN_PRICE = min_price_sompi(FLOOR)  # CONTRACT v2.3: 60_000_000
 NONCE = "0123456789abcdef" * 2
 OTHER_NONCE = "fedcba9876543210" * 2
 CROSSOVER = (MIN_PRICE, 1_333_333_333, 1_333_333_334, 1_333_333_335)
@@ -69,17 +69,22 @@ def forge_tx(outputs, key: str = OFFLINE_PAYER_KEY, utxos=None, **kwargs):
     return forge_payment(private_key_hex=key, network=NETWORK, utxos=utxos or [utxo(0)], outputs=outputs, **kwargs)
 
 
+def pp(tx_id: str, nonce: str = NONCE, key: str = OFFLINE_PAYER_KEY) -> str:
+    """payerProof (CONTRACT v2.6) by `key` over this nonce and txId."""
+    return make_payer_proof(key, nonce, tx_id)
+
+
 def verdict(engine: KaspaEngine, required, forged, **overrides) -> str:
     """Return the error code the engine produces for `forged`, or 'accepted'."""
-    signature = GatewayPaymentSignature.model_validate(
-        {
-            "txId": forged.tx_id,
-            "rawTx": forged.raw_tx,
-            "payerAddress": forged.payer_address,
-            "nonce": NONCE,
-            **overrides,
-        }
-    )
+    fields = {
+        "txId": forged.tx_id,
+        "rawTx": forged.raw_tx,
+        "payerAddress": forged.payer_address,
+        "nonce": NONCE,
+        **overrides,
+    }
+    fields.setdefault("payerProof", pp(fields["txId"], fields["nonce"], key=forged.payer_key))
+    signature = GatewayPaymentSignature.model_validate(fields)
     try:
         engine.verify(signature, required)
     except PaymentVerificationError as exc:
@@ -104,7 +109,7 @@ def test_sdk_built_payment_is_accepted_by_the_gateway_engine(engine, required) -
         payload=payment_payload(required.nonce),
     )
     signature = GatewayPaymentSignature(
-        txId=built.tx_id, rawTx=built.raw_tx, payerAddress=built.payer_address, nonce=required.nonce
+        txId=built.tx_id, rawTx=built.raw_tx, payerAddress=built.payer_address, nonce=required.nonce, payerProof=pp(built.tx_id, required.nonce)
     )
     verified, tx = engine.verify(signature, required)
     assert verified.tx_id == built.tx_id == tx.id
@@ -150,7 +155,7 @@ def test_forged_id_field_inside_raw_tx_cannot_pass_as_the_claimed_tx_id(engine, 
     fake_id = "cd" * 32
     raw = tamper_raw_tx(forged, lambda d: d.update(id=fake_id))
     assert kaspa.Transaction.from_dict(json.loads(raw)).id == fake_id  # SDK trap this test guards against
-    signature = GatewayPaymentSignature(txId=fake_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId=fake_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(fake_id, NONCE))
     with pytest.raises(PaymentVerificationError) as caught:
         engine.verify(signature, required)
     assert caught.value.code == "invalid_payment_header"
@@ -164,7 +169,7 @@ def test_tx_id_replaced_by_real_id_but_other_body_is_rejected(engine, required) 
         data["outputs"].insert(0, data["outputs"][-1])
 
     raw = tamper_raw_tx(forged, add_output)
-    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(forged.tx_id, NONCE))
     with pytest.raises(PaymentVerificationError):
         engine.verify(signature, required)
 
@@ -181,13 +186,13 @@ def test_mainnet_payer_address_is_refused_by_the_schema() -> None:
             txId=forged.tx_id,
             rawTx=forged.raw_tx,
             payerAddress="kaspa:" + forged.payer_address.split(":", 1)[1],
-            nonce=NONCE,
+            nonce=NONCE, payerProof=pp(forged.tx_id, NONCE),
         )
 
 
 def test_challenge_for_wrong_network_is_wrong_network(engine, required) -> None:
     forged = forge_tx(exact(required))
-    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=forged.raw_tx, payerAddress=forged.payer_address, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=forged.raw_tx, payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(forged.tx_id, NONCE))
     mainnet = required.model_copy(update={"network": "kaspa:mainnet"})
     with pytest.raises(PaymentVerificationError) as caught:
         engine.verify(signature, mainnet)
@@ -199,7 +204,7 @@ def test_challenge_for_wrong_network_is_wrong_network(engine, required) -> None:
     ["null", "[]", "{}", '{"id": 1}', "x" * 10, json.dumps({"inputs": [], "outputs": []})],
 )
 def test_garbage_raw_tx_is_an_invalid_header_not_a_crash(engine, required, raw) -> None:
-    signature = GatewayPaymentSignature(txId="ab" * 32, rawTx=raw, payerAddress=PAYER, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId="ab" * 32, rawTx=raw, payerAddress=PAYER, nonce=NONCE, payerProof=pp("ab" * 32, NONCE))
     with pytest.raises(PaymentVerificationError) as caught:
         engine.verify(signature, required)
     assert caught.value.code == "invalid_payment_header"
@@ -216,7 +221,7 @@ def test_unsigned_transaction_passes_the_offline_verifier_and_relies_on_the_node
             entry["signatureScript"] = ""
 
     raw = tamper_raw_tx(forged, strip_signatures)
-    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(forged.tx_id, NONCE))
     verified, _ = engine.verify(signature, required)
     assert verified.tx_id == forged.tx_id
 
@@ -232,7 +237,7 @@ def test_inflated_embedded_utxo_amount_passes_offline_and_relies_on_the_node() -
             entry["utxo"]["amount"] = 10**15
 
     raw = tamper_raw_tx(forged, inflate)
-    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE)
+    signature = GatewayPaymentSignature(txId=forged.tx_id, rawTx=raw, payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(forged.tx_id, NONCE))
     verified, _ = engine.verify(signature, required)
     assert verified.payer_address == forged.payer_address
 
@@ -292,7 +297,7 @@ def test_payload_swap_with_recomputed_id_still_fails_at_the_node_not_in_verify(e
     new_id = str(rewritten.finalize())
     assert new_id != forged.tx_id
     signature = GatewayPaymentSignature(
-        txId=new_id, rawTx=json.dumps(rewritten.to_dict()), payerAddress=forged.payer_address, nonce=NONCE
+        txId=new_id, rawTx=json.dumps(rewritten.to_dict()), payerAddress=forged.payer_address, nonce=NONCE, payerProof=pp(new_id, NONCE)
     )
     verified, _ = engine.verify(signature, required)  # accepted offline
     assert verified.tx_id == new_id
@@ -335,6 +340,7 @@ def test_exact_outputs_are_accepted_at_every_boundary_price(engine, price) -> No
                 "rawTx": f.raw_tx,
                 "payerAddress": f.payer_address,
                 "nonce": NONCE,
+                "payerProof": pp(f.tx_id, NONCE),
             }
         ),
         required,
@@ -508,7 +514,7 @@ class FakeNodeEngine(KaspaEngine):
 
 def _signature_for(forged, nonce: str = NONCE) -> GatewayPaymentSignature:
     return GatewayPaymentSignature(
-        txId=forged.tx_id, rawTx=forged.raw_tx, payerAddress=forged.payer_address, nonce=nonce
+        txId=forged.tx_id, rawTx=forged.raw_tx, payerAddress=forged.payer_address, nonce=nonce, payerProof=pp(forged.tx_id, nonce, key=forged.payer_key)
     )
 
 
@@ -534,7 +540,7 @@ async def test_inflated_embedded_utxo_amount_is_caught_by_the_node_lookup(requir
         txId=forged.tx_id,
         rawTx=tamper_raw_tx(forged, inflate),
         payerAddress=forged.payer_address,
-        nonce=NONCE,
+        nonce=NONCE, payerProof=pp(forged.tx_id, NONCE),
     )
     engine = FakeNodeEngine(funds)
     _, tx = engine.verify(signature, required)  # the offline pass cannot see the lie (GAP-3/4 layering)

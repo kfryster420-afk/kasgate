@@ -8,10 +8,11 @@ tests/integration/
   test_offline_engine.py         gateway KaspaEngine.verify vs SDK-built and forged txs (no services)
   test_offline_contract_probes.py  schema probes; xfail(strict) = documented gap that asserts the secure behaviour
   test_offline_auth.py           wallet-login primitives (challenge format, sign_message verification, Base64 sigs)
+  test_offline_frontrun.py       GAP-1 closed (v2.6): front-runner variants against the real engine's payerProof check
   test_offline_secrets.py        the funded key loads from a file and can never be rendered as text
   test_live_catalog.py           402 challenge, registration rules, floor 422, tax CSV, directory/quote   [gateway]
   test_auth.py                   wallet register/login, replay, Base64, rotate-key, DELETE /v1/auth/session   [gateway]
-  test_live_payments.py          tampering, nonce binding, 17-address cap [gateway]; settlement, replay race, SDK, redelivery [gateway + funds]
+  test_live_payments.py          tampering, nonce binding, payerProof front-running, 17-address cap [gateway]; settlement, replay race, SDK, redelivery [gateway + funds]
   test_zz_rate_limits.py         429 behaviour, marker `ratelimit`, opt-in                              [gateway, special config]
 ```
 

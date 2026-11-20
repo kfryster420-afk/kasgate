@@ -272,3 +272,15 @@ def test_normal_payment_uses_exactly_one_input_address() -> None:
     built = build([500 * KAS])
     assert built.payer_address == PAYER == address_of(PAYER_KEY)
     assert OTHER_KEY != PAYER_KEY
+
+
+def test_known_limitation_two_equal_utxos_that_each_nearly_cover_the_payment_raise_a_typed_error() -> None:
+    """kaspa.Generator stops after the first input when it alone covers the outputs, and then fails on the tiny change.
+    With two equal ~60.3M UTXOs there is no smaller input to put first, so the SDK cannot force a two-input plan
+    without either a non-zero priority fee (donating up to the fee cap, and leaving the contract's `priority_fee=0`
+    call) or hand-computing the network fee for `create_transaction`. Both were rejected: the SDK fails closed instead.
+    Wallets with any other mix, or one extra UTXO, are unaffected (see the tests above)."""
+    with pytest.raises(sdk.TransactionBuildError):
+        build([60_300_000, 60_300_000])
+    built = build([60_300_000, 60_300_000, 40_000_000])  # one more input and the plan is found
+    assert built.change_sompi >= MIN_CHANGE

@@ -91,6 +91,31 @@ def payment_payload(nonce: str) -> bytes:
     return f"{PAYMENT_PAYLOAD_PREFIX}{nonce}".encode("ascii")
 
 
+def payer_proof_message(nonce: str, tx_id: str) -> str:
+    """Message the payer signs with the payerAddress key (CONTRACT v2.6): 'kasgate:v1:<nonce>:<txId>'.
+
+    It binds a PAYMENT-SIGNATURE to whoever holds the payer key, so an observer who copies a signed transaction from
+    the mempool cannot present it as their own payment.
+    """
+    return f"{PAYMENT_PAYLOAD_PREFIX}{nonce}:{tx_id}"
+
+
+def normalise_proof(value: object) -> object:
+    """Accept 128-hex Schnorr (any case), or Base64 of 64 bytes / 65 bytes (leading header byte dropped)."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{128}", text):
+        return text.lower()
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return value
+    if len(raw) == 65:
+        raw = raw[1:]
+    return raw.hex() if len(raw) == 64 else value
+
+
 def kas_to_sompi(value: Decimal | str | float) -> int:
     """Convert a KAS amount to sompi exactly. Rejects non-positive values and more than 8 decimal places."""
     try:
@@ -183,6 +208,13 @@ class PaymentSignature(X402Header):
     rawTx: str = Field(min_length=2, max_length=GATEWAY_MAX_RAW_TX_CHARS)
     payerAddress: str
     nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    payerProof: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+    """Schnorr `sign_message(payer_proof_message(nonce, txId))` by the payerAddress key (CONTRACT v2.6)."""
+
+    @field_validator("payerProof", mode="before")
+    @classmethod
+    def _proof(cls, v: object) -> object:
+        return normalise_proof(v)
 
     @field_validator("txId")
     @classmethod

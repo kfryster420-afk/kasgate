@@ -1113,3 +1113,52 @@ async def test_redelivery_refusal_keeps_the_original_upstream_failure(
 def test_negative_redeliveries_rejected() -> None:
     with pytest.raises(sdk.ConfigurationError):
         KasGateClient(PAYER_KEY, max_redeliveries=-1, utxo_provider=lambda a: [])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- CONTRACT v2.6: payerProof
+
+
+async def test_signature_carries_a_payer_proof_bound_to_nonce_and_tx_id(
+    make_client,
+) -> None:
+    import kaspa
+    from app.schemas import payer_proof_message
+
+    gateway = FakeGateway(challenge(MIN_PRICE))
+    client = make_client(gateway)
+    response = await client.get("/p/demo")
+    assert response.status_code == 200
+    sent = gateway.signatures[0]
+    sig = sent["signature"]
+    assert sent["proof_ok"] is True
+    assert len(sig.payerProof) == 128 and sig.payerProof == sig.payerProof.lower()
+    gateway_sig = gw.PaymentSignature.from_header(
+        gateway.requests[1].headers["PAYMENT-SIGNATURE"]
+    )
+    assert gateway_sig.payerProof == sig.payerProof
+    pubkey = (
+        kaspa.PrivateKey(PAYER_KEY).to_public_key().to_x_only_public_key().to_string()
+    )
+    good = payer_proof_message(NONCE, sig.txId)
+    assert kaspa.verify_message(good, sig.payerProof, kaspa.PublicKey(pubkey))
+    for message in (
+        payer_proof_message("0" * 32, sig.txId),
+        payer_proof_message(NONCE, "00" * 32),
+        f"kasgate:v1:{NONCE}",
+    ):
+        assert not kaspa.verify_message(
+            message, sig.payerProof, kaspa.PublicKey(pubkey)
+        )
+
+
+async def test_proof_is_resigned_for_a_fresh_challenge_after_payment_expired(
+    make_client,
+) -> None:
+    """Re-challenge builds a new tx for a new nonce, so the proof changes with them and still verifies."""
+    gateway = FakeGateway()
+    _expired_then_fresh(gateway)
+    client = make_client(gateway)
+    await client.get("/p/demo")
+    first, second = gateway.signatures
+    assert first["signature"].payerProof != second["signature"].payerProof
+    assert first["proof_ok"] and second["proof_ok"]

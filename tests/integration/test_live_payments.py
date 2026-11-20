@@ -13,6 +13,8 @@ Two tiers:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import time
 from collections import Counter
@@ -30,7 +32,7 @@ from kasgate_client import (
 )
 
 from conftest import RPC_URL, address_for_key, create_endpoint, fresh_quote, merchant_fee_outputs
-from txforge import ForgedPayment, forge_exact, synthetic_utxo
+from txforge import ForgedPayment, forge_exact, make_payer_proof, synthetic_utxo
 
 pytestmark = pytest.mark.live
 funded = pytest.mark.funded
@@ -180,6 +182,86 @@ def test_expired_challenge_is_payment_expired(proxy_url, quote, forge) -> None:
     response = asyncio.run(send(proxy_url, forged.header()))
     assert_rejected(response, "payment_expired")
     assert challenge_of(response).nonce != quote.nonce
+
+
+# ---------------------------------------------------------------- CONTRACT v2.6: payerProof closes front-running (GAP-1)
+
+FRONT_RUNNER_KEY = "e7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"
+
+
+def _front_runner_header(forged: ForgedPayment, **overrides: str) -> str:
+    """The victim's tx copied from the mempool, re-presented with the front-runner's own payerProof."""
+    overrides.setdefault("payerProof", make_payer_proof(FRONT_RUNNER_KEY, forged.nonce, overrides.get("txId", forged.tx_id)))
+    return forged.header(**overrides)
+
+
+def _header_without_proof(forged: ForgedPayment) -> str:
+    body = json.loads(forged.signature().model_dump_json())
+    body.pop("payerProof")
+    return base64.b64encode(json.dumps(body, separators=(",", ":")).encode()).decode()
+
+
+def _reached_the_node_stage(response: httpx.Response) -> bool:
+    """True when the gateway got past every pure check (the proof included); synthetic UTXOs then fail at the node."""
+    return response.status_code in {402, 409, 503} and "payerProof" not in response.text
+
+
+def test_front_runner_with_their_own_proof_is_refused_and_the_victim_is_unaffected(proxy_url, quote, forge) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    thief = asyncio.run(send(proxy_url + "/thief/path", _front_runner_header(forged), method="POST"))
+    assert_rejected(thief, "invalid_payment_header")
+    assert "payerProof" in thief.text, thief.text
+    # nothing was locked or consumed by the refused attempt: the victim's identical tx gets past the proof stage
+    victim = asyncio.run(send(proxy_url, forged.header()))
+    assert _reached_the_node_stage(victim), victim.text
+
+
+def test_missing_payer_proof_is_402(proxy_url, quote, forge) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    response = asyncio.run(send(proxy_url, _header_without_proof(forged)))
+    assert_rejected(response, "invalid_payment_header")
+
+
+def test_proof_for_the_wrong_nonce_is_402(proxy_url, quote, forge) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    proof = make_payer_proof(forged.payer_key, "f" * 32, forged.tx_id)
+    response = asyncio.run(send(proxy_url, forged.header(payerProof=proof)))
+    assert_rejected(response, "invalid_payment_header")
+    assert "payerProof" in response.text
+
+
+def test_proof_for_the_wrong_tx_id_is_402(proxy_url, quote, forge) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    proof = make_payer_proof(forged.payer_key, forged.nonce, "ab" * 32)
+    response = asyncio.run(send(proxy_url, forged.header(payerProof=proof)))
+    assert_rejected(response, "invalid_payment_header")
+    assert "payerProof" in response.text
+
+
+def test_proof_from_an_earlier_payment_cannot_be_replayed_on_a_new_one(proxy_url, quote, forge) -> None:
+    first = forge(merchant_fee_outputs(quote))
+    other_quote = fresh_quote(proxy_url.rsplit("/p/", 1)[0], proxy_url.rsplit("/", 1)[1])
+    second = forge(merchant_fee_outputs(other_quote), nonce=other_quote.nonce)
+    response = asyncio.run(send(proxy_url, second.header(payerProof=first.signature().payerProof)))
+    assert_rejected(response, "invalid_payment_header")
+    assert "payerProof" in response.text
+
+
+@pytest.mark.parametrize("bad", ["", "ab" * 63, "zz" * 64, "00" * 64])
+def test_malformed_or_zero_proofs_are_402(proxy_url, quote, forge, bad: str) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    body = json.loads(forged.signature().model_dump_json())
+    body["payerProof"] = bad
+    header = base64.b64encode(json.dumps(body, separators=(",", ":")).encode()).decode()
+    assert_rejected(asyncio.run(send(proxy_url, header)), "invalid_payment_header")
+
+
+def test_front_runner_who_claims_the_tx_as_their_own_address_is_refused(proxy_url, quote, forge) -> None:
+    forged = forge(merchant_fee_outputs(quote))
+    attacker = address_for_key(FRONT_RUNNER_KEY)
+    proof = make_payer_proof(FRONT_RUNNER_KEY, forged.nonce, forged.tx_id)
+    response = asyncio.run(send(proxy_url, forged.header(payerAddress=attacker, payerProof=proof)))
+    assert_rejected(response, "invalid_payment_header")
 
 
 # ---------------------------------------------------------------- CONTRACT v2.3: at most 16 payer addresses
@@ -412,14 +494,14 @@ def _create_failing_endpoint(gateway_url: str, auth: dict[str, str], price: int)
 
 
 @funded
-@pytest.mark.xfail(strict=True, reason="GAP-1: PAYMENT-SIGNATURE is a bearer token; nothing binds the tx to the request, so a mempool observer can front-run it")
-def test_payment_is_bound_to_the_request_that_was_challenged(proxy_url, quote, real_forge) -> None:
+def test_front_runner_cannot_claim_the_victims_settled_payment(proxy_url, quote, real_forge) -> None:
+    """GAP-1 (closed by CONTRACT v2.6) with real funds: a third party presents the victim's signed tx first, with their
+    own key's payerProof, from another path and method. They get 402; the victim then still gets the resource."""
     forged = real_forge(merchant_fee_outputs(quote))
-    header = forged.header()
-    thief = asyncio.run(send(proxy_url + "/thief/path", header, method="POST"))
-    victim = asyncio.run(send(proxy_url, header))
-    if thief.status_code == 200:
+    thief = asyncio.run(send(proxy_url + "/thief/path", _front_runner_header(forged), method="POST"))
+    assert_rejected(thief, "invalid_payment_header")
+    victim = asyncio.run(send(proxy_url, forged.header()))
+    if victim.status_code == 200:
         real_forge.commit(forged)
-    assert not (thief.status_code == 200 and victim.status_code == 409), (
-        "a third party presenting the victim's signed tx first got the resource; the victim paid and got 409"
-    )
+    assert victim.status_code == 200, victim.text
+    assert PaymentResponse.from_header(victim.headers["PAYMENT-RESPONSE"]).txId == forged.tx_id

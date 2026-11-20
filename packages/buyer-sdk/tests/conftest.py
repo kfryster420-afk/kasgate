@@ -160,6 +160,7 @@ class FakeGateway:
             "signature": signature,
             "tx": tx,
             "payload": bytes.fromhex(tx.payload),
+            "proof_ok": proof_verifies(signature),
         }
         self.signatures.append(parsed)
         if self.paid_handler is not None:
@@ -172,6 +173,20 @@ class FakeGateway:
         return httpx.Response(
             200, headers={"PAYMENT-RESPONSE": receipt}, json={"ok": True}
         )
+
+
+def proof_verifies(signature: Any) -> bool:
+    """The gateway's CONTRACT v2.6 rule, written independently of the SDK: the proof must verify under the x-only key
+    of payerAddress's P2PK script, over 'kasgate:v1:<nonce>:<txId>'."""
+    script = kaspa.pay_to_address_script(kaspa.Address(signature.payerAddress)).script
+    if len(script) != 68 or not script.startswith("20") or not script.endswith("ac"):
+        return False
+    message = f"kasgate:v1:{signature.nonce}:{signature.txId}"
+    return bool(
+        kaspa.verify_message(
+            message, signature.payerProof, kaspa.PublicKey(script[2:-2])
+        )
+    )
 
 
 @pytest.fixture
