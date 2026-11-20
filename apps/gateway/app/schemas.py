@@ -344,6 +344,10 @@ class MerchantCreated(BaseModel):
     api_key: str = Field(
         description="Long-lived automation key (kg_...). Shown once. 'Authorization: Bearer <api_key>'."
     )
+    session_token: str = Field(
+        description="Dashboard session (kgs_...) issued alongside, so the web cookie never holds the api_key."
+    )
+    expires_at: datetime
 
 
 class SessionIssued(BaseModel):
