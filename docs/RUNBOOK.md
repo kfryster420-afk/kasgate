@@ -569,4 +569,4 @@ Offline suites on the commit this runbook was written against:
 | MCP server (`packages/mcp-server`) | 38 passed |
 | Integration, offline tier (`tests/integration`, no gateway running) | 207 passed, 113 skipped (live tests), 3 deselected |
 
-Not yet verified: a registration and login signed by the real KasWare browser extension. The full-stack check above signed the wallet challenge with the same Schnorr primitive the wallet uses, from a script. Do one real KasWare registration on testnet-10 before launch, and record the result here. The mainnet switch ([section 7](#7-production-checklist)) has not been exercised.
+Verified on Nov 20, 2026 (UTC+7): a merchant registration and a login signed by the real KasWare 0.11.6 Chrome extension on Testnet 10 (address kaspatest:qr347rhlq8u5qdx9m2yyvx9c242t44f2qwwtujtej38ufk6w9pdusnkmycha3), both accepted by the gateway. The mainnet switch ([section 7](#7-production-checklist)) has not been exercised.
