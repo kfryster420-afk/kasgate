@@ -461,17 +461,22 @@ async def test_fee_below_raised_floor_is_rejected() -> None:
     assert client.submitted == []
 
 
-async def test_merchant_below_floor_is_underpaid() -> None:
-    total = 40_000_000
-    floor = 25_000_000
-    required = build_unchecked_required(total, floor)
+async def test_merchant_below_twice_the_floor_is_underpaid() -> None:
+    """CONTRACT v2.3: merchant output >= 2*MIN_OUTPUT_SOMPI, even when PAYMENT-REQUIRED asks for less."""
+    floor = get_settings().min_output_sompi
+    total = min_price_sompi() - 1
+    fee = minimum_fee_sompi(total, floor)
+    assert total - fee == 2 * floor - 1
+    with pytest.raises(ValueError):
+        compute_fee_split(total)
+    required = build_unchecked_required(total, fee)
     tx = signed_transaction(
-        [(Address(required.payTo), total - floor), (fee_address(required), floor)],
+        [(Address(required.payTo), total - fee), (fee_address(required), fee)],
         input_amounts=(total + NETWORK_FEE,),
     )
-    engine, client = make_engine(settings=get_settings().model_copy(update={"min_output_sompi": floor}))
+    engine, client = make_engine()
     error = await expect_error(engine, signature_for(tx), required, "underpaid")
-    assert "minimum output" in error.message
+    assert "2*MIN_OUTPUT_SOMPI" in error.message
     assert client.submitted == []
 
 
@@ -583,22 +588,25 @@ async def test_payer_address_prefix_mismatch_is_wrong_network() -> None:
 # ----------------------------------------------------------------------------- mass
 
 
-async def test_v2_1_minimum_price_without_change_is_within_standard_mass() -> None:
+async def test_v2_3_minimum_price_without_change_is_within_standard_mass() -> None:
+    floor = get_settings().min_output_sompi
     price = min_price_sompi()
-    assert price == 40_000_000
+    split = compute_fee_split(price)
+    assert price == 3 * floor == 60_000_000
+    assert (split.fee_sompi, split.merchant_sompi) == (floor, 2 * floor) == (20_000_000, 40_000_000)
     required = build_required(price)
-    assert required.fee_amount_sompi == 20_000_000
-    assert required.merchant_amount_sompi == 20_000_000
     engine, _ = make_engine()
     exact = signed_transaction(
         [(Address(required.payTo), required.merchant_amount_sompi), (fee_address(required), required.fee_amount_sompi)],
         input_amounts=(price + NETWORK_FEE,),
     )
-    result = await engine.verify_and_submit(signature_for(exact), required)
-    assert (result.total_sompi, result.merchant_sompi, result.fee_sompi) == (price, 20_000_000, 20_000_000)
+    signature = signature_for(exact)
+    assert (await engine.resolve_inputs(signature, engine.verify(signature, required)[1])).storage_mass == 58_362
+    result = await engine.verify_and_submit(signature, required)
+    assert (result.total_sompi, result.merchant_sompi, result.fee_sompi) == (price, split.merchant_sompi, floor)
 
 
-async def test_v2_1_minimum_price_with_two_inputs_and_change_is_within_standard_mass() -> None:
+async def test_v2_3_minimum_price_with_two_inputs_and_change_is_within_standard_mass() -> None:
     price = min_price_sompi()
     required = build_required(price)
     change = 500_000_000
@@ -612,14 +620,49 @@ async def test_v2_1_minimum_price_with_two_inputs_and_change_is_within_standard_
     assert (await engine.verify_and_submit(signature_for(tx), required)).total_sompi == price
 
 
-@pytest.mark.parametrize("change", [10_000_000, 500_000_000, 100 * SOMPI_PER_KAS])
-async def test_v2_1_minimum_price_with_single_input_and_change_exceeds_standard_mass(change: int) -> None:
-    """Two 20M outputs alone cost 2 * 10^12 / 2*10^7 = 100_000 storage mass (the standard maximum); with ONE input,
-    any change output pushes the transaction over the limit, so the node would refuse to relay it."""
+@pytest.mark.parametrize(
+    ("change", "expected_mass"),
+    [
+        (30_000_000, 97_235),  # 0.3 KAS: the contract's minimum change for the buyer SDK
+        (50_000_000, 85_918),
+        (500_000_000, 75_215),
+        (100 * SOMPI_PER_KAS, 75_001),
+    ],
+)
+async def test_v2_3_minimum_price_single_input_with_change_passes_mass(change: int, expected_mass: int) -> None:
+    price = min_price_sompi()
+    required = build_required(price)
+    tx = signed_transaction(standard_outputs(required, change=change), input_amounts=(price + change + NETWORK_FEE,))
+    engine, _ = make_engine()
+    signature = signature_for(tx)
+    inputs = await engine.resolve_inputs(signature, engine.verify(signature, required)[1])
+    assert inputs.storage_mass == expected_mass <= 100_000
+    assert (await engine.verify_and_submit(signature, required)).total_sompi == price
+
+
+@pytest.mark.parametrize("change", [10_000_000, 20_000_000, 25_000_000])
+async def test_v2_3_minimum_price_single_input_with_small_change_exceeds_mass(change: int) -> None:
+    """Change below ~0.276 KAS on one input pushes a 0.6 KAS payment over 100_000 (25M change -> 103_250)."""
     price = min_price_sompi()
     required = build_required(price)
     tx = signed_transaction(standard_outputs(required, change=change), input_amounts=(price + change + NETWORK_FEE,))
     engine, client = make_engine()
+    error = await expect_error(engine, signature_for(tx), required, "tx_rejected")
+    assert "standard maximum" in error.message
+    assert client.submitted == []
+
+
+async def test_two_floor_outputs_with_change_exceed_standard_mass() -> None:
+    """Why v2.3 exists: two 0.2 KAS outputs alone cost 100_000 storage mass, so any change is non-standard."""
+    floor = get_settings().min_output_sompi
+    total = 2 * floor
+    required = build_unchecked_required(total, floor)
+    change = 500_000_000
+    tx = signed_transaction(
+        [(Address(required.payTo), floor), (fee_address(required), floor), (address_of(PAYER_KEY), change)],
+        input_amounts=(total + change + NETWORK_FEE,),
+    )
+    engine, client = make_engine(settings=get_settings().model_copy(update={"min_output_sompi": floor // 2}))
     error = await expect_error(engine, signature_for(tx), required, "tx_rejected")
     assert "standard maximum" in error.message
     assert client.submitted == []
@@ -799,7 +842,7 @@ def ceil_fee(total: int) -> int:
 @pytest.mark.parametrize(
     ("total", "expected_fee"),
     [
-        (40_000_000, 20_000_000),  # v2.1 minimum price: flat floor fee, merchant 20M
+        (60_000_000, 20_000_000),  # v2.3 minimum price: flat floor fee, merchant 40M
         (100_000_000, 20_000_000),  # 1.5% would be 1.5M: floor wins
         (1_333_333_333, 20_000_000),  # 19_999_999.995 -> ceil 20_000_000 == floor
         (1_333_333_334, 20_000_001),  # 20_000_000.01 -> ceil 20_000_001: percentage wins by 1 sompi
@@ -1213,7 +1256,7 @@ async def test_mass_is_recomputed_from_node_amounts() -> None:
     """Passing pure verify() with embedded values is not enough: resolve_inputs re-runs mass on node values."""
     price = min_price_sompi()
     required = build_required(price)
-    change = 500_000_000
+    change = 20_000_000  # two inputs: 75_064 storage mass; the same total as one input: 112_516
     total_in = price + change + NETWORK_FEE
     tx = signed_transaction(
         standard_outputs(required, change=change), input_amounts=(total_in // 2, total_in - total_in // 2)
@@ -1244,3 +1287,16 @@ def test_parse_script_key_accepts_all_wire_forms() -> None:
     assert parse_script_key("0001ab") == (1, "ab")
     for bad in ("", "00", "zz", {"version": True, "script": "ab"}, {"script": 5}, 7, None):
         assert parse_script_key(bad) is None
+
+
+def test_more_than_sixteen_payer_addresses_is_invalid_payment_header() -> None:
+    """CONTRACT v2.3: payments drawing from more than 16 payer addresses' UTXOs are rejected."""
+    engine, _ = make_engine()
+    keys = [PrivateKey(f"{index + 16:02x}" * 32) for index in range(17)]
+    scripts = [(0, str(pay_to_address_script(address_of(key)).script)) for key in keys]
+    payer = address_of(keys[0]).to_string()
+    assert len(engine._lookup_addresses(payer, scripts[:16])) == 16
+    with pytest.raises(PaymentVerificationError) as info:
+        engine._lookup_addresses(payer, scripts)
+    assert info.value.code == "invalid_payment_header"
+    assert "more than 16 payer addresses" in info.value.message

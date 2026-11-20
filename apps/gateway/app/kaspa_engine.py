@@ -22,7 +22,8 @@ Error-code decisions:
 * ``wrong_network``       network mismatch or an address prefix that does not belong to the network.
 * ``invalid_payment_header`` malformed JSON/transaction, txId mismatch, nonce or payload mismatch, payer address not
                           an input owner, input UTXO missing on the node or different from the embedded entry.
-* ``underpaid``           ``outputs[0]`` pays the right script but strictly less than the merchant amount.
+* ``underpaid``           ``outputs[0]`` pays the right script but strictly less than the merchant amount, or the
+                          merchant output is below ``2 * MIN_OUTPUT_SOMPI`` (CONTRACT v2.3).
 * ``invalid_fee_split``   missing ``outputs[1]``, wrong script, swapped order, ANY fee value other than the
                           exact fee (1 sompi short or over), or a merchant value above the exact amount.
 * ``tx_rejected``         storage mass above the standard maximum, outputs above inputs, node rejection.
@@ -112,6 +113,7 @@ DEFAULT_BACKOFF_INITIAL_SECONDS: Final[float] = 1.0
 DEFAULT_BACKOFF_MAX_SECONDS: Final[float] = 30.0
 DEFAULT_ACCEPTANCE_POLL_SECONDS: Final[float] = 0.5
 HEALTH_POLL_SECONDS: Final[float] = 5.0
+# CONTRACT v2.3: payments drawing from more than 16 payer addresses' UTXOs are rejected (invalid_payment_header).
 MAX_LOOKUP_ADDRESSES: Final[int] = 16
 
 T = TypeVar("T")
@@ -608,9 +610,12 @@ class KaspaEngine:
                 f"platform fee {fee_out.value} is below max(ceil(1.5%), MIN_OUTPUT_SOMPI) of the payment total "
                 f"({minimum_fee})",
             )
-        if merchant_out.value < floor:
+        merchant_floor = 2 * floor
+        if merchant_out.value < merchant_floor:
             raise PaymentVerificationError(
-                "underpaid", f"output 0 value {merchant_out.value} is below the minimum output of {floor} sompi"
+                "underpaid",
+                f"merchant output {merchant_out.value} is below 2*MIN_OUTPUT_SOMPI ({merchant_floor} sompi), "
+                "the minimum merchant output",
             )
         return merchant_out.value, fee_out.value
 
@@ -652,7 +657,7 @@ class KaspaEngine:
             addresses.add(owner.to_string().lower())
         if len(addresses) > MAX_LOOKUP_ADDRESSES:
             raise PaymentVerificationError(
-                "invalid_payment_header", f"inputs come from more than {MAX_LOOKUP_ADDRESSES} distinct addresses"
+                "invalid_payment_header", f"payment draws from more than {MAX_LOOKUP_ADDRESSES} payer addresses' UTXOs"
             )
         return sorted(addresses)
 
