@@ -103,17 +103,19 @@ function MerchantStep({ onDone }: { onDone: (created: MerchantKeyIssued) => void
   const nameCheck = checkDisplayName(displayName);
   const emailCheck = checkOptionalEmail(email);
 
-  function precheck(): string | null {
+  function precheck(options?: { skipAddress?: boolean }): string | null {
     setTouched(true);
-    if (!addressCheck.ok) return addressCheck.error;
+    if (!options?.skipAddress && !addressCheck.ok) return addressCheck.error;
     if (!nameCheck.ok) return nameCheck.error;
     if (!emailCheck.ok) return emailCheck.error;
     return null;
   }
 
   async function register(proof: WalletProof): Promise<void> {
-    if (!addressCheck.ok || !nameCheck.ok || !emailCheck.ok) throw new Error("Fix the highlighted fields first");
-    const body: MerchantCreate = { ...proof, kaspa_address: addressCheck.value, display_name: nameCheck.value };
+    // proof.kaspa_address is the checked, lower-cased address the wallet signed for (it may have been auto-filled from
+    // KasWare in this same click, so it must not be read from this closure's stale form state).
+    if (!nameCheck.ok || !emailCheck.ok) throw new Error("Fix the highlighted fields first");
+    const body: MerchantCreate = { ...proof, display_name: nameCheck.value };
     if (emailCheck.value) body.email = emailCheck.value;
     try {
       const created = await apiFetch<MerchantKeyIssued>("/api/merchants", { method: "POST", body });

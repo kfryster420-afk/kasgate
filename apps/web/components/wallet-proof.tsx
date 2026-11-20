@@ -4,8 +4,8 @@ import { Loader2, LogIn, ShieldCheck, Wallet } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { apiFetch, errorMessage } from "@/lib/api-client";
 import { checkChallenge, parseChallenge } from "@/lib/challenge";
-import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, NETWORK_LABEL } from "@/lib/config";
-import { getKasware, isPublicKey, isSignatureToken } from "@/lib/kasware";
+import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, KASPA_NETWORK, NETWORK_LABEL } from "@/lib/config";
+import { getKasware, isPublicKey, isSignatureToken, kaswareNetworkRefusal } from "@/lib/kasware";
 import type { AuthChallenge, AuthChallengeRequest, AuthPurpose } from "@/lib/types";
 import { checkKaspaAddress } from "@/lib/validation";
 import { CopyButton } from "./copy-button";
@@ -24,8 +24,11 @@ interface Props {
   address: string;
   onAddressChange: (address: string) => void;
   onProof: (proof: WalletProof) => Promise<void>;
-  /** Runs before any challenge is requested; return a message to stop. */
-  precheck?: () => string | null;
+  /**
+   * Runs before any challenge is requested; return a message to stop. With `skipAddress` the address requirement must be
+   * ignored: KasWare has not been asked for its account yet and will fill the address in.
+   */
+  precheck?: (options?: { skipAddress?: boolean }) => string | null;
   showAddressField?: boolean;
   kaswareLabel: string;
   manualSubmitLabel: string;
@@ -72,8 +75,8 @@ export function WalletProofPanel({ purpose, address, onAddressChange, onProof, p
     return result;
   }
 
-  function startGuard(): boolean {
-    const problem = precheck?.() ?? null;
+  function startGuard(options?: { skipAddress?: boolean }): boolean {
+    const problem = precheck?.(options) ?? null;
     if (problem) {
       setError(problem);
       return false;
@@ -101,17 +104,23 @@ export function WalletProofPanel({ purpose, address, onAddressChange, onProof, p
       setError("KasWare was not detected in this browser. Use the manual option below.");
       return;
     }
-    if (!startGuard()) return;
+    // Name/email checks still run first; an empty address is not an error here, KasWare supplies it below.
+    if (!startGuard({ skipAddress: address.trim() === "" })) return;
     setBusy("wallet");
     try {
       const accounts = await wallet.requestAccounts();
       const account = accounts[0];
       if (!account) throw new Error("KasWare did not return an account");
-      if (showAddressField || address.trim() === "") onAddressChange(account);
-      else if (address.trim().toLowerCase() !== account.toLowerCase()) {
+      // Refuse a wallet on the wrong network before anything is signed (skipped when getNetwork is missing or unclear).
+      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+      if (wrongNetwork) throw new Error(wrongNetwork);
+      const accountCheck = checkKaspaAddress(account);
+      if (!accountCheck.ok) throw new Error(`KasWare account: ${accountCheck.error}`);
+      if (showAddressField || address.trim() === "") onAddressChange(accountCheck.value);
+      else if (address.trim().toLowerCase() !== accountCheck.value) {
         throw new Error("The connected KasWare account is not the address you entered. Switch accounts in KasWare or fix the address.");
       }
-      const fresh = await fetchChallenge(account);
+      const fresh = await fetchChallenge(accountCheck.value);
       const walletKey = wallet.getPublicKey ? await wallet.getPublicKey() : publicKey;
       if (!isPublicKey(walletKey)) throw new Error("KasWare did not provide a usable public key. Paste it in the manual fields below.");
       setPublicKey(walletKey.trim());
