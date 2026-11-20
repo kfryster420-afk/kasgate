@@ -48,7 +48,8 @@ SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
 SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
-Sompi = Annotated[int, Field(gt=0, le=9_223_372_036_854_775_807)]
+MAX_SOMPI = 999_999_999_999_999_999  # 18 digits, same cap as SompiStr
+Sompi = Annotated[int, Field(gt=0, le=MAX_SOMPI)]
 SompiStr = Annotated[str, Field(pattern=SOMPI_STR_RE)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
 

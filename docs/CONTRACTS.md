@@ -167,3 +167,7 @@ Error codes: + payment_expired (402).
   rotate-key revokes ALL sessions of that merchant, then issues the new one returned in MerchantCreated.
 - Challenge Domain includes :port when PUBLIC_BASE_URL has one (exact netloc.lower()).
 - Registration/login require Redis regardless of RATE_LIMIT_ENABLED.
+
+## CONTRACT v2.5
+- Sompi int fields (e.g. EndpointCreate/Read.price_sompi) are capped at MAX_SOMPI = 999_999_999_999_999_999 (18 digits), same as SompiStr. 19 digits -> 422.
+- Representation is intentional: CRUD int fields (price_sompi) are JSON numbers, so clients must parse them big-int safe; x402 header amounts and SettlementRead/tax sompi fields stay strings.
