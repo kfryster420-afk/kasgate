@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import httpx
 
 from .constants import (
+    DEFAULT_MIN_OUTPUT_SOMPI,
     HEADER_PAYMENT_REQUIRED,
+    MIN_CHALLENGE_TTL_SECONDS,
     NETWORK_ADDRESS_PREFIX,
     X402_ASSET,
     X402_SCHEME,
     X402_VERSION,
 )
 from .exceptions import (
+    ChallengeExpiredError,
     FeeSplitMismatchError,
     InvalidChallengeError,
     NetworkMismatchError,
@@ -30,7 +35,9 @@ def decode_challenge(response: httpx.Response) -> PaymentRequired | None:
     try:
         return PaymentRequired.from_header(raw)
     except ValueError as exc:
-        raise InvalidChallengeError(f"PAYMENT-REQUIRED header cannot be decoded: {exc}") from exc
+        raise InvalidChallengeError(
+            f"PAYMENT-REQUIRED header cannot be decoded: {exc}"
+        ) from exc
 
 
 def validate_challenge(
@@ -38,47 +45,95 @@ def validate_challenge(
     *,
     network: str,
     cap_sompi: int,
-    min_output_sompi: int = 1,
+    min_output_sompi: int = DEFAULT_MIN_OUTPUT_SOMPI,
+    now: datetime | None = None,
     pinned_fee_to: str | None = None,
     expected_pay_to: str | None = None,
 ) -> tuple[int, int]:
     """Validate the challenge and return (merchant_sompi, fee_sompi) recomputed locally.
 
-    Raises a subclass of InvalidChallengeError for protocol, network, fee-split or recipient problems and
+    CONTRACT v2.1 split: fee = max(ceil(total * 150 / 10_000), min_output_sompi), merchant = total - fee, and both
+    outputs must be >= min_output_sompi (the floor comes from DirectoryManifest.min_output_sompi; the contract
+    default is 20_000_000). The challenge must also be unexpired (CONTRACT v2 `expiresAt`).
+
+    Raises a subclass of InvalidChallengeError for protocol, network, fee-split, expiry or recipient problems and
     PriceCapExceededError when the total exceeds the circuit breaker. The cap is enforced on the recomputed total,
     never on a field the server could have forged independently of `amount`.
     """
     if challenge.x402Version != X402_VERSION:
-        raise ProtocolMismatchError(f"unsupported x402Version {challenge.x402Version}; expected {X402_VERSION}")
+        raise ProtocolMismatchError(
+            f"unsupported x402Version {challenge.x402Version}; expected {X402_VERSION}"
+        )
     if challenge.scheme != X402_SCHEME:
-        raise ProtocolMismatchError(f"unsupported scheme {challenge.scheme!r}; expected {X402_SCHEME!r}")
+        raise ProtocolMismatchError(
+            f"unsupported scheme {challenge.scheme!r}; expected {X402_SCHEME!r}"
+        )
     if challenge.asset != X402_ASSET:
-        raise ProtocolMismatchError(f"unsupported asset {challenge.asset!r}; expected {X402_ASSET!r}")
+        raise ProtocolMismatchError(
+            f"unsupported asset {challenge.asset!r}; expected {X402_ASSET!r}"
+        )
     if challenge.network != network:
-        raise NetworkMismatchError(f"challenge network {challenge.network!r} differs from client network {network!r}")
+        raise NetworkMismatchError(
+            f"challenge network {challenge.network!r} differs from client network {network!r}"
+        )
 
     prefix = NETWORK_ADDRESS_PREFIX[network]
-    for label, address in (("payTo", challenge.payTo), ("feeTo", challenge.platformFee.feeTo)):
+    for label, address in (
+        ("payTo", challenge.payTo),
+        ("feeTo", challenge.platformFee.feeTo),
+    ):
         if not address.startswith(f"{prefix}:"):
-            raise NetworkMismatchError(f"{label} must use the '{prefix}:' prefix on {network}")
+            raise NetworkMismatchError(
+                f"{label} must use the '{prefix}:' prefix on {network}"
+            )
+
+    current = now or datetime.now(UTC)
+    expires = (
+        challenge.expiresAt
+        if challenge.expiresAt.tzinfo is not None
+        else challenge.expiresAt.replace(tzinfo=UTC)
+    )
+    remaining = (expires - current).total_seconds()
+    if remaining < MIN_CHALLENGE_TTL_SECONDS:
+        raise ChallengeExpiredError(
+            f"challenge expires at {challenge.expiresAt.isoformat()} ({remaining:.1f}s left); refusing to pay"
+        )
 
     total = challenge.total_sompi
-    merchant, fee = compute_fee_split(total)
+    try:
+        merchant, fee = compute_fee_split(total, min_output_sompi)
+    except ValueError as exc:
+        raise FeeSplitMismatchError(
+            f"amount {total} cannot be split with both outputs >= {min_output_sompi} sompi: {exc}"
+        ) from exc
     if challenge.fee_sompi != fee:
         raise FeeSplitMismatchError(
-            f"platformFee.feeAmount={challenge.fee_sompi} but ceil({total} * 150 / 10000) = {fee}"
+            f"platformFee.feeAmount={challenge.fee_sompi} but max(ceil({total} * 150 / 10000), "
+            f"{min_output_sompi}) = {fee}"
         )
     if merchant < min_output_sompi or fee < min_output_sompi:
         raise FeeSplitMismatchError(
             f"split {merchant}/{fee} puts an output below the minimum of {min_output_sompi} sompi"
         )
     if challenge.payTo == challenge.platformFee.feeTo:
-        raise FeeSplitMismatchError("payTo and feeTo are identical; the split would collapse into one recipient")
+        raise FeeSplitMismatchError(
+            "payTo and feeTo are identical; the split would collapse into one recipient"
+        )
 
-    if pinned_fee_to is not None and challenge.platformFee.feeTo != pinned_fee_to.strip().lower():
-        raise UnexpectedRecipientError("feeTo differs from the pinned platform treasury address")
-    if expected_pay_to is not None and challenge.payTo != expected_pay_to.strip().lower():
-        raise UnexpectedRecipientError("payTo differs from the expected merchant address")
+    if (
+        pinned_fee_to is not None
+        and challenge.platformFee.feeTo != pinned_fee_to.strip().lower()
+    ):
+        raise UnexpectedRecipientError(
+            "feeTo differs from the pinned platform treasury address"
+        )
+    if (
+        expected_pay_to is not None
+        and challenge.payTo != expected_pay_to.strip().lower()
+    ):
+        raise UnexpectedRecipientError(
+            "payTo differs from the expected merchant address"
+        )
 
     if total > cap_sompi:
         raise PriceCapExceededError(total, cap_sompi)

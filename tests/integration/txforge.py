@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import kaspa
-from kasgate_client import PaymentSignature
+from kasgate_client import PaymentSignature, payment_payload
 
 NETWORK_IDS = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}
 
@@ -27,10 +27,15 @@ class ForgedPayment:
     payer_address: str
     tx: kaspa.Transaction
     spent_outpoints: tuple[tuple[str, int], ...] = ()
+    nonce: str | None = None
+    payload: bytes = b""
 
     def signature(self, **overrides: str) -> PaymentSignature:
-        fields = {"txId": self.tx_id, "rawTx": self.raw_tx, "payerAddress": self.payer_address}
+        """PAYMENT-SIGNATURE body; `nonce` defaults to the one the tx payload was forged for."""
+        fields = {"txId": self.tx_id, "rawTx": self.raw_tx, "payerAddress": self.payer_address, "nonce": self.nonce}
         fields.update(overrides)
+        if fields["nonce"] is None:
+            raise ValueError("forge_payment(..., nonce=...) or header(nonce=...) is required (CONTRACT v2)")
         return PaymentSignature(**fields)
 
     def header(self, **overrides: str) -> str:
@@ -73,8 +78,14 @@ def forge_payment(
     utxos: Sequence[dict[str, Any]],
     outputs: Sequence[tuple[str, int]],
     priority_fee: int = 0,
+    nonce: str | None = None,
+    payload: bytes | None = None,
 ) -> ForgedPayment:
     """Sign a transaction paying exactly `outputs` (in that order) from the key's UTXOs; change goes last.
+
+    CONTRACT v2: `nonce` is the challenge nonce echoed in PAYMENT-SIGNATURE and, unless `payload` overrides it, the
+    transaction payload becomes `kasgate:v1:<nonce>`. Pass `payload=b""` to forge a tx without any payload, or a
+    different byte string to forge a mismatched one.
 
     The largest UTXO that covers the outputs is used alone, so a rejected forgery never touches more funds than
     it has to (and none at all unless the gateway wrongly submits it).
@@ -92,13 +103,20 @@ def forge_payment(
         network_id=kaspa.NetworkId(NETWORK_IDS[network]),
         outputs=[kaspa.PaymentOutput(kaspa.Address(address), amount) for address, amount in outputs],
         priority_fee=priority_fee,
+        payload=payload if payload is not None else (payment_payload(nonce) if nonce else b""),
     )
     pending = next(generator)
     pending.sign([key], True)
     tx = pending.transaction
     spent = tuple((str(i.previous_outpoint.transaction_id), int(i.previous_outpoint.index)) for i in tx.inputs)
     return ForgedPayment(
-        tx_id=tx.id, raw_tx=json.dumps(tx.to_dict()), payer_address=payer.to_string(), tx=tx, spent_outpoints=spent
+        tx_id=tx.id,
+        raw_tx=json.dumps(tx.to_dict()),
+        payer_address=payer.to_string(),
+        tx=tx,
+        spent_outpoints=spent,
+        nonce=nonce,
+        payload=bytes.fromhex(tx.payload),
     )
 
 

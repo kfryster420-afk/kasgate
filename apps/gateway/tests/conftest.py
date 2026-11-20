@@ -5,14 +5,14 @@ import os
 import shutil
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet
-from kaspa import PrivateKey
+from kaspa import PrivateKey, sign_message
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key().decode()
 TREASURY = "kaspatest:qzxwgn9qu5mxn379rkp54zs729hrsr5v6045eu8hpze0x8r8caq57w49l62en"
@@ -22,7 +22,7 @@ OTHER_KEY = PrivateKey("05" * 32)
 MERCHANT_ADDRESS = MERCHANT_KEY.to_address("testnet").to_string()
 PAYER_ADDRESS = PAYER_KEY.to_address("testnet").to_string()
 OTHER_ADDRESS = OTHER_KEY.to_address("testnet").to_string()
-PRICE_SOMPI = 2_000_000_000  # 20 KAS: fee 30_000_000, merchant 1_970_000_000
+PRICE_SOMPI = 2_000_000_000  # 20 KAS: fee 30_000_000 (1.5 %), merchant 1_970_000_000
 
 os.environ.update(
     {
@@ -47,11 +47,20 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+from app.config import get_settings  # noqa: E402
 from app.deps import get_sessionmaker  # noqa: E402
 from app.kaspa_engine import PaymentVerificationError, VerifiedPayment  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models import Endpoint, Merchant  # noqa: E402
-from app.schemas import PaymentRequired, PaymentSignature  # noqa: E402
+from app.schemas import (  # noqa: E402
+    HEADER_PAYMENT_REQUIRED,
+    HEADER_PAYMENT_SIGNATURE,
+    AuthChallenge,
+    MerchantCreated,
+    PaymentRequired,
+    PaymentSignature,
+    SessionIssued,
+)
 from app.security import encrypt_headers, generate_api_key, hash_api_key  # noqa: E402
 
 GATEWAY_DIR = Path(__file__).resolve().parent.parent
@@ -152,17 +161,19 @@ async def clean_database(request: pytest.FixtureRequest) -> AsyncIterator[None]:
 
 
 class StubEngine:
+    """Stands in for `KaspaEngine`: `verify` is the pure pre-lock check, `verify_and_submit` the node round trip."""
+
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.verify_calls: list[str] = []
+        self.events: list[str] = []
         self.error: Exception | None = None
+        self.verify_error: Exception | None = None
         self.delay: float = 0.0
+        self.on_verify: Callable[[PaymentSignature], None] | None = None
+        self.before_submit: Callable[[PaymentSignature], Awaitable[None]] | None = None
 
-    async def verify_and_submit(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
-        self.calls.append(signature.txId)
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        if self.error is not None:
-            raise self.error
+    def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
         return VerifiedPayment(
             tx_id=signature.txId,
             payer_address=signature.payerAddress,
@@ -171,8 +182,33 @@ class StubEngine:
             fee_sompi=required.fee_amount_sompi,
         )
 
+    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPayment, object]:
+        self.verify_calls.append(signature.txId)
+        self.events.append("verify")
+        if self.on_verify is not None:
+            self.on_verify(signature)
+        if self.verify_error is not None:
+            raise self.verify_error
+        return self._verified(signature, required), object()
+
+    async def verify_and_submit(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
+        self.calls.append(signature.txId)
+        self.events.append("submit")
+        if self.before_submit is not None:
+            await self.before_submit(signature)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self._verified(signature, required)
+
     def fail(self, code: str, message: str = "rejected") -> None:
+        """Make the node round trip (`verify_and_submit`) fail."""
         self.error = PaymentVerificationError(code, message)
+
+    def fail_verify(self, code: str, message: str = "rejected") -> None:
+        """Make the pure pre-lock `verify` fail."""
+        self.verify_error = PaymentVerificationError(code, message)
 
 
 class StubOracle:
@@ -311,9 +347,105 @@ async def seeded(sessionmaker: async_sessionmaker[AsyncSession]) -> Seed:
     return await seed_endpoint(sessionmaker)
 
 
-def make_signature_header(tx_id: str | None = None) -> str:
+def make_signature_header(tx_id: str | None, nonce: str) -> str:
     return PaymentSignature(
         txId=tx_id or uuid.uuid4().hex + uuid.uuid4().hex,
         rawTx="{}",
         payerAddress=PAYER_ADDRESS,
+        nonce=nonce,
     ).to_header()
+
+
+async def fetch_challenge(client: httpx.AsyncClient, slug: str = "weather") -> PaymentRequired:
+    """Make the unpaid request and return the nonce-bound challenge from its 402."""
+    response = await client.get(f"/p/{slug}")
+    assert response.status_code == 402, response.text
+    return PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])
+
+
+async def paid_headers(client: httpx.AsyncClient, tx_id: str | None = None, slug: str = "weather") -> dict[str, str]:
+    """A fresh challenge for `slug` answered with a PAYMENT-SIGNATURE for `tx_id`."""
+    required = await fetch_challenge(client, slug)
+    return {HEADER_PAYMENT_SIGNATURE: make_signature_header(tx_id, required.nonce)}
+
+
+# ---------------------------------------------------------------- wallet proofs
+
+
+def bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def get_challenge(
+    client: httpx.AsyncClient, address: str = MERCHANT_ADDRESS, purpose: str = "login"
+) -> AuthChallenge:
+    response = await client.post("/v1/auth/challenge", json={"kaspa_address": address, "purpose": purpose})
+    assert response.status_code == 200, response.text
+    return AuthChallenge.model_validate(response.json())
+
+
+def proof_fields(
+    challenge: str,
+    key: PrivateKey = MERCHANT_KEY,
+    *,
+    x_only: bool = False,
+    signed: str | None = None,
+) -> dict[str, str]:
+    """`challenge`, `public_key` and `signature` as the wallet would produce them."""
+    public_key = key.to_public_key().to_string()
+    return {
+        "challenge": challenge,
+        "public_key": public_key[2:] if x_only else public_key,
+        "signature": sign_message(signed if signed is not None else challenge, key),
+    }
+
+
+async def register(
+    client: httpx.AsyncClient,
+    key: PrivateKey = MERCHANT_KEY,
+    *,
+    email: str | None = None,
+    display_name: str = "Wallet Merchant",
+) -> MerchantCreated:
+    """Register a merchant the way the dashboard does: challenge (purpose=register), sign, POST."""
+    address = key.to_address("testnet").to_string()
+    challenge = await get_challenge(client, address, "register")
+    body: dict[str, str] = {
+        "kaspa_address": address,
+        "display_name": display_name,
+        **proof_fields(challenge.challenge, key),
+    }
+    if email:
+        body["email"] = email
+    response = await client.post("/v1/merchants", json=body)
+    assert response.status_code == 201, response.text
+    return MerchantCreated.model_validate(response.json())
+
+
+async def login(client: httpx.AsyncClient, key: PrivateKey = MERCHANT_KEY) -> SessionIssued:
+    address = key.to_address("testnet").to_string()
+    challenge = await get_challenge(client, address, "login")
+    response = await client.post(
+        "/v1/auth/verify", json={"kaspa_address": address, **proof_fields(challenge.challenge, key)}
+    )
+    assert response.status_code == 200, response.text
+    return SessionIssued.model_validate(response.json())
+
+
+# ---------------------------------------------------------------- settings overrides
+
+SettingsOverride = Callable[..., None]
+
+
+@pytest.fixture
+def override_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[SettingsOverride]:
+    """`override_settings(redelivery_max_attempts=1)` re-reads Settings with those env vars for one test."""
+
+    def apply(**values: object) -> None:
+        for name, value in values.items():
+            monkeypatch.setenv(name.upper(), str(value))
+        get_settings.cache_clear()
+
+    yield apply
+    monkeypatch.undo()
+    get_settings.cache_clear()

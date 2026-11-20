@@ -1,16 +1,24 @@
 """Paywalled wildcard reverse proxy: the HTTP 402 handshake for `/p/{slug}[/{path}]`.
 
-Request lifecycle
------------------
+Request lifecycle (CONTRACT v2)
+-------------------------------
 1. Resolve the active endpoint (404) and check the HTTP method (405).
 2. Pre-flight everything that can fail without a payment (path, body size, upstream headers, upstream URL).
-3. No `PAYMENT-SIGNATURE` -> 402 + `PAYMENT-REQUIRED`.
-4. Decode the signature (bad header -> 402 `invalid_payment_header`).
-5. Take the Redis replay lock `SET kasgate:tx:{txId} NX EX 600` BEFORE verification or forwarding. A held lock or an
-   existing settlement row -> 409 `payment_replayed`.
-6. `engine.verify_and_submit`. ONLY a failure here releases the lock; success keeps it.
-7. Record the SETTLED settlement (unique `tx_id`; IntegrityError -> 409), then forward upstream.
-8. Return the upstream response with `PAYMENT-RESPONSE` (or 502 `upstream_error`, still with `PAYMENT-RESPONSE`).
+3. No `PAYMENT-SIGNATURE` -> issue a challenge: a fresh payment nonce, `PaymentRequired` bound to it and stored in Redis
+   as `kasgate:nonce:{nonce}` (JSON of the challenge plus the endpoint slug, EX `payment_max_age_seconds`), then 402.
+4. Decode the signature (bad header -> 402 `invalid_payment_header` / `wrong_network`, with a fresh challenge).
+5. Load `required` FROM the stored nonce, never recompute it. A missing or expired nonce -> 402 `payment_expired` with a
+   fresh `PAYMENT-REQUIRED`. A settlement that already exists for the txId may be re-delivered (see below) or is 409.
+6. `engine.verify()` (pure, network-free) runs BEFORE any lock, so garbage never touches the replay locks.
+7. Take the Redis replay lock `SET kasgate:tx:{txId} NX EX 600` BEFORE `engine.verify_and_submit` and before anything is
+   forwarded. A held lock -> 409 `payment_replayed`. ONLY a verification failure releases it; success keeps it.
+8. `engine.verify_and_submit`, then INSERT the SETTLED settlement (unique `tx_id` and `payment_nonce`; an IntegrityError
+   is 409), then consume the nonce (GETDEL), then forward upstream.
+9. Return the upstream response with `PAYMENT-RESPONSE` (or 502 `upstream_error`, still with `PAYMENT-RESPONSE`).
+
+Redelivery: the same txId + nonce + slug (and the same payer, method and path) whose settlement has no upstream
+status or a 5xx one, inside `redelivery_window_seconds` and below `redelivery_max_attempts` deliveries, is
+forwarded again and counted in `Settlement.delivery_attempts`. Anything else for a settled txId is 409.
 """
 
 import asyncio
@@ -19,7 +27,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Final, cast
 from urllib.parse import quote
@@ -30,11 +38,11 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.deps import (
     PaymentVerifier,
     RateProvider,
@@ -57,6 +65,7 @@ from app.schemas import (
     PaymentResponse,
     PaymentSignature,
     X402ErrorBody,
+    new_payment_nonce,
 )
 from app.security import (
     HOP_BY_HOP_HEADERS,
@@ -71,6 +80,10 @@ logger = logging.getLogger("kasgate.proxy")
 
 REPLAY_LOCK_PREFIX: Final = "kasgate:tx:"
 REPLAY_LOCK_TTL_SECONDS: Final = 600
+NONCE_KEY_PREFIX: Final = "kasgate:nonce:"
+NONCE_LOCK_PREFIX: Final = "kasgate:noncelock:"
+DELIVERY_LOCK_PREFIX: Final = "kasgate:delivery:"
+DELIVERY_LOCK_TTL_SECONDS: Final = 60
 DEAD_LETTER_KEY: Final = "kasgate:deadletter:settlements"
 SERVICE_UNAVAILABLE_RETRY_SECONDS: Final = "5"
 UPSTREAM_TIMEOUT_SECONDS: Final = 30.0
@@ -114,6 +127,18 @@ router = APIRouter(tags=["proxy"])
 
 def lock_key(tx_id: str) -> str:
     return f"{REPLAY_LOCK_PREFIX}{tx_id}"
+
+
+def nonce_key(nonce: str) -> str:
+    return f"{NONCE_KEY_PREFIX}{nonce}"
+
+
+def nonce_lock_key(nonce: str) -> str:
+    return f"{NONCE_LOCK_PREFIX}{nonce}"
+
+
+def delivery_lock_key(tx_id: str) -> str:
+    return f"{DELIVERY_LOCK_PREFIX}{tx_id}"
 
 
 # ---------------------------------------------------------------- response helpers
@@ -294,11 +319,27 @@ def _relay(result: UpstreamResult, payment_response: str) -> Response:
 # ---------------------------------------------------------------- lock + persistence helpers
 
 
-async def _release_lock(redis: Redis, tx_id: str) -> None:
+async def _release_payment_locks(redis: Redis, tx_id: str, nonce: str) -> None:
+    """Drop the replay lock and the nonce claim after a FAILED verification so the payer can retry."""
     try:
-        await redis.delete(lock_key(tx_id))
+        await redis.delete(lock_key(tx_id), nonce_lock_key(nonce))
     except RedisError:
         logger.error("could not release replay lock for %s; it will expire in %ss", tx_id, REPLAY_LOCK_TTL_SECONDS)
+
+
+async def _hold_delivery_lock(redis: Redis, tx_id: str) -> None:
+    """Mark a delivery as in flight so a redelivery cannot run concurrently with it (best effort)."""
+    try:
+        await redis.set(delivery_lock_key(tx_id), "1", ex=DELIVERY_LOCK_TTL_SECONDS)
+    except RedisError:
+        logger.warning("could not mark delivery of %s as in flight", tx_id, exc_info=True)
+
+
+async def _drop_delivery_lock(redis: Redis, tx_id: str) -> None:
+    try:
+        await redis.delete(delivery_lock_key(tx_id))
+    except RedisError:
+        logger.warning("could not clear the in-flight delivery marker for %s", tx_id, exc_info=True)
 
 
 async def _record_upstream_status(session: AsyncSession, settlement_id: uuid.UUID, status_code: int | None) -> None:
@@ -317,6 +358,7 @@ def _settlement_payload(settlement: Settlement, endpoint_slug: str) -> str:
     return json.dumps(
         {
             "txId": settlement.tx_id,
+            "paymentNonce": settlement.payment_nonce,
             "endpointId": str(settlement.endpoint_id),
             "endpointSlug": endpoint_slug,
             "merchantId": str(settlement.merchant_id),
@@ -384,8 +426,254 @@ def _new_settlement(
         status=SettlementStatus.SETTLED,
         request_method=request.method,
         request_path=request.url.path,
+        payment_nonce=required.nonce,
+        delivery_attempts=1,
         created_at=now,
         settled_at=now,
+    )
+
+
+# ---------------------------------------------------------------- payment challenges (nonces)
+
+
+async def issue_payment_challenge(redis: Redis, slug: str, price_sompi: int, pay_to: str) -> PaymentRequired:
+    """Mint a nonce-bound `PaymentRequired` and store it as `kasgate:nonce:{nonce}` for `payment_max_age_seconds`.
+
+    Raises ValueError when the price cannot be split into valid outputs and RedisError when the store is down.
+    """
+    settings = get_settings()
+    expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=settings.payment_max_age_seconds)
+    required = PaymentRequired.for_endpoint(price_sompi, pay_to, new_payment_nonce(), expires_at)
+    record = json.dumps({"slug": slug, "required": required.model_dump(mode="json")}, sort_keys=True)
+    await redis.set(nonce_key(required.nonce), record, ex=settings.payment_max_age_seconds)
+    return required
+
+
+async def _load_challenge(redis: Redis, nonce: str) -> tuple[str, PaymentRequired] | None:
+    """The (slug, challenge) stored for `nonce`, or None when it is missing, expired or unreadable."""
+    raw = await redis.get(nonce_key(nonce))
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        slug = data["slug"]
+        required = PaymentRequired.model_validate(data["required"])
+    except (ValueError, KeyError, TypeError):
+        logger.error("stored challenge for nonce %s is unreadable", nonce, exc_info=True)
+        return None
+    if not isinstance(slug, str) or required.nonce != nonce or required.expiresAt <= datetime.now(UTC):
+        return None
+    return slug, required
+
+
+def _limit_error(exc: HTTPException) -> JSONResponse:
+    return _error(
+        exc.status_code,
+        "rate_limited" if exc.status_code == 429 else "service_unavailable",
+        str(exc.detail),
+        headers=dict(exc.headers or {}),
+    )
+
+
+async def _challenge_error(
+    request: Request,
+    redis: Redis,
+    endpoint: Endpoint,
+    merchant_address: str,
+    error: str,
+    message: str,
+    *,
+    limited: bool = True,
+) -> JSONResponse:
+    """A 402 carrying a FRESH `PAYMENT-REQUIRED` (new nonce). Every new challenge costs one unpaid-rate-limit hit."""
+    if limited:
+        try:
+            await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
+        except HTTPException as exc:
+            return _limit_error(exc)
+    try:
+        required = await issue_payment_challenge(redis, endpoint.slug, endpoint.price_sompi, merchant_address)
+    except ValueError as exc:
+        logger.error("endpoint %s cannot be priced: %s", endpoint.slug, exc)
+        return _error(503, "service_unavailable", "endpoint price is not currently payable")
+    except RedisError:
+        logger.exception("payment challenge store unavailable")
+        return _error(503, "service_unavailable", "payment challenges are temporarily unavailable")
+    return _error(402, error, message, required=required)
+
+
+def _verification_failure(exc: PaymentVerificationError, required: PaymentRequired) -> JSONResponse:
+    if isinstance(exc, RpcUnavailableError):
+        logger.warning("payment not settled, node unavailable: %s", exc.message)
+        return _error(503, "rpc_unavailable", exc.message, headers={"Retry-After": "5"})
+    if exc.code == "payment_replayed":
+        return _error(409, "payment_replayed", exc.message)
+    return _error(402, exc.code if exc.code in _VERIFICATION_CODES else "tx_rejected", exc.message, required=required)
+
+
+# ---------------------------------------------------------------- delivery & redelivery
+
+
+async def _forward_and_record(
+    session: AsyncSession,
+    client: httpx.AsyncClient,
+    method: str,
+    prepared: PreparedUpstream,
+    settlement_id: uuid.UUID,
+    tx_id: str,
+    payment_response: str,
+) -> Response:
+    try:
+        result = await _call_upstream(client, method, prepared)
+    except UpstreamFailedError as exc:
+        logger.warning("upstream failure for settled tx %s: %s", tx_id, exc)
+        await _record_upstream_status(session, settlement_id, None)
+        return _error(
+            502,
+            "upstream_error",
+            "the upstream API did not return a response",
+            headers={HEADER_PAYMENT_RESPONSE: payment_response},
+        )
+    await _record_upstream_status(session, settlement_id, result.status_code)
+    return _relay(result, payment_response)
+
+
+def _redelivery_allowed(
+    settings: Settings,
+    settlement: Settlement,
+    signature: PaymentSignature,
+    endpoint: Endpoint,
+    request: Request,
+) -> bool:
+    """CONTRACT v2: same txId + nonce + slug, no upstream result or a 5xx, inside the window, below the attempt cap.
+
+    The payer, method and path must also match the original paid call: a txId and its nonce are public on-chain, so
+    these checks stop a bystander from replaying someone else's payment against a different resource.
+    """
+    if settlement.status != SettlementStatus.SETTLED or settlement.settled_at is None:
+        return False
+    age = datetime.now(UTC) - settlement.settled_at
+    return (
+        settlement.tx_id == signature.txId
+        and settlement.payment_nonce == signature.nonce
+        and settlement.endpoint_id == endpoint.id
+        and settlement.payer_address == signature.payerAddress
+        and settlement.request_method == request.method
+        and settlement.request_path == request.url.path
+        and (settlement.upstream_status_code is None or settlement.upstream_status_code >= 500)
+        and age < timedelta(seconds=settings.redelivery_window_seconds)
+        and settlement.delivery_attempts < settings.redelivery_max_attempts
+    )
+
+
+async def _claim_redelivery(session: AsyncSession, settlement_id: uuid.UUID, max_attempts: int) -> bool:
+    """Atomically count one more delivery; False when a concurrent request already used the last attempt."""
+    result = await session.execute(
+        update(Settlement)
+        .where(
+            Settlement.id == settlement_id,
+            Settlement.status == SettlementStatus.SETTLED,
+            Settlement.delivery_attempts < max_attempts,
+            or_(Settlement.upstream_status_code.is_(None), Settlement.upstream_status_code >= 500),
+        )
+        .values(delivery_attempts=Settlement.delivery_attempts + 1)
+        .returning(Settlement.id)
+    )
+    claimed = result.scalar_one_or_none() is not None
+    await session.commit()
+    return claimed
+
+
+async def _redeliver(
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    settlement: Settlement,
+    method: str,
+    prepared: PreparedUpstream,
+) -> Response:
+    settings = get_settings()
+    tx_id = settlement.tx_id
+    try:
+        idle = await redis.set(delivery_lock_key(tx_id), "1", nx=True, ex=DELIVERY_LOCK_TTL_SECONDS)
+    except RedisError:
+        logger.exception("delivery marker unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    if not idle:
+        return _error(409, "payment_replayed", "this transaction is already being delivered")
+    try:
+        try:
+            claimed = await _claim_redelivery(session, settlement.id, settings.redelivery_max_attempts)
+        except SQLAlchemyError:
+            await session.rollback()
+            logger.exception("redelivery claim failed")
+            return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
+        if not claimed:
+            return _error(409, "payment_replayed", "this transaction was already used")
+        usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
+        return await _forward_and_record(
+            session, client, method, prepared, settlement.id, tx_id, _payment_response_header(tx_id, usd)
+        )
+    finally:
+        await _drop_delivery_lock(redis, tx_id)
+
+
+async def _find_settlement(session: AsyncSession, tx_id: str, nonce: str) -> Settlement | None:
+    """The settlement that already uses this txId or this nonce (the txId match wins when both exist)."""
+    rows = (
+        (
+            await session.execute(
+                select(Settlement).where(or_(Settlement.tx_id == tx_id, Settlement.payment_nonce == nonce))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if row.tx_id == tx_id:
+            return row
+    return rows[0] if rows else None
+
+
+async def _settle_and_deliver(
+    request: Request,
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    oracle: RateProvider,
+    endpoint: Endpoint,
+    merchant_address: str,
+    required: PaymentRequired,
+    verified: VerifiedPaymentLike,
+    method: str,
+    prepared: PreparedUpstream,
+) -> Response:
+    tx_id = verified.tx_id
+    rate = await _lookup_rate(oracle)
+    settlement = _new_settlement(endpoint, merchant_address, required, verified, rate, request)
+    settlement_id = settlement.id
+    unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
+    session.add(settlement)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        logger.error("tx %s (nonce %s) conflicts with an existing settlement", tx_id, required.nonce, exc_info=True)
+        return _error(409, "payment_replayed", "this transaction or payment nonce was already used")
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.error("tx %s was accepted by the node but its settlement could not be stored", tx_id, exc_info=True)
+        await _dead_letter_settlement(redis, unrecorded_payload)
+        return _error(503, "service_unavailable", "payment was accepted but could not be recorded; contact support")
+
+    try:
+        await redis.getdel(nonce_key(required.nonce))
+    except RedisError:
+        logger.warning("could not consume nonce %s; the settlement's unique nonce still blocks reuse", required.nonce)
+
+    usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
+    return await _forward_and_record(
+        session, client, method, prepared, settlement_id, tx_id, _payment_response_header(tx_id, usd)
     )
 
 
@@ -404,17 +692,13 @@ async def paywalled_proxy(
     oracle: Annotated[RateProvider, Depends(get_oracle)],
     path: str = "",
 ) -> Response:
+    settings = get_settings()
     signature_header = request.headers.get(HEADER_PAYMENT_SIGNATURE)
     if not signature_header:
         try:
             await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
         except HTTPException as exc:
-            return _error(
-                exc.status_code,
-                "rate_limited" if exc.status_code == 429 else "service_unavailable",
-                str(exc.detail),
-                headers=dict(exc.headers or {}),
-            )
+            return _limit_error(exc)
     row = (
         await session.execute(
             select(Endpoint, Merchant.kaspa_address)
@@ -434,23 +718,32 @@ async def paywalled_proxy(
             headers={"Allow": ", ".join(sorted(endpoint.allowed_methods))},
         )
 
-    try:
-        required = PaymentRequired.for_endpoint(endpoint.price_sompi, merchant_address)
-    except ValueError as exc:
-        logger.error("endpoint %s cannot be priced: %s", slug, exc)
-        return _error(503, "service_unavailable", "endpoint price is not currently payable")
-
     if not signature_header:
-        return _error(402, "payment_required", "payment is required to access this resource", required=required)
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            "payment_required",
+            "payment is required to access this resource",
+            limited=False,
+        )
     try:
         signature = PaymentSignature.from_header(signature_header)
     except ValidationError as exc:
         description = str(exc).lower()
         code = "wrong_network" if "prefix" in description or "network" in description else "invalid_payment_header"
-        return _error(402, code, f"{HEADER_PAYMENT_SIGNATURE} header is invalid", required=required)
+        return await _challenge_error(
+            request, redis, endpoint, merchant_address, code, f"{HEADER_PAYMENT_SIGNATURE} header is invalid"
+        )
     except ValueError:
-        return _error(
-            402, "invalid_payment_header", f"{HEADER_PAYMENT_SIGNATURE} header is malformed", required=required
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            "invalid_payment_header",
+            f"{HEADER_PAYMENT_SIGNATURE} header is malformed",
         )
 
     try:
@@ -459,70 +752,79 @@ async def paywalled_proxy(
         return _error(exc.status_code, exc.error, exc.message)
 
     tx_id = signature.txId
+    nonce = signature.nonce
     try:
-        acquired = await redis.set(lock_key(tx_id), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS)
+        challenge = await _load_challenge(redis, nonce)
+    except RedisError:
+        logger.exception("payment challenge store unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    try:
+        existing = await _find_settlement(session, tx_id, nonce)
+    except SQLAlchemyError:
+        logger.exception("settlement lookup failed")
+        return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
+    if existing is not None:
+        if _redelivery_allowed(settings, existing, signature, endpoint, request):
+            return await _redeliver(session, redis, client, existing, method, prepared)
+        return _error(409, "payment_replayed", "this transaction or payment nonce was already used")
+
+    if challenge is None:
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            "payment_expired",
+            "the payment challenge is unknown or has expired; pay the fresh challenge",
+        )
+    challenge_slug, required = challenge
+    if challenge_slug != endpoint.slug:
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            "invalid_payment_header",
+            "the payment nonce was issued for a different endpoint",
+        )
+
+    # Pure checks first: a malformed or mispaying transaction never reaches a lock or the node.
+    try:
+        engine.verify(signature, required)
+    except PaymentVerificationError as exc:
+        return _verification_failure(exc, required)
+    except Exception:
+        logger.exception("unexpected failure while checking tx %s", tx_id)
+        return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
+
+    # The replay lock is taken BEFORE verify_and_submit and before anything is forwarded; the nonce claim
+    # first, so a refused tx lock never has to release a lock that belongs to another request.
+    tx_locked = False
+    try:
+        if await redis.set(nonce_lock_key(nonce), tx_id, nx=True, ex=REPLAY_LOCK_TTL_SECONDS):
+            tx_locked = bool(await redis.set(lock_key(tx_id), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
+            if not tx_locked:
+                await redis.delete(nonce_lock_key(nonce))
     except RedisError:
         logger.exception("replay lock unavailable")
         return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
-    if not acquired:
-        return _error(409, "payment_replayed", "this transaction is already being processed or was already used")
-
-    try:
-        already_settled = await session.scalar(select(Settlement.id).where(Settlement.tx_id == tx_id))
-    except SQLAlchemyError:
-        logger.exception("settlement lookup failed")
-        await _release_lock(redis, tx_id)
-        return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
-    if already_settled is not None:
-        return _error(409, "payment_replayed", "this transaction was already used")
+    if not tx_locked:
+        return _error(409, "payment_replayed", "this transaction or payment nonce is already being processed")
 
     try:
         verified = await engine.verify_and_submit(signature, required)
-    except RpcUnavailableError as exc:
-        await _release_lock(redis, tx_id)
-        logger.warning("tx %s not settled, node unavailable: %s", tx_id, exc.message)
-        return _error(503, "rpc_unavailable", exc.message, headers={"Retry-After": "5"})
     except PaymentVerificationError as exc:
-        await _release_lock(redis, tx_id)
-        if exc.code == "payment_replayed":
-            return _error(409, "payment_replayed", exc.message)
-        return _error(
-            402, exc.code if exc.code in _VERIFICATION_CODES else "tx_rejected", exc.message, required=required
-        )
+        await _release_payment_locks(redis, tx_id, nonce)
+        return _verification_failure(exc, required)
     except Exception:
-        await _release_lock(redis, tx_id)
+        await _release_payment_locks(redis, tx_id, nonce)
         logger.exception("unexpected failure while verifying tx %s", tx_id)
         return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
 
-    rate = await _lookup_rate(oracle)
-    settlement = _new_settlement(endpoint, merchant_address, required, verified, rate, request)
-    settlement_id = settlement.id
-    unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
-    session.add(settlement)
+    await _hold_delivery_lock(redis, tx_id)
     try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        return _error(409, "payment_replayed", "this transaction was already used")
-    except SQLAlchemyError:
-        await session.rollback()
-        logger.error("tx %s was accepted by the node but its settlement could not be stored", tx_id, exc_info=True)
-        await _dead_letter_settlement(redis, unrecorded_payload)
-        return _error(503, "service_unavailable", "payment was accepted but could not be recorded; contact support")
-
-    usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
-    payment_response = _payment_response_header(tx_id, usd)
-
-    try:
-        result = await _call_upstream(client, method, prepared)
-    except UpstreamFailedError as exc:
-        logger.warning("upstream failure for settled tx %s on %s: %s", tx_id, slug, exc)
-        await _record_upstream_status(session, settlement_id, None)
-        return _error(
-            502,
-            "upstream_error",
-            "the upstream API did not return a response",
-            headers={HEADER_PAYMENT_RESPONSE: payment_response},
+        return await _settle_and_deliver(
+            request, session, redis, client, oracle, endpoint, merchant_address, required, verified, method, prepared
         )
-    await _record_upstream_status(session, settlement_id, result.status_code)
-    return _relay(result, payment_response)
+    finally:
+        await _drop_delivery_lock(redis, tx_id)

@@ -22,7 +22,9 @@ UtxoProvider = Callable[[str], Awaitable[list[dict[str, Any]]]]
 
 
 class UtxoLedger:
-    def __init__(self, ttl_seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self, ttl_seconds: float, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self._ttl = ttl_seconds
         self._clock = clock
         self._spent: dict[Outpoint, float] = {}
@@ -67,7 +69,9 @@ class UtxoLedger:
 class RpcUtxoProvider:
     """Fetches confirmed UTXOs through a lazily connected wRPC client bound to the running event loop."""
 
-    def __init__(self, network: str, rpc_url: str | None, connect_timeout_ms: int = 10_000) -> None:
+    def __init__(
+        self, network: str, rpc_url: str | None, connect_timeout_ms: int = 10_000
+    ) -> None:
         self._network = network
         self._rpc_url = rpc_url
         self._timeout = connect_timeout_ms
@@ -81,7 +85,11 @@ class RpcUtxoProvider:
             else:
                 rpc = kaspa.RpcClient(resolver=kaspa.Resolver(), network_id=network_id)
             try:
-                await rpc.connect(timeout_duration=self._timeout, retry_interval=500, strategy="fallback")
+                await rpc.connect(
+                    timeout_duration=self._timeout,
+                    retry_interval=500,
+                    strategy="fallback",
+                )
             except Exception as exc:
                 raise RpcError(f"cannot connect to a Kaspa node: {exc}") from exc
             self._rpc = rpc

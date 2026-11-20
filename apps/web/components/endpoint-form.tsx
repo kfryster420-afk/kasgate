@@ -145,7 +145,7 @@ export function EndpointForm(props: Props) {
         </div>
       </Field>
 
-      {sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} /> : null}
+      {sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} minOutput={pricing.minOutput} /> : null}
 
       <fieldset>
         <legend className="label">Allowed methods</legend>

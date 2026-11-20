@@ -33,6 +33,8 @@ class VerifiedPaymentLike(Protocol):
 class PaymentVerifier(Protocol):
     """Structural type of `app.kaspa_engine.KaspaEngine` as used by the proxy."""
 
+    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPaymentLike, object]: ...
+
     async def verify_and_submit(
         self, signature: PaymentSignature, required: PaymentRequired
     ) -> VerifiedPaymentLike: ...

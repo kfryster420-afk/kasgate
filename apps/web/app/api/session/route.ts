@@ -3,11 +3,11 @@ import { NextResponse } from "next/server";
 import { gatewayRequest } from "@/lib/server/gateway";
 import { checkSameOrigin, fromGatewayFailure, jsonError, readJsonBody } from "@/lib/server/route";
 import { API_KEY_RE, clearSessionCookie, setSessionCookie } from "@/lib/server/session";
-import type { MerchantRead, MerchantRegistered } from "@/lib/types";
+import type { MerchantRead, SessionStarted } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-/** Sign in with an existing API key: verified against GET /v1/merchants/me, then stored in the httpOnly cookie. */
+/** Sign in with an existing `kg_` API key: verified against GET /v1/merchants/me, then stored in the httpOnly cookie (7 days). */
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const blocked = checkSameOrigin(request);
   if (blocked) return blocked;
@@ -20,7 +20,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   if (!result.ok) {
     return result.status === 401 || result.status === 403 ? jsonError("That API key was not recognised", 401) : fromGatewayFailure(result);
   }
-  const response = NextResponse.json<MerchantRegistered>({ merchant: result.data }, { headers: { "Cache-Control": "no-store" } });
+  const response = NextResponse.json<SessionStarted>({ merchant: result.data, expires_at: null }, { headers: { "Cache-Control": "no-store" } });
   setSessionCookie(response, apiKey);
   return response;
 }

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +39,16 @@ if str(GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR))
 
 from kasgate_client import PaymentRequired, PlatformFee  # noqa: E402
-from kasgate_client.protocol import compute_fee_split  # noqa: E402
+from kasgate_client.protocol import min_price_sompi  # noqa: E402
 
 PRICE = 1_500_000_000
+FLOOR = 20_000_000
+MIN_PRICE = min_price_sompi(FLOOR)  # CONTRACT v2.1: 40_000_000 sompi (0.4 KAS)
+NONCE = "0123456789abcdef" * 2
+
+
+def future(seconds: float = 120.0) -> datetime:
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).replace(microsecond=0)
 
 
 def make_utxo(index: int, amount: int, address: str = PAYER, tx_prefix: int = 0xAA) -> dict[str, Any]:
@@ -63,9 +71,12 @@ def challenge(
     fee_to: str = TREASURY,
     network: str = "kaspa:testnet-10",
     fee_amount: int | None = None,
+    floor: int = FLOOR,
+    nonce: str = NONCE,
+    expires_in: float = 120.0,
     **overrides: Any,
 ) -> PaymentRequired:
-    _, fee = compute_fee_split(price)
+    fee = max(-(-price * 150 // 10_000), floor)  # independent of the SDK: v2.1 fee = max(ceil(1.5%), floor)
     fields: dict[str, Any] = {
         "x402Version": 2,
         "scheme": "kaspa-exact-v1",
@@ -74,6 +85,8 @@ def challenge(
         "amount": str(price),
         "payTo": pay_to,
         "platformFee": PlatformFee(feeTo=fee_to, feeAmount=str(fee if fee_amount is None else fee_amount)),
+        "nonce": nonce,
+        "expiresAt": future(expires_in),
     }
     fields.update(overrides)
     return PaymentRequired(**fields)
@@ -87,9 +100,21 @@ class FakeGateway:
         self.challenge_header = challenge_header
         self.requests: list[httpx.Request] = []
         self.signatures: list[dict[str, Any]] = []
+        self.directory_calls = 0
+        self.manifest_floor: int | None = None  # None: the gateway has no manifest (404)
         self.paid_handler: Callable[[httpx.Request, dict[str, Any]], httpx.Response] | None = None
 
+    def directory_response(self) -> httpx.Response:
+        self.directory_calls += 1
+        if self.manifest_floor is None:
+            return httpx.Response(404, json={"detail": "not found"})
+        return httpx.Response(
+            200, json={"network": "kaspa:testnet-10", "min_output_sompi": self.manifest_floor, "endpoints": []}
+        )
+
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/directory":
+            return self.directory_response()
         from kasgate_client import PaymentResponse, PaymentSignature
 
         self.requests.append(request)
@@ -102,7 +127,8 @@ class FakeGateway:
                 json={"error": "payment_required", "message": "payment required", "accepts": None},
             )
         signature = PaymentSignature.from_header(raw)
-        parsed = {"signature": signature, "tx": kaspa.Transaction.from_dict(json.loads(signature.rawTx))}
+        tx = kaspa.Transaction.from_dict(json.loads(signature.rawTx))
+        parsed = {"signature": signature, "tx": tx, "payload": bytes.fromhex(tx.payload)}
         self.signatures.append(parsed)
         if self.paid_handler is not None:
             return self.paid_handler(request, parsed)

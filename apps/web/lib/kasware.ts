@@ -24,39 +24,15 @@ export function getKasware(): KaswareProvider | null {
   return provider && typeof provider.requestAccounts === "function" && typeof provider.signMessage === "function" ? provider : null;
 }
 
-const HEX_SIGNATURE = /^[0-9a-f]{128}$/;
-const HEX_PUBLIC_KEY = /^(?:[0-9a-f]{64}|0[23][0-9a-f]{64})$/;
+const HEX_PUBLIC_KEY = /^(?:[0-9a-f]{64}|0[23][0-9a-f]{64})$/i;
 
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+/** Public keys are trimmed and checked for shape only; signatures are never modified (the gateway normalises them). */
+export function isPublicKey(value: string): boolean {
+  return HEX_PUBLIC_KEY.test(value.trim());
 }
 
-function base64ToBytes(value: string): Uint8Array | null {
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 !== 0) return null;
-  try {
-    const raw = atob(value);
-    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The gateway requires a 128-hex (64-byte) signature. Wallets may return hex directly, or Base64 of the 64-byte
- * signature, or Base64 of 65 bytes (one leading header byte + 64-byte signature). Returns null if unrecognised.
- */
-export function normalizeSignature(input: string): string | null {
-  const value = input.trim();
-  const lower = value.toLowerCase().replace(/^0x/, "");
-  if (HEX_SIGNATURE.test(lower)) return lower;
-  const bytes = base64ToBytes(value);
-  if (!bytes) return null;
-  if (bytes.length === 64) return bytesToHex(bytes);
-  if (bytes.length === 65) return bytesToHex(bytes.slice(1));
-  return null;
-}
-
-export function normalizePublicKey(input: string): string | null {
-  const lower = input.trim().toLowerCase().replace(/^0x/, "");
-  return HEX_PUBLIC_KEY.test(lower) ? lower : null;
+/** Signature sanity check that does not transform the value: non-empty single token of plausible length. */
+export function isSignatureToken(value: string): boolean {
+  const v = value.trim();
+  return v.length >= 64 && v.length <= 200 && !/\s/.test(v);
 }

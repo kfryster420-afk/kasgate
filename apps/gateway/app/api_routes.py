@@ -1,7 +1,6 @@
 """Merchant-facing REST API (`/v1/*`) and the public directory/quote routes."""
 
 import csv
-import hmac
 import io
 import logging
 import re
@@ -23,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import get_settings
 from app.deps import get_db_session, get_redis, get_sessionmaker
 from app.models import Endpoint, Merchant, Settlement, SettlementStatus
+from app.proxy import issue_payment_challenge
 from app.schemas import (
     PROXY_PATH_PREFIX,
     TAX_CSV_COLUMNS,
@@ -41,6 +41,7 @@ from app.schemas import (
     MerchantCreated,
     MerchantRead,
     PaymentRequired,
+    SessionIssued,
     SettlementRead,
     TaxReportRow,
     X402ErrorBody,
@@ -51,17 +52,17 @@ from app.security import (
     RATE_LIMIT_AUTH_CHALLENGE,
     RATE_LIMIT_AUTH_VERIFY,
     RATE_LIMIT_CREATE_MERCHANT,
-    challenge_key,
+    RATE_LIMIT_UNPAID_PROXY,
+    auth_challenge_key,
+    consume_wallet_proof,
+    create_session,
     encrypt_headers,
     generate_api_key,
     get_current_merchant,
     hash_api_key,
     limit_by_ip,
-    limit_challenge_by_address,
-    new_login_challenge,
-    parse_login_challenge,
+    new_auth_challenge,
     validate_upstream_headers,
-    verify_wallet_signature,
 )
 
 logger = logging.getLogger("kasgate.api")
@@ -133,6 +134,9 @@ async def _rotate_api_key(session: AsyncSession, merchant: Merchant) -> Merchant
     return MerchantCreated(merchant=MerchantRead.model_validate(merchant), api_key=api_key)
 
 
+REGISTRATION_FAILED_DETAIL = "registration failed: invalid challenge or signature"
+
+
 @router.post(
     "/merchants",
     status_code=status.HTTP_201_CREATED,
@@ -140,7 +144,20 @@ async def _rotate_api_key(session: AsyncSession, merchant: Merchant) -> Merchant
     tags=["merchants"],
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_CREATE_MERCHANT))],
 )
-async def create_merchant(payload: MerchantCreate, session: DbSession) -> MerchantCreated:
+async def create_merchant(
+    payload: MerchantCreate, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]
+) -> MerchantCreated:
+    # The wallet proof comes first: only the owner of the address can learn whether it is already registered.
+    proven = await consume_wallet_proof(
+        redis,
+        purpose="register",
+        address=payload.kaspa_address,
+        challenge=payload.challenge,
+        public_key=payload.public_key,
+        signature=payload.signature,
+    )
+    if not proven:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=REGISTRATION_FAILED_DETAIL)
     email = str(payload.email).lower() if payload.email is not None else None
     if await session.scalar(select(Merchant.id).where(Merchant.kaspa_address == payload.kaspa_address)) is not None:
         raise HTTPException(
@@ -178,7 +195,7 @@ async def rotate_key(merchant: CurrentMerchant, session: DbSession) -> MerchantC
     return await _rotate_api_key(session, merchant)
 
 
-# ---------------------------------------------------------------- wallet-signature login / key recovery
+# ---------------------------------------------------------------- wallet-signature login
 
 
 LOGIN_FAILED_DETAIL = "login failed: invalid address, challenge or signature"
@@ -193,64 +210,60 @@ def _login_failed() -> HTTPException:
     "/auth/challenge",
     response_model=AuthChallenge,
     tags=["auth"],
-    dependencies=[
-        Depends(limit_by_ip(RATE_LIMIT_AUTH_CHALLENGE)),
-        Depends(limit_challenge_by_address),
-    ],
+    dependencies=[Depends(limit_by_ip(RATE_LIMIT_AUTH_CHALLENGE))],
 )
 async def auth_challenge(payload: AuthChallengeRequest, redis: Annotated[Redis, Depends(get_redis)]) -> AuthChallenge:
-    challenge, message = new_login_challenge(payload.kaspa_address)
+    """Always 200, even for unknown addresses, so it cannot be used to find out who is registered."""
+    challenge = new_auth_challenge(payload.purpose, payload.kaspa_address)
     try:
-        await redis.set(challenge_key(challenge.address, challenge.nonce), message, ex=AUTH_CHALLENGE_TTL_SECONDS)
+        await redis.set(
+            auth_challenge_key(challenge.purpose, challenge.address, challenge.nonce),
+            challenge.message,
+            ex=AUTH_CHALLENGE_TTL_SECONDS,
+        )
     except RedisError as exc:
-        logger.exception("could not store login challenge")
+        logger.exception("could not store auth challenge")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="login is temporarily unavailable"
         ) from exc
-    return AuthChallenge(kaspa_address=challenge.address, challenge=message, expires_at=challenge.expires_at)
+    return AuthChallenge(kaspa_address=challenge.address, challenge=challenge.message, expires_at=challenge.expires_at)
 
 
 @router.post(
     "/auth/verify",
-    response_model=MerchantCreated,
+    response_model=SessionIssued,
     tags=["auth"],
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_AUTH_VERIFY))],
 )
 async def auth_verify(
     payload: AuthVerifyRequest, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]
-) -> MerchantCreated:
+) -> SessionIssued:
+    """Exchange a signed `login` challenge for a `kgs_` dashboard session. The API key is NOT rotated."""
     # Every check runs (and the challenge is always consumed) regardless of earlier failures, so the work done
     # and the response are identical for unknown addresses, bad challenges and bad signatures.
-    challenge_ok = False
-    try:
-        challenge = parse_login_challenge(payload.challenge)
-    except ValueError:
-        challenge = None
-    if challenge is not None:
-        try:
-            stored = await redis.getdel(challenge_key(challenge.address, challenge.nonce))
-        except RedisError as exc:
-            logger.exception("could not consume login challenge")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="login is temporarily unavailable"
-            ) from exc
-        challenge_ok = (
-            stored is not None
-            and hmac.compare_digest(str(stored), payload.challenge)
-            and challenge.address == payload.kaspa_address
-            and challenge.expires_at > datetime.now(UTC)
-        )
+    proven = await consume_wallet_proof(
+        redis,
+        purpose="login",
+        address=payload.kaspa_address,
+        challenge=payload.challenge,
+        public_key=payload.public_key,
+        signature=payload.signature,
+    )
     merchant = (
         await session.execute(select(Merchant).where(Merchant.kaspa_address == payload.kaspa_address))
     ).scalar_one_or_none()
-    signature_ok = await verify_wallet_signature(
-        payload.challenge, payload.signature, payload.public_key, payload.kaspa_address
-    )
-    if merchant is None or not challenge_ok or not signature_ok:
+    if merchant is None or not proven:
         raise _login_failed()
     if not merchant.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="merchant account is disabled")
-    return await _rotate_api_key(session, merchant)
+    try:
+        token, expires_at = await create_session(redis, merchant.id)
+    except RedisError as exc:
+        logger.exception("could not store session")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="login is temporarily unavailable"
+        ) from exc
+    return SessionIssued(merchant=MerchantRead.model_validate(merchant), session_token=token, expires_at=expires_at)
 
 
 # ---------------------------------------------------------------- endpoints
@@ -584,8 +597,10 @@ async def directory(session: DbSession, redis: Annotated[Redis, Depends(get_redi
     response_model=PaymentRequired,
     responses={404: {"model": X402ErrorBody}},
     tags=["public"],
+    dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
-async def quote(slug: str, session: DbSession) -> Response:
+async def quote(slug: str, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]) -> Response:
+    """A payable quote: the same nonce-bound challenge `/p/{slug}` answers with, valid for `payment_max_age_seconds`."""
     row = (
         await session.execute(
             select(Endpoint.price_sompi, Merchant.kaspa_address)
@@ -597,12 +612,19 @@ async def quote(slug: str, session: DbSession) -> Response:
         body = X402ErrorBody(error="endpoint_not_found", message=f"no active endpoint with slug '{slug}'")
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=body.model_dump(mode="json"))
     try:
-        required = PaymentRequired.for_endpoint(row[0], row[1])
+        required = await issue_payment_challenge(redis, slug, row[0], row[1])
     except ValueError as exc:
         logger.error("endpoint %s has an unquotable price: %s", slug, exc)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": "endpoint price is not currently payable"},
+        )
+    except RedisError:
+        logger.exception("quote store unavailable")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "quotes are temporarily unavailable"},
+            headers={"Retry-After": "5"},
         )
     return JSONResponse(content=required.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
 

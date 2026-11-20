@@ -30,15 +30,26 @@ NETWORK_TYPE: dict[str, str] = {
     NETWORK_MAINNET: "mainnet",
 }
 
-# The gateway rejects Base64 headers larger than schemas.MAX_HEADER_BYTES and rawTx longer than 100_000 chars.
-GATEWAY_MAX_HEADER_BYTES = 131_072
-GATEWAY_MAX_RAW_TX_CHARS = 100_000
+# CONTRACT v2: the gateway rejects Base64 headers larger than schemas.MAX_HEADER_BYTES and rawTx longer than
+# schemas.MAX_RAW_TX_CHARS.
+GATEWAY_MAX_HEADER_BYTES = 40_960
+GATEWAY_MAX_RAW_TX_CHARS = 24_000
+PAYMENT_PAYLOAD_PREFIX = "kasgate:v1:"
+DIRECTORY_PATH = "/v1/directory"
+MANIFEST_TIMEOUT_SECONDS = 5.0
+# A challenge that expires sooner than this cannot be paid, mined and presented in time.
+MIN_CHALLENGE_TTL_SECONDS = 3.0
 # Real-world servers (uvicorn/h11 defaults to 16 KiB per header block, nginx to 8 KiB per line) are stricter than
 # the gateway's own limit, so the SDK refuses to emit a PAYMENT-SIGNATURE larger than this by default.
 DEFAULT_MAX_SIGNATURE_HEADER_BYTES = 12_000
 
-DEFAULT_MAX_PRICE_SOMPI = 2_000_000_000  # 20 KAS: above the ~13.33 KAS minimum endpoint price, far below a drain.
-DEFAULT_MIN_OUTPUT_SOMPI = 20_000_000  # KIP-9 storage-mass floor per output (gateway DEFAULT_MIN_OUTPUT_SOMPI).
+DEFAULT_MAX_PRICE_SOMPI = 2_000_000_000  # 20 KAS: far above the 0.4 KAS minimum endpoint price, far below a drain.
+# KIP-9 storage-mass floor per output (gateway DEFAULT_MIN_OUTPUT_SOMPI). CONTRACT v2.1: the treasury fee is
+# max(ceil(1.5%), floor) and the merchant output is total - fee, so the minimum price is 2 * floor = 0.4 KAS.
+DEFAULT_MIN_OUTPUT_SOMPI = 20_000_000
+DEFAULT_MAX_REDELIVERIES = 1
 MAX_RETRY_AFTER_SECONDS = 10.0
-DEFAULT_MAX_NETWORK_FEE_SOMPI = 5_000_000  # 0.05 KAS ceiling on the miner fee the payer funds on top of the price.
+DEFAULT_MAX_NETWORK_FEE_SOMPI = (
+    5_000_000  # 0.05 KAS ceiling on the miner fee the payer funds on top of the price.
+)
 DEFAULT_UTXO_QUARANTINE_SECONDS = 180.0

@@ -1,38 +1,35 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { checkDisplayName, checkKaspaAddress, checkOptionalEmail } from "@/lib/validation";
+import { EXPECTED_AUTH_DOMAINS } from "@/lib/config";
+import { checkChallenge } from "@/lib/challenge";
+import { checkMerchantCreate } from "@/lib/server/auth-input";
 import { gatewayRequest } from "@/lib/server/gateway";
 import { checkSameOrigin, fromGatewayFailure, jsonError, readJsonBody } from "@/lib/server/route";
-import { setSessionCookie } from "@/lib/server/session";
-import type { MerchantCreated, MerchantRegistered } from "@/lib/types";
+import { API_KEY_RE, setSessionCookie } from "@/lib/server/session";
+import type { MerchantCreated } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-/** Registers a merchant. The one-time api_key is stored ONLY in an httpOnly cookie and never returned to the browser. */
+/**
+ * Registers a merchant with a wallet signature over a purpose="register" challenge. The response carries the long-lived
+ * api_key exactly once (the UI shows it a single time); the same key also becomes the httpOnly session cookie.
+ */
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const blocked = checkSameOrigin(request);
   if (blocked) return blocked;
 
   const body = await readJsonBody(request);
   if (!body) return jsonError("Request body must be a JSON object", 400);
+  const checked = checkMerchantCreate(body);
+  if (!checked.ok) return jsonError(checked.error, 422);
+  const refusal = checkChallenge(checked.value.challenge, { purpose: "register", address: checked.value.kaspa_address, domains: EXPECTED_AUTH_DOMAINS });
+  if (refusal) return jsonError(refusal, 422, "challenge_rejected");
 
-  const address = checkKaspaAddress(body.kaspa_address);
-  if (!address.ok) return jsonError(address.error, 422);
-  const name = checkDisplayName(body.display_name);
-  if (!name.ok) return jsonError(name.error, 422);
-  const email = checkOptionalEmail(body.email);
-  if (!email.ok) return jsonError(email.error, 422);
-
-  const payload: Record<string, unknown> = { kaspa_address: address.value, display_name: name.value };
-  if (email.value) payload.email = email.value;
-
-  const result = await gatewayRequest<MerchantCreated>("/v1/merchants", { method: "POST", body: JSON.stringify(payload) });
+  const result = await gatewayRequest<MerchantCreated>("/v1/merchants", { method: "POST", body: JSON.stringify(checked.value) });
   if (!result.ok) return fromGatewayFailure(result);
+  if (!API_KEY_RE.test(result.data.api_key)) return jsonError("The gateway returned an invalid API key. Please try again.", 502);
 
-  const response = NextResponse.json<MerchantRegistered>(
-    { merchant: result.data.merchant },
-    { status: 201, headers: { "Cache-Control": "no-store" } },
-  );
+  const response = NextResponse.json<MerchantCreated>(result.data, { status: 201, headers: { "Cache-Control": "no-store" } });
   setSessionCookie(response, result.data.api_key);
   return response;
 }

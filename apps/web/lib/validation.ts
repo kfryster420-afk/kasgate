@@ -128,13 +128,16 @@ export function checkUpstreamHeaders(input: unknown): Check<Record<string, strin
   return ok(out);
 }
 
-/** Validates a decimal-string sompi price against the integer range and the KIP-9 output floor. */
+/**
+ * Validates a decimal-string sompi price (max 18 digits, SompiStr) against the minimum price 2 * F derived from the
+ * gateway's min_output_sompi `minOutput`, so both the treasury and merchant outputs clear the KIP-9 floor.
+ */
 export function checkPriceSompi(input: unknown, minOutput: bigint): Check<string> {
-  if (typeof input !== "string" || !/^[1-9][0-9]{0,18}$/.test(input.trim())) return fail("Price must be a positive whole number of sompi");
+  if (typeof input !== "string" || !/^[1-9][0-9]{0,17}$/.test(input.trim())) return fail("Price must be a positive whole number of sompi (at most 18 digits)");
   const value = BigInt(input.trim());
   if (value > MAX_SOMPI) return fail("Price exceeds the maximum supported amount");
   const floorPrice = minPriceSompi(minOutput);
-  if (!meetsOutputFloor(value, minOutput)) {
+  if (value < floorPrice || !meetsOutputFloor(value, minOutput)) {
     return fail(`Minimum price is ${formatSompi(floorPrice)} sompi (${formatKas(floorPrice)} KAS) so both outputs clear the KIP-9 floor`);
   }
   return ok(value.toString());

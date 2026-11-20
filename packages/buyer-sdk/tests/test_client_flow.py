@@ -12,6 +12,9 @@ import kaspa
 import pytest
 from app import schemas as gw
 from conftest import (
+    FLOOR,
+    MIN_PRICE,
+    NONCE,
     MERCHANT,
     OTHER,
     PAYER,
@@ -25,7 +28,7 @@ from conftest import (
 from kasgate_client import KasGateClient, KasGateSyncClient, receipt_of
 
 KAS = 100_000_000
-FLOOR_PRICE = 1_333_333_267
+OTHER_NONCE = "fedcba9876543210" * 2
 
 
 def script_of(address: str) -> str:
@@ -55,6 +58,10 @@ async def test_pays_with_exact_output_layout_and_attaches_receipt(gateway, make_
     gateway_sig = gw.PaymentSignature.from_header(gateway.requests[1].headers["PAYMENT-SIGNATURE"])
     assert gateway_sig.txId == sig.txId == tx.id
     assert gateway_sig.payerAddress == PAYER
+    assert sig.nonce == gateway_sig.nonce == NONCE
+    assert gateway_sig.txId == tx.id
+    assert bytes.fromhex(tx.payload) == gw.payment_payload(NONCE) == b"kasgate:v1:" + NONCE.encode()
+    assert gateway.signatures[0]["payload"] == b"kasgate:v1:" + NONCE.encode()
 
     merchant, fee = sdk.compute_fee_split(PRICE)
     outputs = tx.outputs
@@ -214,7 +221,18 @@ def _bad_header(mutate) -> str:
         (lambda: FakeGateway(challenge(fee_amount=sdk.compute_fee_split(PRICE)[1] + 1)), sdk.FeeSplitMismatchError),
         (lambda: FakeGateway(challenge(fee_amount=sdk.compute_fee_split(PRICE)[1] - 1)), sdk.FeeSplitMismatchError),
         (lambda: FakeGateway(challenge(fee_amount=1)), sdk.FeeSplitMismatchError),
-        (lambda: FakeGateway(challenge(FLOOR_PRICE - 1)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(1)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(20_000_000)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(39_999_999)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(MIN_PRICE, fee_amount=600_000)), sdk.FeeSplitMismatchError),  # pre-v2.1 split
+        (lambda: FakeGateway(challenge(MIN_PRICE, fee_amount=FLOOR - 1)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(MIN_PRICE, fee_amount=FLOOR + 1)), sdk.FeeSplitMismatchError),
+        (lambda: FakeGateway(challenge(expires_in=-5)), sdk.ChallengeExpiredError),
+        (lambda: FakeGateway(challenge(expires_in=1)), sdk.ChallengeExpiredError),
+        (lambda: FakeGateway(challenge_header=_bad_header(lambda p: p.pop("nonce"))), sdk.InvalidChallengeError),
+        (lambda: FakeGateway(challenge_header=_bad_header(lambda p: p.update(nonce="XYZ"))), sdk.InvalidChallengeError),
+        (lambda: FakeGateway(challenge_header=_bad_header(lambda p: p.pop("expiresAt"))), sdk.InvalidChallengeError),
+        (lambda: FakeGateway(challenge(MIN_PRICE - 1)), sdk.FeeSplitMismatchError),
         (lambda: FakeGateway(challenge(pay_to=TREASURY, fee_to=TREASURY)), sdk.FeeSplitMismatchError),
         (lambda: FakeGateway(challenge_header="%%%not-base64%%%"), sdk.InvalidChallengeError),
         (lambda: FakeGateway(challenge_header=base64.b64encode(b"not json").decode()), sdk.InvalidChallengeError),
@@ -335,6 +353,8 @@ async def test_upstream_502_with_receipt_returns_response_and_receipt(make_clien
     response = await client.get("/p/demo")
     assert response.status_code == 502
     assert receipt_of(response) is not None
+    assert len(gateway.signatures) == 2  # one redelivery (default max_redeliveries=1) with the very same signature
+    assert gateway.requests[1].headers["PAYMENT-SIGNATURE"] == gateway.requests[2].headers["PAYMENT-SIGNATURE"]
 
 
 async def test_503_rpc_unavailable_retries_once_with_the_same_signature(make_client) -> None:
@@ -525,3 +545,311 @@ def test_sync_wrapper_pays_and_returns_receipt(gateway) -> None:
         with pytest.raises(sdk.PriceCapExceededError):
             client.get("/p/demo", max_price_kas="1")
         assert client.address == PAYER
+
+
+# ------------------------------------------------------------------ CONTRACT v2.1: fee floor and minimum price
+
+
+def _outputs(tx) -> list[tuple[int, str]]:
+    return [(o.value, o.script_public_key.script) for o in tx.outputs]
+
+
+async def test_pays_exactly_the_minimum_price_40_000_000(make_client) -> None:
+    gateway = FakeGateway(challenge(MIN_PRICE))
+    client = make_client(gateway)
+    response = await client.get("/p/demo")
+
+    assert response.status_code == 200
+    tx = gateway.signatures[0]["tx"]
+    outputs = _outputs(tx)
+    assert outputs[0] == (20_000_000, script_of(MERCHANT))
+    assert outputs[1] == (20_000_000, script_of(TREASURY))
+    assert outputs[2][1] == script_of(PAYER)
+    receipt = receipt_of(response)
+    assert (receipt.amount_sompi, receipt.merchant_sompi, receipt.fee_sompi) == (40_000_000, 20_000_000, 20_000_000)
+
+
+@pytest.mark.parametrize(
+    ("total", "merchant", "fee"),
+    [
+        (1_333_333_333, 1_313_333_333, 20_000_000),
+        (1_333_333_334, 1_313_333_333, 20_000_001),
+        (1_333_333_335, 1_313_333_334, 20_000_001),
+    ],
+)
+async def test_pays_the_exact_split_around_the_crossover(make_client, total, merchant, fee) -> None:
+    gateway = FakeGateway(challenge(total))
+    client = make_client(gateway)
+    response = await client.get("/p/demo", max_price_kas="20")
+
+    tx = gateway.signatures[0]["tx"]
+    outputs = _outputs(tx)
+    assert outputs[0] == (merchant, script_of(MERCHANT))
+    assert outputs[1] == (fee, script_of(TREASURY))
+    assert fee * 10_000 >= total * 150  # never below the 1.5% share
+    receipt = receipt_of(response)
+    assert (receipt.merchant_sompi, receipt.fee_sompi) == (merchant, fee)
+    assert gw.compute_fee_split(total, min_output_sompi=FLOOR).fee_sompi == fee
+
+
+@pytest.mark.parametrize("price", [1, 20_000_000, 39_999_998, 39_999_999])
+async def test_any_price_below_the_floor_split_is_refused_before_signing(make_client, price) -> None:
+    gateway = FakeGateway(challenge(price))
+    client = make_client(gateway)
+    with pytest.raises(sdk.FeeSplitMismatchError):
+        await client.get("/p/demo")
+    assert_untouched(client, gateway)
+
+
+async def test_pre_v2_1_percentage_only_fee_is_refused(make_client) -> None:
+    gateway = FakeGateway(challenge(MIN_PRICE, fee_amount=600_000))
+    client = make_client(gateway)
+    with pytest.raises(sdk.FeeSplitMismatchError):
+        await client.get("/p/demo")
+    assert_untouched(client, gateway)
+
+
+async def test_floor_is_read_from_the_gateway_manifest(make_client) -> None:
+    gateway = FakeGateway(challenge(60_000_000, floor=30_000_000))
+    gateway.manifest_floor = 30_000_000
+    client = make_client(gateway)
+    await client.get("/p/demo")
+
+    outputs = _outputs(gateway.signatures[0]["tx"])
+    assert outputs[0][0] == 30_000_000 and outputs[1][0] == 30_000_000
+    assert gateway.directory_calls == 1
+    await client.get("/p/demo")  # cached per origin
+    assert gateway.directory_calls == 1
+
+
+async def test_manifest_floor_is_enforced_on_the_merchant_output(make_client) -> None:
+    """Challenge fee/merchant are valid for the default floor but the manifest says 30M: merchant 20M is too small."""
+    gateway = FakeGateway(challenge(MIN_PRICE))
+    gateway.manifest_floor = 30_000_000
+    client = make_client(gateway)
+    with pytest.raises(sdk.FeeSplitMismatchError):
+        await client.get("/p/demo")
+    assert_untouched(client, gateway)
+
+
+@pytest.mark.parametrize("manifest_floor", [None, 0, -5, "20000000", True, 10**30])
+async def test_unusable_manifest_falls_back_to_the_contract_default(make_client, manifest_floor) -> None:
+    gateway = FakeGateway(challenge(MIN_PRICE))
+    gateway.manifest_floor = manifest_floor  # type: ignore[assignment]
+    client = make_client(gateway)
+    response = await client.get("/p/demo")
+    assert response.status_code == 200
+    assert _outputs(gateway.signatures[0]["tx"])[0][0] == 20_000_000
+
+
+async def test_pinned_floor_overrides_the_manifest_and_skips_the_lookup(make_client) -> None:
+    gateway = FakeGateway(challenge(MIN_PRICE))
+    gateway.manifest_floor = 5_000_000
+    client = make_client(gateway, min_output_sompi=20_000_000)
+    await client.get("/p/demo")
+    assert gateway.directory_calls == 0
+    assert _outputs(gateway.signatures[0]["tx"])[1][0] == 20_000_000
+
+
+def test_invalid_pinned_floor_is_rejected() -> None:
+    with pytest.raises(sdk.ConfigurationError):
+        KasGateClient(PAYER_KEY, min_output_sompi=0, utxo_provider=lambda a: [])  # type: ignore[arg-type]
+
+
+def test_builder_refuses_any_output_below_the_floor() -> None:
+    from kasgate_client.transaction import build_payment_transaction
+
+    base = {
+        "private_key": kaspa.PrivateKey(PAYER_KEY),
+        "network": "kaspa:testnet-10",
+        "utxo_entries": [make_utxo(0, 500 * KAS)],
+        "pay_to": MERCHANT,
+        "fee_to": TREASURY,
+        "max_network_fee_sompi": sdk.DEFAULT_MAX_NETWORK_FEE_SOMPI,
+        "payload": sdk.payment_payload(NONCE),
+    }
+    ok = build_payment_transaction(**base, merchant_sompi=20_000_000, fee_sompi=20_000_000)
+    assert (ok.merchant_sompi, ok.fee_sompi) == (20_000_000, 20_000_000)
+    for merchant, fee in [(19_999_999, 20_000_000), (20_000_000, 19_999_999), (1, 1), (1_000_000_000, 600_000)]:
+        with pytest.raises(sdk.TransactionBuildError):
+            build_payment_transaction(**base, merchant_sompi=merchant, fee_sompi=fee)
+    with pytest.raises(sdk.TransactionBuildError):
+        build_payment_transaction(**base, merchant_sompi=20_000_000, fee_sompi=20_000_000, min_output_sompi=20_000_001)
+
+
+@pytest.mark.parametrize("payload", [b"", "kasgate:v1:text", None])
+def test_builder_requires_the_payload_as_bytes(payload) -> None:
+    from kasgate_client.transaction import build_payment_transaction
+
+    with pytest.raises(sdk.TransactionBuildError):
+        build_payment_transaction(
+            private_key=kaspa.PrivateKey(PAYER_KEY),
+            network="kaspa:testnet-10",
+            utxo_entries=[make_utxo(0, 500 * KAS)],
+            pay_to=MERCHANT,
+            fee_to=TREASURY,
+            merchant_sompi=20_000_000,
+            fee_sompi=20_000_000,
+            max_network_fee_sompi=sdk.DEFAULT_MAX_NETWORK_FEE_SOMPI,
+            payload=payload,  # type: ignore[arg-type]
+        )
+
+
+# ------------------------------------------------------------------ CONTRACT v2: nonce binding and expiry
+
+
+async def test_transaction_payload_binds_the_challenge_nonce(make_client) -> None:
+    gateway = FakeGateway(challenge(nonce=OTHER_NONCE))
+    client = make_client(gateway)
+    await client.get("/p/demo")
+    parsed = gateway.signatures[0]
+    assert parsed["signature"].nonce == OTHER_NONCE
+    assert parsed["payload"] == b"kasgate:v1:" + OTHER_NONCE.encode()
+    # the payload is part of the tx id: the same payment without a payload would have a different id
+    assert json.loads(parsed["signature"].rawTx)["payload"] == parsed["payload"].hex()
+
+
+async def test_each_payment_uses_the_nonce_of_its_own_challenge(make_client) -> None:
+    gateway = FakeGateway(challenge(nonce=NONCE))
+    client = make_client(gateway)
+    await client.get("/p/a")
+    gateway.required = challenge(nonce=OTHER_NONCE)
+    await client.get("/p/b")
+    assert [s["signature"].nonce for s in gateway.signatures] == [NONCE, OTHER_NONCE]
+    assert gateway.signatures[0]["signature"].txId != gateway.signatures[1]["signature"].txId
+
+
+async def test_expired_challenge_is_refused_before_signing(make_client) -> None:
+    gateway = FakeGateway(challenge(expires_in=-1))
+    client = make_client(gateway)
+    with pytest.raises(sdk.ChallengeExpiredError):
+        await client.get("/p/demo")
+    assert_untouched(client, gateway)
+
+
+def _expired_then_fresh(gateway: FakeGateway, *, always: bool = False):
+    calls = {"n": 0}
+
+    def handler(request, parsed):
+        calls["n"] += 1
+        if not always:
+            gateway.required = challenge(nonce=OTHER_NONCE)
+        body = {"error": "payment_expired", "message": "payment nonce expired or unknown"}
+        if calls["n"] == 1 or always:
+            return httpx.Response(402, json=body)
+        receipt = sdk.PaymentResponse(
+            txId=parsed["signature"].txId, network="kaspa:testnet-10", usdValueAtSettlement="1.00000000"
+        ).to_header()
+        return httpx.Response(200, headers={"PAYMENT-RESPONSE": receipt}, json={"ok": True})
+
+    gateway.paid_handler = handler
+    return calls
+
+
+async def test_payment_expired_triggers_exactly_one_rechallenge_with_a_new_nonce(make_client) -> None:
+    gateway = FakeGateway()
+    _expired_then_fresh(gateway)
+    client = make_client(gateway)
+    response = await client.get("/p/demo")
+
+    assert response.status_code == 200
+    first, second = gateway.signatures
+    assert first["signature"].nonce == NONCE and second["signature"].nonce == OTHER_NONCE
+    assert second["payload"] == b"kasgate:v1:" + OTHER_NONCE.encode()
+    assert first["signature"].txId != second["signature"].txId
+    # the first tx never reached the node (expired nonce), so its inputs were NOT quarantined and are reused
+    assert {(i.previous_outpoint.transaction_id, i.previous_outpoint.index) for i in first["tx"].inputs} == {
+        (i.previous_outpoint.transaction_id, i.previous_outpoint.index) for i in second["tx"].inputs
+    }
+    assert receipt_of(response).tx_id == second["signature"].txId
+
+
+async def test_persistent_payment_expired_raises_after_one_rechallenge(make_client) -> None:
+    gateway = FakeGateway()
+    _expired_then_fresh(gateway, always=True)
+    client = make_client(gateway)
+    with pytest.raises(sdk.PaymentExpiredError) as info:
+        await client.get("/p/demo")
+    assert info.value.code == "payment_expired" and info.value.status_code == 402
+    assert len(gateway.signatures) == 2
+
+
+# ------------------------------------------------------------------ CONTRACT v2: redelivery
+
+
+def _upstream_failing_then_ok(fail_times: int, status: int = 502):
+    state = {"n": 0}
+
+    def handler(request, parsed):
+        state["n"] += 1
+        receipt = sdk.PaymentResponse(
+            txId=parsed["signature"].txId, network="kaspa:testnet-10", usdValueAtSettlement="1.00000000"
+        ).to_header()
+        code = status if state["n"] <= fail_times else 200
+        return httpx.Response(code, headers={"PAYMENT-RESPONSE": receipt}, json={"n": state["n"]})
+
+    return handler
+
+
+async def test_redelivery_resends_the_same_signature_for_idempotent_methods(make_client) -> None:
+    gateway = FakeGateway()
+    gateway.paid_handler = _upstream_failing_then_ok(1)
+    client = make_client(gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+
+    assert response.status_code == 200 and response.json() == {"n": 2}
+    assert receipt_of(response) is not None
+    sent = [r.headers["PAYMENT-SIGNATURE"] for r in gateway.requests if "PAYMENT-SIGNATURE" in r.headers]
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert len({s["signature"].txId for s in gateway.signatures}) == 1  # one payment, delivered twice
+
+
+async def test_redelivery_is_bounded(make_client) -> None:
+    gateway = FakeGateway()
+    gateway.paid_handler = _upstream_failing_then_ok(10)
+    client = make_client(gateway, unavailable_retry_delay=0, max_redeliveries=2)
+    response = await client.get("/p/demo")
+    assert response.status_code == 502
+    assert len(gateway.signatures) == 3
+
+
+async def test_redelivery_is_skipped_for_non_idempotent_methods(make_client) -> None:
+    gateway = FakeGateway()
+    gateway.paid_handler = _upstream_failing_then_ok(1)
+    client = make_client(gateway, unavailable_retry_delay=0)
+    response = await client.post("/p/demo", content=b"{}")
+    assert response.status_code == 502
+    assert len(gateway.signatures) == 1
+
+
+async def test_redelivery_can_be_disabled(make_client) -> None:
+    gateway = FakeGateway()
+    gateway.paid_handler = _upstream_failing_then_ok(1)
+    client = make_client(gateway, max_redeliveries=0)
+    response = await client.get("/p/demo")
+    assert response.status_code == 502
+    assert len(gateway.signatures) == 1
+
+
+async def test_redelivery_refusal_keeps_the_original_upstream_failure(make_client) -> None:
+    gateway = FakeGateway()
+    state = {"n": 0}
+
+    def handler(request, parsed):
+        state["n"] += 1
+        if state["n"] == 1:
+            receipt = sdk.PaymentResponse(
+                txId=parsed["signature"].txId, network="kaspa:testnet-10", usdValueAtSettlement="1.00000000"
+            ).to_header()
+            return httpx.Response(502, headers={"PAYMENT-RESPONSE": receipt}, json={"error": "upstream_error"})
+        return httpx.Response(409, json={"error": "payment_replayed", "message": "window over"})
+
+    gateway.paid_handler = handler
+    client = make_client(gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    assert response.status_code == 502 and receipt_of(response) is not None
+
+
+def test_negative_redeliveries_rejected() -> None:
+    with pytest.raises(sdk.ConfigurationError):
+        KasGateClient(PAYER_KEY, max_redeliveries=-1, utxo_provider=lambda a: [])  # type: ignore[arg-type]

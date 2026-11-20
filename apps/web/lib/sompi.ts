@@ -19,26 +19,54 @@ export function parseKasToSompi(input: string): bigint | null {
   return sompi;
 }
 
-/** Mirrors schemas.compute_fee_split: fee = ceil(total * 150 / 10_000), merchant = total - fee. */
-export function computeFeeSplit(total: bigint): BigFeeSplit {
-  const fee = (total * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1n) / BPS_DENOMINATOR;
-  return { total, merchant: total - fee, fee };
+/** ceil(price * 150 / 10_000) using BigInt. */
+export function percentageFeeSompi(price: bigint): bigint {
+  return (price * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1n) / BPS_DENOMINATOR;
 }
 
 /**
- * Mirrors schemas.min_price_sompi: max(floor((F-1)*10000/150)+1, F + ceil(F*150/10000)) where F is the gateway's
- * `min_output_sompi` (from GET /v1/directory). F is never hardcoded here; e.g. F=20,000,000 gives 1,333,333,267.
+ * CONTRACT v2.1 treasury fee: max(ceil(price * 150 / 10_000), F) where F is the gateway's `min_output_sompi`
+ * (DirectoryManifest.min_output_sompi). F is never hardcoded in this app.
  */
-export function minPriceSompi(minOutput: bigint): bigint {
-  const byFee = ((minOutput - 1n) * BPS_DENOMINATOR) / PLATFORM_FEE_BPS + 1n;
-  const byMerchant = minOutput + (minOutput * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1n) / BPS_DENOMINATOR;
-  return byFee > byMerchant ? byFee : byMerchant;
+export function feeSompi(price: bigint, minOutput: bigint): bigint {
+  const pct = percentageFeeSompi(price);
+  return pct > minOutput ? pct : minOutput;
 }
 
-/** True when both outputs of the split meet the KIP-9 floor. */
+/** Mirrors schemas.compute_fee_split: merchant = price - feeSompi(price, F). */
+export function computeFeeSplit(total: bigint, minOutput: bigint): BigFeeSplit {
+  const fee = feeSompi(total, minOutput);
+  return { total, merchant: total - fee, fee };
+}
+
+/** Mirrors schemas.min_price_sompi: 2 * F (fee = F and merchant = F). 40,000,000 sompi when F = 20,000,000. */
+export function minPriceSompi(minOutput: bigint): bigint {
+  return 2n * minOutput;
+}
+
+/** True when the treasury fee is the flat floor F, i.e. ceil(price * 150 / 10_000) <= F. */
+export function isFlatFee(price: bigint, minOutput: bigint): boolean {
+  return percentageFeeSompi(price) <= minOutput;
+}
+
+/** Highest price that still pays the flat floor fee: floor(F * 10_000 / 150). 1,333,333,333 when F = 20,000,000. */
+export function flatFeeMaxPriceSompi(minOutput: bigint): bigint {
+  return (minOutput * BPS_DENOMINATOR) / PLATFORM_FEE_BPS;
+}
+
+/** Valid iff the merchant output clears the KIP-9 floor (the fee output is always >= F by construction). */
 export function meetsOutputFloor(total: bigint, minOutput: bigint): boolean {
-  const split = computeFeeSplit(total);
-  return split.fee >= minOutput && split.merchant >= minOutput;
+  return total - feeSompi(total, minOutput) >= minOutput;
+}
+
+/** Share of `part` in `total` as hundredths of a percent, rounded half up (e.g. 150 = 1.50%). */
+export function shareBps(part: bigint, total: bigint): bigint {
+  return (part * 20_000n + total) / (2n * total);
+}
+
+export function formatBps(bps: bigint): string {
+  const frac = (bps % 100n).toString().padStart(2, "0");
+  return `${bps / 100n}.${frac}`.replace(/0+$/, "").replace(/\.$/, "");
 }
 
 export function toBigInt(value: string | bigint): bigint {

@@ -46,7 +46,7 @@ export function AnalyticsPanel({ range, reloadKey }: { range: DateRange; reloadK
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <Stat icon={<Activity className="h-4 w-4" />} label="Paid calls" primary={data.total_calls.toLocaleString("en-US")} />
             <Stat icon={<Coins className="h-4 w-4" />} label="Gross volume" primary={`${formatKas(data.gross_sompi)} KAS`} secondary={`${formatSompi(data.gross_sompi)} sompi`} />
-            <Stat icon={<Wallet className="h-4 w-4" />} label="Your revenue (98.5%)" primary={`${formatKas(data.merchant_sompi)} KAS`} secondary={`${formatSompi(data.merchant_sompi)} sompi`} tone="text-kas-300" />
+            <Stat icon={<Wallet className="h-4 w-4" />} label="Your revenue" primary={`${formatKas(data.merchant_sompi)} KAS`} secondary={`${formatSompi(data.merchant_sompi)} sompi`} tone="text-kas-300" />
             <Stat icon={<Receipt className="h-4 w-4" />} label="USD at settlement" primary={formatUsd(data.usd_value)} secondary={`platform fee ${formatKas(data.fee_sompi)} KAS`} />
           </div>
 

@@ -9,9 +9,12 @@ import logging
 import re
 import secrets
 import socket
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpcore
 import httpx
@@ -28,17 +31,22 @@ from app.config import get_settings
 from app.deps import get_db_session, get_redis
 from app.models import Merchant
 from app.schemas import (
+    AUTH_PURPOSE,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
-    AuthChallengeRequest,
+    NONCE_RE,
+    REGISTER_PURPOSE,
+    build_auth_challenge,
 )
 
 logger = logging.getLogger("kasgate.security")
 
 API_KEY_PREFIX = "kg_"
+SESSION_TOKEN_PREFIX = "kgs_"  # noqa: S105 - a token-type prefix, not a credential
 API_KEY_MIN_LENGTH = len(API_KEY_PREFIX) + 16
 API_KEY_MAX_LENGTH = 128
+SESSION_KEY_PREFIX = "kasgate:session:"
 
 HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     {
@@ -66,7 +74,9 @@ FORBIDDEN_UPSTREAM_HEADER_NAMES: frozenset[str] = (
 HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
 HEADER_VALUE_MAX_LENGTH = 4096
 
-_bearer_scheme = HTTPBearer(auto_error=False, description="KasGate merchant API key (kg_...)")
+_bearer_scheme = HTTPBearer(
+    auto_error=False, description="KasGate merchant API key (kg_...) or dashboard session (kgs_...)"
+)
 
 
 # ---------------------------------------------------------------- API keys
@@ -80,6 +90,22 @@ def hash_api_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
+def generate_session_token() -> str:
+    return f"{SESSION_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+
+
+def session_key(token: str) -> str:
+    return f"{SESSION_KEY_PREFIX}{hash_api_key(token)}"
+
+
+async def create_session(redis: Redis, merchant_id: uuid.UUID) -> tuple[str, datetime]:
+    """Store `kasgate:session:{sha256(token)}` -> merchant id for `session_ttl_seconds`; return (token, expiry)."""
+    ttl = get_settings().session_ttl_seconds
+    token = generate_session_token()
+    await redis.set(session_key(token), str(merchant_id), ex=ttl)
+    return token, datetime.now(UTC) + timedelta(seconds=ttl)
+
+
 def _unauthorized(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -88,22 +114,47 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
+async def _merchant_for_session(token: str, session: AsyncSession, redis: Redis) -> Merchant | None:
+    try:
+        raw = await redis.get(session_key(token))
+    except RedisError as exc:
+        logger.error("session store unavailable", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="service temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
+    if raw is None:
+        return None
+    try:
+        merchant_id = uuid.UUID(str(raw))
+    except ValueError:
+        return None
+    return (await session.execute(select(Merchant).where(Merchant.id == merchant_id))).scalar_one_or_none()
+
+
 async def get_current_merchant(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     session: AsyncSession = Depends(get_db_session),
+    redis: Redis = Depends(get_redis),
 ) -> Merchant:
+    """Resolve `Authorization: Bearer kg_<api key>` (hash lookup) or `kgs_<session>` (Redis session) to a merchant."""
     if credentials is None:
         raise _unauthorized("missing bearer token")
     token = credentials.credentials.strip()
-    if (
-        not token.startswith(API_KEY_PREFIX)
-        or not API_KEY_MIN_LENGTH <= len(token) <= API_KEY_MAX_LENGTH
-        or not token.isascii()
-    ):
+    if not API_KEY_MIN_LENGTH <= len(token) <= API_KEY_MAX_LENGTH or not token.isascii():
         raise _unauthorized("invalid API key")
-    digest = hash_api_key(token)
-    merchant = (await session.execute(select(Merchant).where(Merchant.api_key_hash == digest))).scalar_one_or_none()
-    if merchant is None or not hmac.compare_digest(merchant.api_key_hash, digest):
+    merchant: Merchant | None
+    if token.startswith(SESSION_TOKEN_PREFIX):
+        merchant = await _merchant_for_session(token, session, redis)
+        if merchant is None:
+            raise _unauthorized("invalid or expired session")
+    elif token.startswith(API_KEY_PREFIX):
+        digest = hash_api_key(token)
+        merchant = (await session.execute(select(Merchant).where(Merchant.api_key_hash == digest))).scalar_one_or_none()
+        if merchant is None or not hmac.compare_digest(merchant.api_key_hash, digest):
+            raise _unauthorized("invalid API key")
+    else:
         raise _unauthorized("invalid API key")
     if not merchant.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="merchant account is disabled")
@@ -165,17 +216,44 @@ class UpstreamBlockedError(Exception):
     """Raised when an upstream host resolves to a non-public address."""
 
 
+NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """IPv4 addresses a v6 address can tunnel to: v4-mapped, 6to4, Teredo (server and client) and NAT64."""
+    found: list[ipaddress.IPv4Address] = []
+    if ip.ipv4_mapped is not None:
+        found.append(ip.ipv4_mapped)
+    if ip.sixtofour is not None:
+        found.append(ip.sixtofour)
+    if ip.teredo is not None:
+        found.extend(ip.teredo)
+    if ip in NAT64_WELL_KNOWN:
+        found.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return found
+
+
 def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    """True unless `ip` is a public unicast address (and, for IPv6, so is every IPv4 address it tunnels to)."""
+    if isinstance(ip, ipaddress.IPv6Address) and any(is_forbidden_ip(inner) for inner in _embedded_ipv4(ip)):
+        return True
     return not ip.is_global or ip.is_multicast
 
 
-async def resolve_public_address(host: str, port: int) -> str:
-    """Resolve `host` and return one address, failing if ANY resolved address is non-public."""
+async def _getaddrinfo(host: str, port: int) -> list[tuple[Any, Any, Any, Any, tuple[Any, ...]]]:
+    """DNS lookup seam: the one place the upstream guard talks to the resolver (replaced in tests)."""
     loop = asyncio.get_running_loop()
+    return await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+async def resolve_public_address(host: str, port: int) -> str:
+    """Resolve `host` at request time and return one address; fail if ANY resolved address is non-public.
+
+    Names such as `*.nip.io` or `localtest.me` resolve to private or loopback addresses and are refused here, as are
+    literal IPs outside `is_global` (for example 100.64.0.0/10). The caller connects to the returned IP itself.
+    """
     try:
-        infos = await loop.getaddrinfo(host.strip("[]"), port, type=socket.SOCK_STREAM)
+        infos = await _getaddrinfo(host.strip("[]"), port)
     except socket.gaierror as exc:
         raise UpstreamBlockedError(f"cannot resolve upstream host {host!r}") from exc
     addresses: list[str] = []
@@ -249,58 +327,74 @@ def build_upstream_client() -> httpx.AsyncClient:
     )
 
 
-# ---------------------------------------------------------------- wallet-signature login
+# ---------------------------------------------------------------- wallet-signature login / registration
 
 AUTH_CHALLENGE_TTL_SECONDS = 300
-AUTH_CHALLENGE_KEY_PREFIX = "kasgate:auth:"
-_AUTH_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
-_LOGIN_HEADER = "KasGate login"
+AUTH_KEY_PREFIX = "kasgate:auth:"
+AuthPurpose = Literal["login", "register"]
+_PURPOSE_TEXT: dict[AuthPurpose, str] = {"login": AUTH_PURPOSE, "register": REGISTER_PURPOSE}
 _KASPA_NETWORK_NAME: dict[str, str] = {"kaspa:testnet-10": "testnet", "kaspa:mainnet": "mainnet"}
+_NONCE_PATTERN = re.compile(NONCE_RE)
 
 
 @dataclass(frozen=True)
-class LoginChallenge:
+class AuthChallengeData:
+    purpose: AuthPurpose
     address: str
     nonce: str
     expires_at: datetime
+    message: str
 
 
-def new_login_challenge(address: str, now: datetime | None = None) -> tuple[LoginChallenge, str]:
+def auth_domain() -> str:
+    """Host of PUBLIC_BASE_URL: the domain every signed challenge is bound to."""
+    return urlsplit(get_settings().public_base_url).hostname or "localhost"
+
+
+def _build_auth_message(purpose: AuthPurpose, address: str, nonce: str, expires_at: datetime) -> str:
+    return build_auth_challenge(_PURPOSE_TEXT[purpose], auth_domain(), address, nonce, expires_at)
+
+
+def new_auth_challenge(purpose: AuthPurpose, address: str, now: datetime | None = None) -> AuthChallengeData:
     moment = now or datetime.now(UTC)
     expires_at = moment.astimezone(UTC).replace(microsecond=0) + timedelta(seconds=AUTH_CHALLENGE_TTL_SECONDS)
-    challenge = LoginChallenge(address=address, nonce=secrets.token_hex(16), expires_at=expires_at)
-    return challenge, format_login_challenge(challenge)
-
-
-def format_login_challenge(challenge: LoginChallenge) -> str:
-    return (
-        f"{_LOGIN_HEADER}\nAddress: {challenge.address}\nNonce: {challenge.nonce}\n"
-        f"Expires: {challenge.expires_at.isoformat()}"
+    nonce = secrets.token_hex(16)
+    return AuthChallengeData(
+        purpose=purpose,
+        address=address,
+        nonce=nonce,
+        expires_at=expires_at,
+        message=_build_auth_message(purpose, address, nonce, expires_at),
     )
 
 
-def parse_login_challenge(message: str) -> LoginChallenge:
-    """Parse a challenge produced by `format_login_challenge`; raises ValueError if it is not byte-identical."""
+def parse_auth_challenge(message: str) -> AuthChallengeData:
+    """Parse a challenge produced by `new_auth_challenge`; raises ValueError unless it is byte-identical to one."""
     lines = message.split("\n")
-    if len(lines) != 4 or lines[0] != _LOGIN_HEADER:
-        raise ValueError("malformed login challenge")
-    prefixes = ("Address: ", "Nonce: ", "Expires: ")
+    prefixes = ("Domain: ", "Purpose: ", "Address: ", "Nonce: ", "Expires: ")
+    if len(lines) != 6 or lines[0] != "KasGate":
+        raise ValueError("malformed auth challenge")
     if not all(line.startswith(prefix) for line, prefix in zip(lines[1:], prefixes, strict=True)):
-        raise ValueError("malformed login challenge")
-    address, nonce, expires = (line[len(prefix) :] for line, prefix in zip(lines[1:], prefixes, strict=True))
-    if not _AUTH_NONCE_RE.fullmatch(nonce):
-        raise ValueError("malformed login challenge nonce")
+        raise ValueError("malformed auth challenge")
+    _, purpose_text, address, nonce, expires = (
+        line[len(prefix) :] for line, prefix in zip(lines[1:], prefixes, strict=True)
+    )
+    purposes = [name for name, text in _PURPOSE_TEXT.items() if text == purpose_text]
+    if not purposes or not _NONCE_PATTERN.fullmatch(nonce):
+        raise ValueError("malformed auth challenge purpose or nonce")
     expires_at = datetime.fromisoformat(expires)
     if expires_at.tzinfo is None:
-        raise ValueError("login challenge expiry has no timezone")
-    parsed = LoginChallenge(address=address, nonce=nonce, expires_at=expires_at.astimezone(UTC))
-    if format_login_challenge(parsed) != message:
-        raise ValueError("login challenge is not in canonical form")
+        raise ValueError("auth challenge expiry has no timezone")
+    parsed = AuthChallengeData(
+        purpose=purposes[0], address=address, nonce=nonce, expires_at=expires_at.astimezone(UTC), message=message
+    )
+    if _build_auth_message(parsed.purpose, address, nonce, parsed.expires_at) != message:
+        raise ValueError("auth challenge is not in canonical form for this domain")
     return parsed
 
 
-def challenge_key(address: str, nonce: str) -> str:
-    return f"{AUTH_CHALLENGE_KEY_PREFIX}{address}:{nonce}"
+def auth_challenge_key(purpose: AuthPurpose, address: str, nonce: str) -> str:
+    return f"{AUTH_KEY_PREFIX}{purpose}:{address}:{nonce}"
 
 
 def _check_wallet_signature(message: str, signature_hex: str, public_key_hex: str, expected_address: str) -> bool:
@@ -318,6 +412,47 @@ def _check_wallet_signature(message: str, signature_hex: str, public_key_hex: st
 async def verify_wallet_signature(message: str, signature_hex: str, public_key_hex: str, expected_address: str) -> bool:
     """True only if `signature_hex` signs `message` AND the public key derives exactly `expected_address`."""
     return await asyncio.to_thread(_check_wallet_signature, message, signature_hex, public_key_hex, expected_address)
+
+
+async def consume_wallet_proof(
+    redis: Redis,
+    *,
+    purpose: AuthPurpose,
+    address: str,
+    challenge: str,
+    public_key: str,
+    signature: str,
+) -> bool:
+    """True only for a live, unused challenge of `purpose` for `address` that the wallet signed.
+
+    The challenge is single use: it is consumed (GETDEL) whenever it parses, and the signature check always runs, so
+    the work done and the outcome are the same however the proof fails. Raises 503 when Redis is unavailable.
+    """
+    parsed: AuthChallengeData | None
+    try:
+        parsed = parse_auth_challenge(challenge)
+    except ValueError:
+        parsed = None
+    challenge_ok = False
+    if parsed is not None:
+        try:
+            stored = await redis.getdel(auth_challenge_key(parsed.purpose, parsed.address, parsed.nonce))
+        except RedisError as exc:
+            logger.exception("could not consume auth challenge")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="login is temporarily unavailable",
+                headers={"Retry-After": "5"},
+            ) from exc
+        challenge_ok = (
+            stored is not None
+            and hmac.compare_digest(str(stored), challenge)
+            and parsed.purpose == purpose
+            and parsed.address == address
+            and parsed.expires_at > datetime.now(UTC)
+        )
+    signature_ok = await verify_wallet_signature(challenge, signature, public_key, address)
+    return challenge_ok and signature_ok
 
 
 # ---------------------------------------------------------------- rate limiting (fixed window, Redis)
@@ -389,8 +524,3 @@ def limit_by_ip(rule: RateLimit) -> Callable[[Request, Redis], Awaitable[None]]:
         await enforce_rate_limit(redis, rule, f"ip:{client_ip(request)}")
 
     return dependency
-
-
-async def limit_challenge_by_address(payload: AuthChallengeRequest, redis: Redis = Depends(get_redis)) -> None:
-    """Per-address limit for `/v1/auth/challenge` (the per-IP limit is a separate dependency)."""
-    await enforce_rate_limit(redis, RATE_LIMIT_AUTH_CHALLENGE, f"addr:{payload.kaspa_address}")

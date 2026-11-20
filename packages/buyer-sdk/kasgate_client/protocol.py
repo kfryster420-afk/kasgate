@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal
 
@@ -18,14 +19,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .constants import (
     BPS_DENOMINATOR,
+    DEFAULT_MIN_OUTPUT_SOMPI,
     GATEWAY_MAX_HEADER_BYTES,
+    GATEWAY_MAX_RAW_TX_CHARS,
+    PAYMENT_PAYLOAD_PREFIX,
     PLATFORM_FEE_BPS,
     SOMPI_PER_KAS,
 )
 
-KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
+KASPA_ADDRESS_RE = re.compile(
+    r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$"
+)
 TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 SOMPI_STR_RE = r"^[1-9][0-9]{0,18}$"
+NONCE_RE = r"^[0-9a-f]{32}$"
 
 SompiStr = Annotated[str, Field(pattern=SOMPI_STR_RE)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
@@ -45,15 +52,42 @@ def normalize_tx_id(value: str) -> str:
     return value
 
 
-def compute_fee_split(total_sompi: int) -> tuple[int, int]:
-    """Return (merchant_sompi, fee_sompi): fee = ceil(total * 150 / 10_000), merchant = total - fee."""
+def min_price_sompi(min_output_sompi: int = DEFAULT_MIN_OUTPUT_SOMPI) -> int:
+    """Cheapest valid total: fee = floor (1.5% is below it here) and merchant = floor."""
+    return 2 * min_output_sompi
+
+
+def compute_fee_split(
+    total_sompi: int, min_output_sompi: int = DEFAULT_MIN_OUTPUT_SOMPI
+) -> tuple[int, int]:
+    """Return (merchant_sompi, fee_sompi) under CONTRACT v2.1.
+
+    fee = max(ceil(total * 150 / 10_000), min_output_sompi); merchant = total - fee. Raises ValueError when the
+    merchant output would fall below `min_output_sompi` (total < 2 * min_output_sompi).
+    """
     if total_sompi <= 0:
         raise ValueError("total_sompi must be positive")
-    fee = (total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
-    return total_sompi - fee, fee
+    if min_output_sompi < 1:
+        raise ValueError("min_output_sompi must be >= 1")
+    percentage_fee = (
+        total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1
+    ) // BPS_DENOMINATOR
+    fee = max(percentage_fee, min_output_sompi)
+    merchant = total_sompi - fee
+    if merchant < min_output_sompi:
+        raise ValueError(
+            f"price {total_sompi} sompi leaves a merchant output below {min_output_sompi} sompi; "
+            f"minimum price is {min_price_sompi(min_output_sompi)} sompi"
+        )
+    return merchant, fee
 
 
-def kas_to_sompi(value: Decimal | str | int | float) -> int:
+def payment_payload(nonce: str) -> bytes:
+    """Exact transaction payload that binds a payment to one 402 challenge (CONTRACT v2): b'kasgate:v1:' + nonce."""
+    return f"{PAYMENT_PAYLOAD_PREFIX}{nonce}".encode("ascii")
+
+
+def kas_to_sompi(value: Decimal | str | float) -> int:
     """Convert a KAS amount to sompi exactly. Rejects non-positive values and more than 8 decimal places."""
     try:
         dec = Decimal(str(value)) if not isinstance(value, Decimal) else value
@@ -91,7 +125,7 @@ class X402Header(BaseModel):
         return encode_header(self)
 
     @classmethod
-    def from_header(cls, value: str):  # noqa: ANN206 - returns the concrete subclass
+    def from_header(cls, value: str):
         return cls.model_validate_json(decode_header_bytes(value))
 
 
@@ -117,6 +151,8 @@ class PaymentRequired(X402Header):
     amount: SompiStr
     payTo: str
     platformFee: PlatformFee
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    expiresAt: datetime
 
     @field_validator("payTo")
     @classmethod
@@ -140,8 +176,9 @@ class PaymentSignature(X402Header):
     """Body of the PAYMENT-SIGNATURE header. `rawTx` is `json.dumps(Transaction.to_dict())` of the signed tx."""
 
     txId: str
-    rawTx: str = Field(min_length=2, max_length=100_000)
+    rawTx: str = Field(min_length=2, max_length=GATEWAY_MAX_RAW_TX_CHARS)
     payerAddress: str
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
 
     @field_validator("txId")
     @classmethod

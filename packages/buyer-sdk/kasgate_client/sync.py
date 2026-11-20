@@ -21,7 +21,9 @@ T = TypeVar("T")
 class KasGateSyncClient:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run, name="kasgate-sync-loop", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="kasgate-sync-loop", daemon=True
+        )
         self._thread.start()
         self._closed = False
         try:
@@ -51,7 +53,9 @@ class KasGateSyncClient:
     def address(self) -> str:
         return self._client.address
 
-    def request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def request(
+        self, method: str, url: str | httpx.URL, **kwargs: Any
+    ) -> httpx.Response:
         return self._call(self._client.request(method, url, **kwargs))
 
     def get(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:

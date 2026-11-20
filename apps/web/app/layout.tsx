@@ -6,7 +6,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: { default: "KasGate — monetize any API with Kaspa", template: "%s · KasGate" },
   description:
-    "Put any HTTP API behind a non-custodial Kaspa paywall in 60 seconds. x402-style pay-per-call, 1.5% fee, zero code.",
+    "Put any HTTP API behind a non-custodial Kaspa paywall in 60 seconds. x402-style pay-per-call, 1.5% fee (small flat minimum on low prices), zero code.",
   applicationName: "KasGate",
 };
 

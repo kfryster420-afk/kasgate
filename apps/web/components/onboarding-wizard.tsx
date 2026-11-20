@@ -1,18 +1,20 @@
 "use client";
 
-import { ArrowRight, CheckCircle2, Loader2, LogIn } from "lucide-react";
+import { ArrowRight, CheckCircle2, LogIn } from "lucide-react";
 import Link from "next/link";
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { ADDRESS_PREFIX, GATEWAY_PUBLIC_URL, NETWORK_LABEL } from "@/lib/config";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { curlCreateEndpoint, curlDiscover, curlPaid, curlRegisterMerchant, pythonSnippet } from "@/lib/snippets";
-import type { EndpointCreate, EndpointRead, MerchantRead, MerchantRegistered } from "@/lib/types";
+import type { EndpointCreate, EndpointRead, MerchantCreate, MerchantCreated, MerchantRead } from "@/lib/types";
 import { checkDisplayName, checkKaspaAddress, checkOptionalEmail } from "@/lib/validation";
 import { formatKas, formatSompi } from "@/lib/sompi";
 import { CodeBlock } from "./code-block";
+import { ApiKeyReveal } from "./api-key-reveal";
 import { CopyButton } from "./copy-button";
 import { EndpointForm } from "./endpoint-form";
-import { ErrorBanner, Field } from "./ui";
+import { Field } from "./ui";
+import { WalletProofPanel, type WalletProof } from "./wallet-proof";
 
 type Step = 1 | 2 | 3;
 
@@ -26,6 +28,7 @@ export function OnboardingWizard({ initialMerchant }: { initialMerchant: Merchan
   const [step, setStep] = useState<Step>(initialMerchant ? 2 : 1);
   const [merchant, setMerchant] = useState<MerchantRead | null>(initialMerchant);
   const [endpoint, setEndpoint] = useState<EndpointRead | null>(null);
+  const [revealedKey, setRevealedKey] = useState<string | null>(null);
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-10">
@@ -49,15 +52,26 @@ export function OnboardingWizard({ initialMerchant }: { initialMerchant: Merchan
         })}
       </ol>
 
-      {step === 1 ? (
+      {step === 1 && !revealedKey ? (
         <MerchantStep
-          onDone={(m) => {
-            setMerchant(m);
+          onDone={(created) => {
+            setMerchant(created.merchant);
+            setRevealedKey(created.api_key);
+          }}
+        />
+      ) : null}
+      {revealedKey ? (
+        <ApiKeyReveal
+          apiKey={revealedKey}
+          title="Your API key (shown once)"
+          doneLabel="Continue to step 2"
+          onDone={() => {
+            setRevealedKey(null);
             setStep(2);
           }}
         />
       ) : null}
-      {step === 2 && merchant ? (
+      {step === 2 && merchant && !revealedKey ? (
         <EndpointStep
           merchant={merchant}
           onDone={(e) => {
@@ -79,44 +93,45 @@ export function OnboardingWizard({ initialMerchant }: { initialMerchant: Merchan
   );
 }
 
-function MerchantStep({ onDone }: { onDone: (merchant: MerchantRead) => void }) {
+function MerchantStep({ onDone }: { onDone: (created: MerchantCreated) => void }) {
   const [address, setAddress] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [touched, setTouched] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const addressCheck = checkKaspaAddress(address);
   const nameCheck = checkDisplayName(displayName);
   const emailCheck = checkOptionalEmail(email);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  function precheck(): string | null {
     setTouched(true);
-    setError(null);
-    if (!addressCheck.ok || !nameCheck.ok || !emailCheck.ok) return;
-    setBusy(true);
+    if (!addressCheck.ok) return addressCheck.error;
+    if (!nameCheck.ok) return nameCheck.error;
+    if (!emailCheck.ok) return emailCheck.error;
+    return null;
+  }
+
+  async function register(proof: WalletProof): Promise<void> {
+    if (!addressCheck.ok || !nameCheck.ok || !emailCheck.ok) throw new Error("Fix the highlighted fields first");
+    const body: MerchantCreate = { ...proof, kaspa_address: addressCheck.value, display_name: nameCheck.value };
+    if (emailCheck.value) body.email = emailCheck.value;
     try {
-      const body: Record<string, string> = { kaspa_address: addressCheck.value, display_name: nameCheck.value };
-      if (emailCheck.value) body.email = emailCheck.value;
-      const result = await apiFetch<MerchantRegistered>("/api/merchants", { method: "POST", body });
-      onDone(result.merchant);
+      const created = await apiFetch<MerchantCreated>("/api/merchants", { method: "POST", body });
+      onDone(created);
     } catch (e) {
-      setError(e instanceof ApiError && e.status === 409 ? "That address or email is already registered. Sign in with your wallet instead." : errorMessage(e));
-    } finally {
-      setBusy(false);
+      if (e instanceof ApiError && e.status === 409) throw new Error("That address or email is already registered. Sign in with your wallet instead.");
+      throw e;
     }
   }
 
   return (
-    <form onSubmit={submit} className="card space-y-5 p-6" noValidate>
-      <h2 className="text-lg font-medium text-zinc-100">Step 1 · Where should payments go?</h2>
+    <div className="card space-y-5 p-6">
+      <h2 className="text-lg font-medium text-zinc-100">Step 1 · Prove your payout wallet</h2>
       <Field
         label="Kaspa payout address"
         htmlFor="kaspa-address"
         error={touched && !addressCheck.ok ? addressCheck.error : null}
-        hint={`Must start with "${ADDRESS_PREFIX}" on ${NETWORK_LABEL}. 98.5% of every call lands here, directly on-chain.`}
+        hint={`Must start with "${ADDRESS_PREFIX}" on ${NETWORK_LABEL}. Payments land here directly on-chain; you will sign a message to prove you own it.`}
       >
         <input id="kaspa-address" className="input font-mono" value={address} onChange={(e) => setAddress(e.target.value)} placeholder={`${ADDRESS_PREFIX}q…`} autoComplete="off" spellCheck={false} />
       </Field>
@@ -129,21 +144,25 @@ function MerchantStep({ onDone }: { onDone: (merchant: MerchantRead) => void }) 
         </Field>
       </div>
       <p className="rounded-lg border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-500">
-        Your API key is created once and stored only in a secure, httpOnly browser cookie. It is never exposed to page scripts or local storage.
+        Registration signs a one-time message that authorises nothing but ownership of the address. You will then receive an automation API key, shown once. The browser session is kept in a secure httpOnly cookie, never in local storage.
       </p>
-      <ErrorBanner message={error} />
-      <div className="flex flex-wrap items-center gap-3">
-        <button type="submit" className="btn-primary" disabled={busy}>
-          {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
-          Create merchant account
-          <ArrowRight className="h-4 w-4" aria-hidden />
-        </button>
+      <WalletProofPanel
+        purpose="register"
+        address={address}
+        onAddressChange={setAddress}
+        showAddressField={false}
+        precheck={precheck}
+        onProof={register}
+        kaswareLabel="Register with KasWare"
+        manualSubmitLabel="Verify & register"
+      />
+      <div>
         <Link href="/login" className="btn-ghost">
           <LogIn className="h-4 w-4" aria-hidden />
           I already have an account
         </Link>
       </div>
-    </form>
+    </div>
   );
 }
 

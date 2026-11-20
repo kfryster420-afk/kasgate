@@ -27,11 +27,14 @@ export const X402_ERROR_CODES = [
   "payment_required",
   "invalid_payment_header",
   "payment_replayed",
+  "payment_expired",
   "underpaid",
   "invalid_fee_split",
   "wrong_network",
   "tx_rejected",
   "rpc_unavailable",
+  "service_unavailable",
+  "rate_limited",
   "endpoint_not_found",
   "method_not_allowed",
   "upstream_error",
@@ -54,12 +57,17 @@ export interface PaymentRequired {
   amount: Sompi;
   payTo: string;
   platformFee: PlatformFee;
+  /** 32 lowercase hex. The signed transaction payload must equal `kasgate:v1:` + nonce (ASCII). */
+  nonce: string;
+  /** UTC ISO-8601; after this the nonce is gone and the gateway answers 402 `payment_expired`. */
+  expiresAt: IsoDateTime;
 }
 
 export interface PaymentSignature {
   txId: string;
   rawTx: string;
   payerAddress: string;
+  nonce: string;
 }
 
 export interface PaymentResponse {
@@ -85,10 +93,15 @@ export interface FeeSplit {
 
 /* ------------------------------------------------------------------ merchants */
 
+/** Registration requires a wallet signature over a purpose="register" challenge (CONTRACT v2). */
 export interface MerchantCreate {
   kaspa_address: string;
   display_name: string;
   email?: string | null;
+  challenge: string;
+  public_key: string;
+  /** Sent exactly as the wallet returned it; the gateway normalises hex / Base64. */
+  signature: string;
 }
 
 export interface MerchantRead {
@@ -100,21 +113,33 @@ export interface MerchantRead {
   created_at: IsoDateTime;
 }
 
-/** `api_key` is consumed only by the Next route handler; it is never sent to the browser. */
+/** Long-lived automation key (`kg_…`). Returned by register and rotate-key; shown to the user exactly once. */
 export interface MerchantCreated {
   merchant: MerchantRead;
   api_key: string;
 }
 
-/** What the browser receives from POST /api/merchants (no api_key). */
-export interface MerchantRegistered {
+/** Wallet login result from the gateway. The session_token is consumed only by the Next route handler. */
+export interface SessionIssued {
   merchant: MerchantRead;
+  /** `kgs_…`, does NOT rotate the api_key. */
+  session_token: string;
+  expires_at: IsoDateTime;
+}
+
+/** What the browser receives after login or API-key sign-in: no credentials. */
+export interface SessionStarted {
+  merchant: MerchantRead;
+  expires_at: IsoDateTime | null;
 }
 
 /* ------------------------------------------------------------------ wallet-signature login */
 
+export type AuthPurpose = "login" | "register";
+
 export interface AuthChallengeRequest {
   kaspa_address: string;
+  purpose: AuthPurpose;
 }
 
 export interface AuthChallenge {
@@ -129,7 +154,7 @@ export interface AuthVerifyRequest {
   challenge: string;
   /** 64 hex (x-only) or 66 hex (02/03-prefixed compressed). */
   public_key: string;
-  /** 128 lowercase hex characters. */
+  /** Sent as-is from the wallet (128-hex Schnorr, or Base64 of 64/65 bytes); the gateway normalises. */
   signature: string;
 }
 

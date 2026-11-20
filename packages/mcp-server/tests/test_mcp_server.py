@@ -13,7 +13,9 @@ from kasgate_mcp.server import validate_path, validate_slug
 from mcp import Client
 from sdk_helpers import (
     MERCHANT,
+    MIN_PRICE,
     PAYER_KEY,
+    NONCE,
     PRICE,
     FakeGateway,
     challenge,
@@ -25,6 +27,7 @@ KAS = 100_000_000
 DIRECTORY = {
     "manifest_version": 1,
     "network": "kaspa:testnet-10",
+    "min_output_sompi": 20_000_000,
     "endpoints": [{"slug": "demo-abc123", "price_sompi": PRICE, "price_kas": "15"}],
 }
 
@@ -208,3 +211,36 @@ def test_config_from_env() -> None:
     assert Config.from_env({}).buyer_private_key is None
     with pytest.raises(SystemExit):
         Config.from_env({"KASGATE_MAX_PRICE_KAS": "-3"})
+
+
+async def test_call_at_the_minimum_price_splits_20_000_000_each() -> None:
+    fake = FakeGateway(challenge(MIN_PRICE))
+    server, _ = make_server(fake)
+    async with Client(server) as client:
+        result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123", "max_price_kas": 1})
+    assert not result.is_error
+    data = structured(result)
+    assert data["payment"]["paid_kas"] == "0.4" and data["payment"]["platform_fee_kas"] == "0.2"
+    tx = fake.signatures[0]["tx"]
+    assert [o.value for o in tx.outputs[:2]] == [20_000_000, 20_000_000]
+    assert fake.signatures[0]["payload"] == b"kasgate:v1:" + NONCE.encode()
+
+
+@pytest.mark.parametrize("price", [39_999_999, 20_000_000])
+async def test_sub_floor_challenge_is_refused_before_signing(price: int) -> None:
+    fake = FakeGateway(challenge(price))
+    server, buyer = make_server(fake)
+    async with Client(server) as client:
+        result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123"})
+    assert result.is_error and "FeeSplitMismatchError" in result.content[0].text
+    assert fake.signatures == []
+    assert buyer._utxo_provider.calls == []  # type: ignore[union-attr]
+
+
+async def test_expired_challenge_is_refused_before_signing() -> None:
+    fake = FakeGateway(challenge(expires_in=-10))
+    server, buyer = make_server(fake)
+    async with Client(server) as client:
+        result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123"})
+    assert result.is_error and "ChallengeExpiredError" in result.content[0].text
+    assert fake.signatures == [] and buyer._utxo_provider.calls == []  # type: ignore[union-attr]

@@ -2,18 +2,27 @@ import { ArrowRight, Bot, FileSpreadsheet, Gauge, Hexagon, Lock, Zap } from "luc
 import Link from "next/link";
 import { CodeBlock } from "@/components/code-block";
 import { GATEWAY_PUBLIC_URL, NETWORK_LABEL } from "@/lib/config";
+import { getMinOutputSompi } from "@/lib/server/gateway";
 import { curlCreateEndpoint, curlRegisterMerchant } from "@/lib/snippets";
+import { flatFeeMaxPriceSompi, formatKas, minPriceSompi } from "@/lib/sompi";
 
-const FEATURES = [
+export const dynamic = "force-dynamic";
+
+const FEATURES = (feeNote: string) =>
+  [
   { icon: Zap, title: "60-second, zero-code onboarding", body: "Paste your upstream API URL, set a price in KAS, get a live proxy URL. Your API stays untouched." },
-  { icon: Lock, title: "Non-custodial by design", body: "Each paid call is one Kaspa transaction: 98.5% straight to your address, 1.5% to the treasury. We never hold your funds." },
+  { icon: Lock, title: "Non-custodial by design", body: `Each paid call is one Kaspa transaction: your share straight to your address, the platform fee (${feeNote}) to the treasury. We never hold your funds.` },
   { icon: Bot, title: "Built for AI agents", body: "x402-style HTTP 402 handshake plus a public directory and machine-readable manifest that agents can crawl." },
   { icon: FileSpreadsheet, title: "Tax-ready ledger", body: "Every settlement records KAS and the USD value at settlement. Export a CSV for your accountant in one click." },
   { icon: Gauge, title: "Live analytics", body: "Daily revenue, per-endpoint breakdowns and a full settlements table with transaction IDs." },
   { icon: Hexagon, title: "Fast finality on Kaspa", body: "Sub-second blocks mean buyers pay and get a response in a single round trip." },
 ] as const;
 
-export default function LandingPage() {
+export default async function LandingPage() {
+  const floor = await getMinOutputSompi();
+  const feeNote = floor === null ? "1.5%, with a small flat minimum on low-priced calls" : `1.5%, or a flat ${formatKas(floor)} KAS on calls up to ${formatKas(flatFeeMaxPriceSompi(floor))} KAS`;
+  const minPrice = floor === null ? null : `${formatKas(minPriceSompi(floor))} KAS`;
+
   return (
     <div>
       <section className="mx-auto max-w-6xl px-4 pb-16 pt-20 text-center">
@@ -22,7 +31,7 @@ export default function LandingPage() {
           Get paid in <span className="text-kas-400">KAS</span> every time your API is called
         </h1>
         <p className="mx-auto mt-5 max-w-2xl text-lg text-zinc-400">
-          KasGate wraps any HTTP API in a pay-per-call paywall. No SDK, no deploy, no custody. Humans and AI agents pay on-chain; you keep 98.5%.
+          KasGate wraps any HTTP API in a pay-per-call paywall. No SDK, no deploy, no custody. Humans and AI agents pay on-chain; the platform fee is 1.5% with a small flat minimum on low-priced calls.
         </p>
         <div className="mt-8 flex flex-wrap justify-center gap-3">
           <Link href="/onboarding" className="btn-primary px-6 py-3 text-base">
@@ -34,15 +43,15 @@ export default function LandingPage() {
           </Link>
         </div>
         <dl className="mx-auto mt-14 grid max-w-3xl grid-cols-3 gap-4 text-left">
-          <Metric value="98.5%" label="goes to you" />
-          <Metric value="1.5%" label="flat platform fee" />
+          <Metric value="1.5%" label="platform fee" />
+          <Metric value={minPrice ?? "—"} label="minimum price per call" />
           <Metric value="0" label="lines of code" />
         </dl>
       </section>
 
       <section className="mx-auto max-w-6xl px-4 py-12">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {FEATURES.map((f) => (
+          {FEATURES(feeNote).map((f) => (
             <div key={f.title} className="card p-5">
               <f.icon className="h-5 w-5 text-kas-400" aria-hidden />
               <h2 className="mt-3 font-medium text-zinc-100">{f.title}</h2>

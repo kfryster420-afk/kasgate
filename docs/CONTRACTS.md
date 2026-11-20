@@ -26,8 +26,8 @@ X402_SCHEME="kaspa-exact-v1", X402_ASSET="KAS", MIN_OUTPUT_SOMPI default 20_000_
 Network prefixes: kaspa:testnet-10 -> "kaspatest:", kaspa:mainnet -> "kaspa:".
 
 ## Fee split (schemas.compute_fee_split)
-fee = ceil(total * 150 / 10_000); merchant = total - fee. Both must be >= MIN_OUTPUT_SOMPI.
-Minimum endpoint price at default floor = 1333333267 sompi (~13.33 KAS); fee uses CEIL rounding — schemas.min_price_sompi().
+fee = max(ceil(total * 150 / 10_000), MIN_OUTPUT_SOMPI); merchant = total - fee, must be >= MIN_OUTPUT_SOMPI.
+Minimum endpoint price = 2 * MIN_OUTPUT_SOMPI = 40000000 sompi (0.4 KAS) at the default floor — schemas.min_price_sompi(). Flat 0.2 KAS fee up to 1333333333 sompi, 1.5% (ceil) above.
 On-chain: outputs[0] = merchant (payTo) EXACT merchant amount, outputs[1] = treasury (feeTo) EXACT fee.
 outputs[2+] allowed only as change. Generator/create_transaction keep payment outputs first.
 
@@ -55,7 +55,7 @@ upstream failure after settlement -> 502 upstream_error, PAYMENT-RESPONSE still 
 ## Gateway routes (03 implements, 04/05 consume)
 GET  /healthz                         -> HealthStatus
 ANY  /p/{slug} and /p/{slug}/{path:path}  paywalled proxy (PROXY_PATH_PREFIX="/p")
-POST /v1/merchants                    MerchantCreate -> 201 MerchantCreated (api_key shown once)
+POST /v1/merchants                    MerchantCreate{kaspa_address, display_name, email, challenge(purpose=register), public_key, signature} -> 201 MerchantCreated{merchant, api_key (once), session_token kgs_, expires_at}
 GET  /v1/merchants/me                 -> MerchantRead            [Bearer]
 POST /v1/endpoints                    EndpointCreate -> 201 EndpointRead   [Bearer]
 GET  /v1/endpoints                    -> list[EndpointRead]       [Bearer]
@@ -90,14 +90,14 @@ kasgate:tx:{txId}  SET NX EX 600 replay lock (03)
 ## Merchant login / key recovery (wallet-signature, non-custodial) — added after 04 review
 POST /v1/auth/challenge   AuthChallengeRequest{kaspa_address} -> AuthChallenge{kaspa_address, challenge, expires_at}
                           challenge = "KasGate login\nAddress: {addr}\nNonce: {token_hex(16)}\nExpires: {iso}"; Redis kasgate:auth:{addr}:{nonce} EX 300, single use
-POST /v1/auth/verify      AuthVerifyRequest{kaspa_address, challenge, public_key, signature} -> 200 MerchantCreated (NEW rotated api_key)
+POST /v1/auth/verify      AuthVerifyRequest{kaspa_address, challenge, public_key, signature} -> 200 SessionIssued{merchant, session_token kgs_, expires_at} (api_key NOT rotated)
                           verify: kaspa.verify_message(challenge, signature, public_key) AND PublicKey(public_key).to_address(network) == kaspa_address
                           challenge ALWAYS 200 (even for unknown addresses, to prevent enumeration); verify -> 401 for unknown address,
                           bad/expired/used challenge or bad signature (one generic message)
                           signature format: 128 lowercase hex Schnorr from kaspa.sign_message (KasWare signMessage(msg,{type:'schnorr'}));
                           server also accepts Base64 of 64 or 65 bytes (65 -> drop the first header byte) and normalises to hex
                           public_key: 66-hex compressed or 64-hex x-only; both verified OK with kaspa==2.1.0
-POST /v1/merchants/me/rotate-key  [Bearer] -> MerchantCreated (old key invalid immediately)
+POST /v1/merchants/me/rotate-key  [Bearer] -> MerchantCreated{merchant, api_key, session_token, expires_at} (old api_key invalid immediately; returns a fresh session too)
 POST /v1/merchants duplicate kaspa_address or email -> 409 {"detail": "..."}
 GET /v1/settlements: limit 1..200 (default 50), offset >= 0
 FastAPI validation errors stay as {"detail": [...]}; x402 errors use X402ErrorBody.
@@ -143,3 +143,10 @@ Error codes: + payment_expired (402).
 - Below 1_333_333_334 sompi the fee is the flat floor (0.2 KAS); above that it is 1.5% (ceil).
 - Engine: exact-value checks against PaymentRequired still apply; the ">= 1.5%" check stays valid because fee >= 1.5% always.
 - Clients (web lib/sompi.ts, buyer SDK) must replicate: fee = max(ceil(amount*150/10000), min_output_sompi) using DirectoryManifest.min_output_sompi.
+
+## CONTRACT v2.2 — answers to 04 (2026-11-20)
+- Registration and rotate-key return MerchantCreated WITH a session (session_token kgs_ + expires_at), so the web app never stores a kg_ key in a cookie.
+- Challenge "Domain:" = urlsplit(PUBLIC_BASE_URL).netloc lowercased (host, plus :port only when the URL has one). Exactly one form; clients compare exact string.
+  The web app's public URL that users see must therefore equal PUBLIC_BASE_URL's netloc (in local dev: localhost:8000 vs the web on :3000 → web compares with NEXT_PUBLIC_GATEWAY_URL netloc, which must equal PUBLIC_BASE_URL).
+- SompiStr 18-digit cap stands (max 999_999_999_999_999_999 sompi ≫ total KAS supply).
+- KasWare signature format is verified live in Phase 4; gateway normalisation (hex128 / Base64 64|65 bytes) is the contract.

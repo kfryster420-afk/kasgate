@@ -67,8 +67,8 @@ export function SettlementsPanel({ endpoints, reloadKey }: { endpoints: Endpoint
               <th className="th">Tx</th>
               <th className="th">Status</th>
               <th className="th text-right">Gross</th>
-              <th className="th text-right">Your 98.5%</th>
-              <th className="th text-right">Fee 1.5%</th>
+              <th className="th text-right">You received</th>
+              <th className="th text-right">Platform fee</th>
               <th className="th text-right">KAS/USD rate</th>
               <th className="th text-right">USD at settlement</th>
             </tr>
