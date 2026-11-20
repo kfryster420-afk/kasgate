@@ -48,7 +48,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "${GATEWAY_BIND:-127.0.0.1}:8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
       interval: 10s
@@ -72,7 +72,7 @@ services:
       gateway:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "${WEB_BIND:-127.0.0.1}:3000:3000"
 
   # Optional own Kaspa node (rusty-kaspa) for the gateway's wRPC Borsh connection. Off unless the `node` profile
   # is enabled: docker compose --profile node up -d. Then set KASPA_RPC_URL=ws://kaspad:<KASPAD_RPC_BORSH_PORT>

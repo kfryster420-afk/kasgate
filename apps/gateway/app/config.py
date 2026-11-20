@@ -58,6 +58,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"KASGATE_TREASURY_ADDRESS must start with '{self.address_prefix}:' on {self.kaspa_network}"
             )
+        from kaspa import Address
+
+        if not Address.validate(self.kasgate_treasury_address):
+            raise ValueError("KASGATE_TREASURY_ADDRESS is not a valid Kaspa address (bad checksum or placeholder)")
         if self.kaspa_network == "kaspa:mainnet" and not self.public_base_url.startswith("https://"):
             raise ValueError("PUBLIC_BASE_URL must use https:// on kaspa:mainnet")
         if self.public_base_url.endswith("/"):

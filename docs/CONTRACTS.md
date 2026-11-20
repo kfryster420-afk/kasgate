@@ -149,7 +149,7 @@ Error codes: + payment_expired (402).
 - Challenge "Domain:" = urlsplit(PUBLIC_BASE_URL).netloc lowercased (host, plus :port only when the URL has one). Exactly one form; clients compare exact string.
   The web app's public URL that users see must therefore equal PUBLIC_BASE_URL's netloc (in local dev: localhost:8000 vs the web on :3000 → web compares with NEXT_PUBLIC_GATEWAY_URL netloc, which must equal PUBLIC_BASE_URL).
 - SompiStr 18-digit cap stands (max 999_999_999_999_999_999 sompi ≫ total KAS supply).
-- KasWare signature format is verified live in Phase 4; gateway normalisation (hex128 / Base64 64|65 bytes) is the contract.
+- KasWare signature format: script-signed (kaspa sign_message) registration verified live on tn10; a real KasWare browser signature is still to be verified; gateway normalisation (hex128 / Base64 64|65 bytes) is the contract.
 
 ## CONTRACT v2.3 — storage-mass correction to the minimum price (2026-11-20, from 02's live testnet finding)
 - At 0.4 KAS the two 0.2 KAS outputs use the entire 100_000 standard storage mass; any change output makes the tx non-standard.
