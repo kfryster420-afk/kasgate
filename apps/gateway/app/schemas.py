@@ -97,18 +97,23 @@ def compute_fee_split(total_sompi: int, min_output_sompi: int | None = None) -> 
     pct_fee = (total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
     fee = max(pct_fee, floor)
     merchant = total_sompi - fee
-    if merchant < floor:
+    if merchant < 2 * floor:
         raise ValueError(
-            f"price {total_sompi} sompi produces a merchant output below MIN_OUTPUT_SOMPI={floor}; "
+            f"price {total_sompi} sompi leaves the merchant output below 2*MIN_OUTPUT_SOMPI={2 * floor} "
+            "(needed so a payment with change stays under the KIP-9 storage-mass limit); "
             f"minimum price is {min_price_sompi(floor)} sompi"
         )
     return FeeSplit(total_sompi=total_sompi, merchant_sompi=merchant, fee_sompi=fee)
 
 
 def min_price_sompi(min_output_sompi: int | None = None) -> int:
-    """Cheapest valid total: fee = floor (percentage fee is below it here) and merchant = floor."""
+    """Cheapest valid total: fee = floor (flat) and merchant = 2*floor.
+
+    Two outputs at the floor already use the whole 100_000 standard storage mass, so any change output
+    would make the tx non-standard. A 2*floor merchant output leaves room for change >= ~0.3 KAS.
+    """
     floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
-    return 2 * floor
+    return 3 * floor
 
 
 def _reject_private_host(url: HttpUrl) -> HttpUrl:

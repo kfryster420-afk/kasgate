@@ -150,3 +150,10 @@ Error codes: + payment_expired (402).
   The web app's public URL that users see must therefore equal PUBLIC_BASE_URL's netloc (in local dev: localhost:8000 vs the web on :3000 → web compares with NEXT_PUBLIC_GATEWAY_URL netloc, which must equal PUBLIC_BASE_URL).
 - SompiStr 18-digit cap stands (max 999_999_999_999_999_999 sompi ≫ total KAS supply).
 - KasWare signature format is verified live in Phase 4; gateway normalisation (hex128 / Base64 64|65 bytes) is the contract.
+
+## CONTRACT v2.3 — storage-mass correction to the minimum price (2026-11-20, from 02's live testnet finding)
+- At 0.4 KAS the two 0.2 KAS outputs use the entire 100_000 standard storage mass; any change output makes the tx non-standard.
+- Merchant output must be >= 2*MIN_OUTPUT_SOMPI. min_price_sompi(floor) = 3*floor = 60_000_000 sompi (0.6 KAS). Fee rule unchanged.
+- Verified with kaspa.calculate_storage_mass: at >= 0.6 KAS a single-input payment with change >= ~0.3 KAS stays <= 100_000.
+- Buyer SDK MUST select inputs so change is 0 or >= 30_000_000 sompi (add another UTXO when needed); never emit small change.
+- Payments drawing from more than 16 payer addresses' UTXOs are rejected (invalid_payment_header).

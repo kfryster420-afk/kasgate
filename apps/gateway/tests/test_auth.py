@@ -1,24 +1,26 @@
-"""Wallet-signature login, key rotation, merchant uniqueness, and the Redis rate limits."""
+"""Wallet-proof registration and login, kgs_ sessions, key rotation, merchant uniqueness, and the auth rate limits."""
 
 import asyncio
+import base64
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
-from kaspa import PrivateKey, sign_message
-from sqlalchemy import select, update
+from kaspa import PrivateKey
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import Merchant
-from app.schemas import AuthChallenge, MerchantCreated
+from app.schemas import AUTH_PURPOSE, REGISTER_PURPOSE, MerchantCreated, SessionIssued, build_auth_challenge
 from app.security import (
     AUTH_CHALLENGE_TTL_SECONDS,
-    LoginChallenge,
-    challenge_key,
-    format_login_challenge,
+    auth_challenge_key,
     hash_api_key,
-    parse_login_challenge,
+    new_auth_challenge,
+    parse_auth_challenge,
+    session_key,
 )
 from tests.conftest import (
     MERCHANT_ADDRESS,
@@ -26,29 +28,14 @@ from tests.conftest import (
     OTHER_ADDRESS,
     OTHER_KEY,
     Seed,
+    SettingsOverride,
+    bearer,
+    get_challenge,
+    login,
     make_asgi_client,
+    proof_fields,
+    register,
 )
-
-
-def bearer(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}"}
-
-
-async def register(
-    client: httpx.AsyncClient, address: str = MERCHANT_ADDRESS, email: str | None = None
-) -> MerchantCreated:
-    body: dict[str, Any] = {"kaspa_address": address, "display_name": "Wallet Merchant"}
-    if email:
-        body["email"] = email
-    response = await client.post("/v1/merchants", json=body)
-    assert response.status_code == 201, response.text
-    return MerchantCreated.model_validate(response.json())
-
-
-async def get_challenge(client: httpx.AsyncClient, address: str = MERCHANT_ADDRESS) -> AuthChallenge:
-    response = await client.post("/v1/auth/challenge", json={"kaspa_address": address})
-    assert response.status_code == 200, response.text
-    return AuthChallenge.model_validate(response.json())
 
 
 def verify_body(
@@ -59,97 +46,270 @@ def verify_body(
     x_only: bool = False,
     signed: str | None = None,
 ) -> dict[str, str]:
-    public_key = key.to_public_key().to_string()
-    return {
-        "kaspa_address": address,
-        "challenge": challenge,
-        "public_key": public_key[2:] if x_only else public_key,
-        "signature": sign_message(signed if signed is not None else challenge, key),
-    }
+    return {"kaspa_address": address, **proof_fields(challenge, key, x_only=x_only, signed=signed)}
+
+
+def register_body(
+    challenge: str,
+    key: PrivateKey = MERCHANT_KEY,
+    address: str = MERCHANT_ADDRESS,
+    *,
+    email: str | None = None,
+    signed: str | None = None,
+) -> dict[str, str]:
+    body = {"kaspa_address": address, "display_name": "Shop", **proof_fields(challenge, key, signed=signed)}
+    if email:
+        body["email"] = email
+    return body
+
+
+async def stored_challenge(redis: Any, purpose: str, address: str, issued_at: datetime) -> str:
+    """Put a challenge that Redis really holds, but which was issued at `issued_at` (so it may be expired)."""
+    data = new_auth_challenge("login" if purpose == "login" else "register", address, now=issued_at)
+    await redis.set(auth_challenge_key(data.purpose, address, data.nonce), data.message, ex=300)
+    return data.message
 
 
 # ---------------------------------------------------------------- challenge
 
 
-async def test_challenge_format_storage_and_ttl(client: httpx.AsyncClient, redis: Any) -> None:
+@pytest.mark.parametrize(("purpose", "text"), [("login", AUTH_PURPOSE), ("register", REGISTER_PURPOSE)])
+async def test_challenge_format_storage_and_ttl(client: httpx.AsyncClient, redis: Any, purpose: str, text: str) -> None:
     before = datetime.now(UTC)
-    challenge = await get_challenge(client)
+    challenge = await get_challenge(client, purpose=purpose)
     lines = challenge.challenge.split("\n")
-    assert lines[0] == "KasGate login"
-    assert lines[1] == f"Address: {MERCHANT_ADDRESS}"
-    assert lines[2].startswith("Nonce: ") and len(lines[2]) == len("Nonce: ") + 32
-    assert lines[3] == f"Expires: {challenge.expires_at.isoformat()}"
+    assert lines[0] == "KasGate"
+    assert lines[1] == "Domain: gateway.test"
+    assert lines[2] == f"Purpose: {text}"
+    assert lines[3] == f"Address: {MERCHANT_ADDRESS}"
+    assert lines[4].startswith("Nonce: ") and len(lines[4]) == len("Nonce: ") + 32
+    assert lines[5] == f"Expires: {challenge.expires_at.isoformat()}"
     assert before + timedelta(seconds=AUTH_CHALLENGE_TTL_SECONDS - 5) <= challenge.expires_at
     assert challenge.expires_at <= before + timedelta(seconds=AUTH_CHALLENGE_TTL_SECONDS + 5)
-    nonce = lines[2].removeprefix("Nonce: ")
-    key = f"kasgate:auth:{MERCHANT_ADDRESS}:{nonce}"
-    assert key == challenge_key(MERCHANT_ADDRESS, nonce)
+    nonce = lines[4].removeprefix("Nonce: ")
+    key = f"kasgate:auth:{purpose}:{MERCHANT_ADDRESS}:{nonce}"
+    assert key == auth_challenge_key(purpose, MERCHANT_ADDRESS, nonce)  # type: ignore[arg-type]
     assert await redis.get(key) == challenge.challenge
     assert 0 < await redis.ttl(key) <= 300
-    other = await get_challenge(client)
-    assert other.challenge != challenge.challenge
+    assert (await get_challenge(client, purpose=purpose)).challenge != challenge.challenge
 
 
-async def test_challenge_rejects_invalid_address(client: httpx.AsyncClient) -> None:
+async def test_challenge_purpose_defaults_to_login(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})
+    assert f"Purpose: {AUTH_PURPOSE}" in response.json()["challenge"]
+
+
+async def test_challenge_domain_is_the_lowercased_netloc_of_public_base_url(
+    client: httpx.AsyncClient, override_settings: SettingsOverride
+) -> None:
+    override_settings(public_base_url="http://Gateway.Test:8000/")
+    challenge = await get_challenge(client)
+    assert challenge.challenge.split("\n")[1] == "Domain: gateway.test:8000"
+
+
+async def test_challenge_rejects_invalid_input(client: httpx.AsyncClient) -> None:
     assert (await client.post("/v1/auth/challenge", json={"kaspa_address": "nope"})).status_code == 422
+    body = {"kaspa_address": MERCHANT_ADDRESS, "purpose": "admin"}
+    assert (await client.post("/v1/auth/challenge", json=body)).status_code == 422
 
 
 def test_challenge_parser_is_strict() -> None:
-    parsed = LoginChallenge(MERCHANT_ADDRESS, "ab" * 16, datetime(2030, 1, 1, tzinfo=UTC))
-    message = format_login_challenge(parsed)
-    assert parse_login_challenge(message) == parsed
+    issued = new_auth_challenge("register", MERCHANT_ADDRESS)
+    parsed = parse_auth_challenge(issued.message)
+    assert (parsed.purpose, parsed.address, parsed.nonce, parsed.expires_at) == (
+        "register",
+        MERCHANT_ADDRESS,
+        issued.nonce,
+        issued.expires_at,
+    )
+    message = issued.message
+    other_domain = build_auth_challenge(
+        REGISTER_PURPOSE, "evil.test", MERCHANT_ADDRESS, issued.nonce, issued.expires_at
+    )
     for broken in (
         message + "\n",
-        message.replace("KasGate login", "Other login"),
-        message.replace("Nonce: ", "Nonce:  "),
-        message.replace("ab" * 16, "AB" * 16),
+        message.replace("KasGate", "Other"),
+        message.replace("Domain: ", "Domain:  "),
+        other_domain,
+        message.replace(REGISTER_PURPOSE, "Do something else"),
+        message.replace(issued.nonce, issued.nonce.upper()),
         message.replace("+00:00", ""),
         "x",
     ):
         with pytest.raises(ValueError):
-            parse_login_challenge(broken)
+            parse_auth_challenge(broken)
 
 
-# ---------------------------------------------------------------- verify
+# ---------------------------------------------------------------- registration needs a wallet proof
 
 
-async def test_verify_rotates_key_and_invalidates_the_old_one(
+async def test_register_returns_key_and_session_once(client: httpx.AsyncClient, redis: Any) -> None:
+    before = datetime.now(UTC)
+    challenge = await get_challenge(client, purpose="register")
+    response = await client.post("/v1/merchants", json=register_body(challenge.challenge, email="Owner@Example.com"))
+    assert response.status_code == 201, response.text
+    created = MerchantCreated.model_validate(response.json())
+    assert created.api_key.startswith("kg_")
+    assert created.session_token.startswith("kgs_")
+    assert before + timedelta(seconds=604_790) <= created.expires_at <= before + timedelta(seconds=604_810)
+    assert created.merchant.kaspa_address == MERCHANT_ADDRESS
+    assert created.merchant.email == "owner@example.com"
+    assert "api_key" not in (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).json()
+    # the session is stored hashed, as kasgate:session:{sha256(token)} -> merchant id, for session_ttl_seconds
+    key = f"kasgate:session:{hash_api_key(created.session_token)}"
+    assert key == session_key(created.session_token)
+    assert await redis.get(key) == str(created.merchant.id)
+    assert 604_700 < await redis.ttl(key) <= 604_800
+    assert await redis.keys("kasgate:session:*") == [key]
+    # both credentials authenticate
+    for token in (created.api_key, created.session_token):
+        me = await client.get("/v1/merchants/me", headers=bearer(token))
+        assert me.status_code == 200 and me.json()["id"] == str(created.merchant.id)
+
+
+async def test_session_lifetime_comes_from_settings(
+    client: httpx.AsyncClient, redis: Any, override_settings: SettingsOverride
+) -> None:
+    override_settings(session_ttl_seconds=3600)
+    created = await register(client)
+    assert 3500 < await redis.ttl(session_key(created.session_token)) <= 3600
+    assert created.expires_at <= datetime.now(UTC) + timedelta(seconds=3601)
+
+
+async def test_register_without_wallet_proof_is_422(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/merchants", json={"kaspa_address": MERCHANT_ADDRESS, "display_name": "Shop"})
+    assert response.status_code == 422
+    fields = {error["loc"][-1] for error in response.json()["detail"]}
+    assert {"challenge", "public_key", "signature"} <= fields
+
+
+async def _no_merchants(maker: async_sessionmaker[AsyncSession]) -> bool:
+    async with maker() as session:
+        return await session.scalar(select(func.count()).select_from(Merchant)) == 0
+
+
+async def test_register_with_bad_signature_is_401_and_creates_nothing(
+    client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession], redis: Any
+) -> None:
+    challenge = await get_challenge(client, purpose="register")
+    response = await client.post("/v1/merchants", json=register_body(challenge.challenge, signed="something else"))
+    assert response.status_code == 401
+    assert await _no_merchants(sessionmaker)
+    assert await redis.keys("kasgate:session:*") == []
+
+
+async def test_register_with_the_key_of_another_address_is_401(
     client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
+    challenge = await get_challenge(client, MERCHANT_ADDRESS, "register")
+    response = await client.post("/v1/merchants", json=register_body(challenge.challenge, key=OTHER_KEY))
+    assert response.status_code == 401
+    assert await _no_merchants(sessionmaker)
+
+
+async def test_register_cannot_claim_an_address_with_someone_elses_challenge(
+    client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    victim = await get_challenge(client, MERCHANT_ADDRESS, "register")
+    body = register_body(victim.challenge, key=OTHER_KEY, address=OTHER_ADDRESS)
+    assert (await client.post("/v1/merchants", json=body)).status_code == 401
+    assert await _no_merchants(sessionmaker)
+
+
+async def test_login_challenge_cannot_register(
+    client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    challenge = await get_challenge(client, purpose="login")
+    assert (await client.post("/v1/merchants", json=register_body(challenge.challenge))).status_code == 401
+    assert await _no_merchants(sessionmaker)
+
+
+async def test_register_challenge_cannot_log_in(client: httpx.AsyncClient) -> None:
+    await register(client)
+    challenge = await get_challenge(client, purpose="register")
+    assert (await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))).status_code == 401
+
+
+async def test_register_challenge_is_single_use(client: httpx.AsyncClient) -> None:
+    challenge = await get_challenge(client, purpose="register")
+    body = register_body(challenge.challenge)
+    assert (await client.post("/v1/merchants", json=body)).status_code == 201
+    assert (await client.post("/v1/merchants", json=body)).status_code == 401
+
+
+async def test_register_with_an_expired_challenge_is_401(client: httpx.AsyncClient, redis: Any) -> None:
+    message = await stored_challenge(redis, "register", MERCHANT_ADDRESS, datetime.now(UTC) - timedelta(seconds=400))
+    assert (await client.post("/v1/merchants", json=register_body(message))).status_code == 401
+
+
+async def test_duplicate_address_and_email_are_409_after_the_proof(client: httpx.AsyncClient) -> None:
+    await register(client, MERCHANT_KEY, email="a@example.com")
+    again = await get_challenge(client, MERCHANT_ADDRESS, "register")
+    same_address = await client.post("/v1/merchants", json=register_body(again.challenge))
+    assert same_address.status_code == 409
+    assert "address" in same_address.json()["detail"]
+    other = await get_challenge(client, OTHER_ADDRESS, "register")
+    same_email = await client.post(
+        "/v1/merchants",
+        json=register_body(other.challenge, key=OTHER_KEY, address=OTHER_ADDRESS, email="A@Example.com"),
+    )
+    assert same_email.status_code == 409
+    assert "email" in same_email.json()["detail"]
+
+
+async def test_duplicate_check_does_not_leak_to_someone_without_the_key(client: httpx.AsyncClient) -> None:
+    await register(client)
+    challenge = await get_challenge(client, MERCHANT_ADDRESS, "register")
+    forged = register_body(challenge.challenge, key=OTHER_KEY)
+    response = await client.post("/v1/merchants", json=forged)
+    assert response.status_code == 401  # not 409: only the owner learns the address is taken
+
+
+async def test_concurrent_duplicate_registration_returns_one_201(client: httpx.AsyncClient) -> None:
+    challenges = [await get_challenge(client, MERCHANT_ADDRESS, "register") for _ in range(4)]
+    responses = await asyncio.gather(
+        *(client.post("/v1/merchants", json=register_body(c.challenge)) for c in challenges)
+    )
+    assert sorted(r.status_code for r in responses) == [201, 409, 409, 409]
+
+
+# ---------------------------------------------------------------- login issues a session
+
+
+async def test_login_issues_a_session_and_does_not_rotate_the_api_key(client: httpx.AsyncClient, redis: Any) -> None:
     created = await register(client)
     challenge = await get_challenge(client)
     response = await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))
     assert response.status_code == 200, response.text
-    rotated = MerchantCreated.model_validate(response.json())
-    assert rotated.merchant.id == created.merchant.id
-    assert rotated.api_key.startswith("kg_")
-    assert rotated.api_key != created.api_key
+    issued = SessionIssued.model_validate(response.json())
+    assert "api_key" not in response.json()
+    assert issued.merchant.id == created.merchant.id
+    assert issued.session_token.startswith("kgs_")
+    assert issued.session_token != created.session_token
+    assert issued.expires_at > datetime.now(UTC) + timedelta(days=6)
+    assert await redis.get(session_key(issued.session_token)) == str(created.merchant.id)
+    assert 604_700 < await redis.ttl(session_key(issued.session_token)) <= 604_800
 
-    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 401
-    assert (await client.get("/v1/merchants/me", headers=bearer(rotated.api_key))).status_code == 200
-    async with sessionmaker() as session:
-        stored = (await session.execute(select(Merchant).where(Merchant.id == created.merchant.id))).scalar_one()
-        assert stored.api_key_hash == hash_api_key(rotated.api_key)
+    assert (await client.get("/v1/merchants/me", headers=bearer(issued.session_token))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 200
 
 
-async def test_verify_accepts_x_only_public_key(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize("x_only", [False, True])
+async def test_both_public_key_forms_work(client: httpx.AsyncClient, x_only: bool) -> None:
     await register(client)
     challenge = await get_challenge(client)
-    response = await client.post("/v1/auth/verify", json=verify_body(challenge.challenge, x_only=True))
-    assert response.status_code == 200
+    body = verify_body(challenge.challenge, x_only=x_only)
+    assert len(body["public_key"]) == (64 if x_only else 66)
+    assert (await client.post("/v1/auth/verify", json=body)).status_code == 200
 
 
 async def test_challenge_is_single_use(client: httpx.AsyncClient) -> None:
-    created = await register(client)
+    await register(client)
     challenge = await get_challenge(client)
     body = verify_body(challenge.challenge)
-    first = await client.post("/v1/auth/verify", json=body)
-    assert first.status_code == 200
-    second = await client.post("/v1/auth/verify", json=body)
-    assert second.status_code == 401
-    me = await client.get("/v1/merchants/me", headers=bearer(first.json()["api_key"]))
-    assert me.status_code == 200
-    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 401
+    assert (await client.post("/v1/auth/verify", json=body)).status_code == 200
+    assert (await client.post("/v1/auth/verify", json=body)).status_code == 401
 
 
 async def test_concurrent_verifies_of_one_challenge_only_one_wins(client: httpx.AsyncClient) -> None:
@@ -168,21 +328,20 @@ async def test_signature_over_a_different_message_is_401(client: httpx.AsyncClie
     assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
 
 
-async def test_signature_by_another_key_is_401(client: httpx.AsyncClient) -> None:
-    created = await register(client)
-    challenge = await get_challenge(client)
-    body = verify_body(challenge.challenge)
-    body["signature"] = sign_message(challenge.challenge, OTHER_KEY)
-    assert (await client.post("/v1/auth/verify", json=body)).status_code == 401
-    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
-
-
 async def test_valid_signature_from_wrong_address_key_is_401(client: httpx.AsyncClient) -> None:
-    created = await register(client)
+    await register(client)
     challenge = await get_challenge(client)
-    response = await client.post("/v1/auth/verify", json=verify_body(challenge.challenge, key=OTHER_KEY))
-    assert response.status_code == 401
-    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+    assert (
+        await client.post("/v1/auth/verify", json=verify_body(challenge.challenge, key=OTHER_KEY))
+    ).status_code == 401
+
+
+async def test_challenge_with_a_foreign_domain_is_401(client: httpx.AsyncClient, redis: Any) -> None:
+    await register(client)
+    expires = datetime.now(UTC) + timedelta(minutes=5)
+    message = build_auth_challenge(AUTH_PURPOSE, "evil.test", MERCHANT_ADDRESS, "ab" * 16, expires)
+    await redis.set(auth_challenge_key("login", MERCHANT_ADDRESS, "ab" * 16), message, ex=300)
+    assert (await client.post("/v1/auth/verify", json=verify_body(message))).status_code == 401
 
 
 async def test_unknown_address_gets_the_same_challenge_shape_and_a_generic_401(
@@ -194,7 +353,8 @@ async def test_unknown_address_gets_the_same_challenge_shape_and_a_generic_401(
     assert known.status_code == unknown.status_code == 200
     assert known.json().keys() == unknown.json().keys()
     assert known.headers.keys() == unknown.headers.keys()
-    assert await redis.get(f"kasgate:auth:{OTHER_ADDRESS}:{unknown.json()['challenge'].split('Nonce: ')[1][:32]}")
+    nonce = unknown.json()["challenge"].split("Nonce: ")[1][:32]
+    assert await redis.get(f"kasgate:auth:login:{OTHER_ADDRESS}:{nonce}")
 
     body = verify_body(unknown.json()["challenge"], key=OTHER_KEY, address=OTHER_ADDRESS)
     response = await client.post("/v1/auth/verify", json=body)
@@ -204,8 +364,15 @@ async def test_unknown_address_gets_the_same_challenge_shape_and_a_generic_401(
 
 async def _generic_failure(client: httpx.AsyncClient) -> dict[str, Any]:
     """The body every failed login must produce: a valid signature over a challenge that was never issued."""
-    forged = LoginChallenge(MERCHANT_ADDRESS, "99" * 16, datetime.now(UTC) + timedelta(minutes=5))
-    response = await client.post("/v1/auth/verify", json=verify_body(format_login_challenge(forged)))
+    forged = new_auth_challenge("login", MERCHANT_ADDRESS)
+    response = await client.post("/v1/auth/verify", json=verify_body(forged.message))
+    assert response.status_code == 401
+    result: dict[str, Any] = response.json()
+    return result
+
+
+async def _post_verify(client: httpx.AsyncClient, body: dict[str, str]) -> dict[str, Any]:
+    response = await client.post("/v1/auth/verify", json=body)
     assert response.status_code == 401
     result: dict[str, Any] = response.json()
     return result
@@ -218,44 +385,30 @@ async def test_every_login_failure_has_the_identical_401_body(client: httpx.Asyn
 
     unknown = await get_challenge(client, OTHER_ADDRESS)
     bodies.append(await _post_verify(client, verify_body(unknown.challenge, OTHER_KEY, OTHER_ADDRESS)))
-
     bad_signature = await get_challenge(client)
     bodies.append(await _post_verify(client, verify_body(bad_signature.challenge, signed="other")))
-
     wrong_key = await get_challenge(client)
     bodies.append(await _post_verify(client, verify_body(wrong_key.challenge, key=OTHER_KEY)))
-
     used = await get_challenge(client)
     assert (await client.post("/v1/auth/verify", json=verify_body(used.challenge))).status_code == 200
     bodies.append(await _post_verify(client, verify_body(used.challenge)))
-
-    expired = LoginChallenge(MERCHANT_ADDRESS, "cd" * 16, datetime.now(UTC) - timedelta(seconds=1))
-    message = format_login_challenge(expired)
-    await redis.set(challenge_key(MERCHANT_ADDRESS, expired.nonce), message, ex=300)
-    bodies.append(await _post_verify(client, verify_body(message)))
-
+    expired = await stored_challenge(redis, "login", MERCHANT_ADDRESS, datetime.now(UTC) - timedelta(seconds=400))
+    bodies.append(await _post_verify(client, verify_body(expired)))
     other_address = await get_challenge(client, OTHER_ADDRESS)
     bodies.append(await _post_verify(client, verify_body(other_address.challenge)))
-
+    register_purpose = await get_challenge(client, purpose="register")
+    bodies.append(await _post_verify(client, verify_body(register_purpose.challenge)))
     assert bodies == [expected] * len(bodies)
 
 
-async def _post_verify(client: httpx.AsyncClient, body: dict[str, str]) -> dict[str, Any]:
-    response = await client.post("/v1/auth/verify", json=body)
-    assert response.status_code == 401
-    result: dict[str, Any] = response.json()
-    return result
-
-
 async def test_any_verify_attempt_consumes_the_challenge(client: httpx.AsyncClient, redis: Any) -> None:
-    created = await register(client)
+    await register(client)
     challenge = await get_challenge(client)
-    bad = await client.post("/v1/auth/verify", json=verify_body(challenge.challenge, signed="nope"))
-    assert bad.status_code == 401
+    assert (
+        await client.post("/v1/auth/verify", json=verify_body(challenge.challenge, signed="nope"))
+    ).status_code == 401
     assert await redis.keys("kasgate:auth:*") == []
-    good = await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))
-    assert good.status_code == 401
-    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+    assert (await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))).status_code == 401
 
 
 async def test_unknown_address_attempt_also_consumes_the_challenge(client: httpx.AsyncClient, redis: Any) -> None:
@@ -267,8 +420,6 @@ async def test_unknown_address_attempt_also_consumes_the_challenge(client: httpx
 
 @pytest.mark.parametrize("variant", ["base64_64", "base64_65", "upper_hex"])
 async def test_signature_encodings_are_normalised(client: httpx.AsyncClient, variant: str) -> None:
-    import base64
-
     await register(client)
     challenge = await get_challenge(client)
     body = verify_body(challenge.challenge)
@@ -279,38 +430,26 @@ async def test_signature_encodings_are_normalised(client: httpx.AsyncClient, var
         body["signature"] = base64.b64encode(b"\x1b" + raw).decode()
     else:
         body["signature"] = body["signature"].upper()
-    response = await client.post("/v1/auth/verify", json=body)
-    assert response.status_code == 200, response.text
-
-
-@pytest.mark.parametrize("x_only", [False, True])
-async def test_both_public_key_forms_work(client: httpx.AsyncClient, x_only: bool) -> None:
-    await register(client)
-    challenge = await get_challenge(client)
-    body = verify_body(challenge.challenge, x_only=x_only)
-    assert len(body["public_key"]) == (64 if x_only else 66)
     assert (await client.post("/v1/auth/verify", json=body)).status_code == 200
 
 
 async def test_expired_challenge_is_401(client: httpx.AsyncClient, redis: Any) -> None:
     await register(client)
-    expired = LoginChallenge(MERCHANT_ADDRESS, "cd" * 16, datetime.now(UTC) - timedelta(seconds=1))
-    message = format_login_challenge(expired)
-    await redis.set(challenge_key(MERCHANT_ADDRESS, expired.nonce), message, ex=300)
+    message = await stored_challenge(redis, "login", MERCHANT_ADDRESS, datetime.now(UTC) - timedelta(seconds=400))
     assert (await client.post("/v1/auth/verify", json=verify_body(message))).status_code == 401
 
 
 async def test_challenge_missing_from_redis_is_401(client: httpx.AsyncClient, redis: Any) -> None:
     await register(client)
     challenge = await get_challenge(client)
-    await redis.flushall()
+    await redis.delete(*await redis.keys("kasgate:auth:*"))
     assert (await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))).status_code == 401
 
 
 async def test_self_made_challenge_is_401(client: httpx.AsyncClient) -> None:
     await register(client)
-    forged = LoginChallenge(MERCHANT_ADDRESS, "ef" * 16, datetime.now(UTC) + timedelta(minutes=5))
-    assert (await client.post("/v1/auth/verify", json=verify_body(format_login_challenge(forged)))).status_code == 401
+    forged = new_auth_challenge("login", MERCHANT_ADDRESS)
+    assert (await client.post("/v1/auth/verify", json=verify_body(forged.message))).status_code == 401
 
 
 async def test_challenge_for_another_address_is_401(client: httpx.AsyncClient) -> None:
@@ -344,7 +483,7 @@ async def test_all_zero_signature_is_401(client: httpx.AsyncClient) -> None:
     assert (await client.post("/v1/auth/verify", json=body)).status_code == 401
 
 
-async def test_disabled_merchant_cannot_recover_a_key(
+async def test_disabled_merchant_cannot_log_in(
     client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
     created = await register(client)
@@ -355,43 +494,133 @@ async def test_disabled_merchant_cannot_recover_a_key(
     assert (await client.post("/v1/auth/verify", json=verify_body(challenge.challenge))).status_code == 403
 
 
+# ---------------------------------------------------------------- the Bearer dependency: kg_ keys and kgs_ sessions
+
+
+async def test_session_token_authenticates_every_merchant_route(client: httpx.AsyncClient) -> None:
+    created = await register(client)
+    headers = bearer(created.session_token)
+    assert (await client.get("/v1/endpoints", headers=headers)).status_code == 200
+    assert (await client.get("/v1/settlements", headers=headers)).status_code == 200
+    assert (await client.get("/v1/analytics", headers=headers)).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "token", ["kgs_" + "a" * 43, "kgs_short", "kgs_", "kgx_" + "a" * 43, "Bearer", "kg_" + "a" * 43]
+)
+async def test_unknown_tokens_are_401(client: httpx.AsyncClient, token: str) -> None:
+    response = await client.get("/v1/merchants/me", headers=bearer(token))
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+async def test_a_session_is_not_an_api_key_and_vice_versa(client: httpx.AsyncClient) -> None:
+    created = await register(client)
+    api_key_as_session = created.api_key.replace("kg_", "kgs_", 1)
+    session_as_api_key = created.session_token.replace("kgs_", "kg_", 1)
+    assert (await client.get("/v1/merchants/me", headers=bearer(api_key_as_session))).status_code == 401
+    assert (await client.get("/v1/merchants/me", headers=bearer(session_as_api_key))).status_code == 401
+
+
+async def test_expired_session_is_401(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    await redis.delete(session_key(created.session_token))
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 401
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+
+
+async def test_session_of_a_disabled_merchant_is_403(
+    client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    created = await register(client)
+    async with sessionmaker() as session:
+        await session.execute(update(Merchant).where(Merchant.id == created.merchant.id).values(is_active=False))
+        await session.commit()
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 403
+
+
+async def test_session_for_a_deleted_merchant_is_401(
+    client: httpx.AsyncClient, redis: Any, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    created = await register(client)
+    async with sessionmaker() as session:
+        merchant = await session.get(Merchant, created.merchant.id)
+        assert merchant is not None
+        await session.delete(merchant)
+        await session.commit()
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 401
+
+
+async def test_corrupt_session_value_is_401(client: httpx.AsyncClient, redis: Any) -> None:
+    created = await register(client)
+    await redis.set(session_key(created.session_token), "not-a-uuid", ex=60)
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.session_token))).status_code == 401
+
+
+async def test_session_check_fails_closed_when_redis_is_down(
+    client: httpx.AsyncClient, redis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = await register(client)
+
+    async def broken(*args: Any, **kwargs: Any) -> None:
+        raise RedisConnectionError("down")
+
+    monkeypatch.setattr(redis, "get", broken)
+    response = await client.get("/v1/merchants/me", headers=bearer(created.session_token))
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 200
+
+
 # ---------------------------------------------------------------- rotate-key
 
 
-async def test_rotate_key_returns_new_key_and_kills_old(client: httpx.AsyncClient, seeded: Seed) -> None:
+async def test_rotate_key_returns_new_key_and_a_session_and_kills_the_old_key(
+    client: httpx.AsyncClient, seeded: Seed, redis: Any
+) -> None:
     response = await client.post("/v1/merchants/me/rotate-key", headers=bearer(seeded.api_key))
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     rotated = MerchantCreated.model_validate(response.json())
     assert rotated.merchant.id == seeded.merchant_id
     assert rotated.api_key != seeded.api_key
+    assert rotated.session_token.startswith("kgs_")
+    assert rotated.expires_at > datetime.now(UTC) + timedelta(days=6)
+    assert await redis.get(session_key(rotated.session_token)) == str(seeded.merchant_id)
+    assert 604_700 < await redis.ttl(session_key(rotated.session_token)) <= 604_800
     assert (await client.get("/v1/merchants/me", headers=bearer(seeded.api_key))).status_code == 401
     assert (await client.get("/v1/merchants/me", headers=bearer(rotated.api_key))).status_code == 200
+    assert (await client.get("/v1/merchants/me", headers=bearer(rotated.session_token))).status_code == 200
     assert (await client.post("/v1/merchants/me/rotate-key", headers=bearer(seeded.api_key))).status_code == 401
+
+
+async def test_rotate_key_with_a_session_keeps_existing_sessions(client: httpx.AsyncClient) -> None:
+    created = await register(client)
+    issued = await login(client)
+    response = await client.post("/v1/merchants/me/rotate-key", headers=bearer(issued.session_token))
+    assert response.status_code == 200
+    rotated = MerchantCreated.model_validate(response.json())
+    assert (await client.get("/v1/merchants/me", headers=bearer(created.api_key))).status_code == 401
+    assert (await client.get("/v1/merchants/me", headers=bearer(rotated.api_key))).status_code == 200
+    for token in (created.session_token, issued.session_token, rotated.session_token):
+        assert (await client.get("/v1/merchants/me", headers=bearer(token))).status_code == 200
+
+
+async def test_rotate_key_stores_only_the_hash(
+    client: httpx.AsyncClient, seeded: Seed, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    rotated = MerchantCreated.model_validate(
+        (await client.post("/v1/merchants/me/rotate-key", headers=bearer(seeded.api_key))).json()
+    )
+    async with sessionmaker() as session:
+        stored = (await session.execute(select(Merchant).where(Merchant.id == seeded.merchant_id))).scalar_one()
+        assert stored.api_key_hash == hash_api_key(rotated.api_key)
 
 
 async def test_rotate_key_requires_auth(client: httpx.AsyncClient) -> None:
     assert (await client.post("/v1/merchants/me/rotate-key")).status_code == 401
 
 
-# ---------------------------------------------------------------- uniqueness & bounds
-
-
-async def test_duplicate_address_and_email_are_409(client: httpx.AsyncClient) -> None:
-    await register(client, MERCHANT_ADDRESS, email="a@example.com")
-    same_address = await client.post("/v1/merchants", json={"kaspa_address": MERCHANT_ADDRESS, "display_name": "x"})
-    assert same_address.status_code == 409
-    assert "address" in same_address.json()["detail"]
-    same_email = await client.post(
-        "/v1/merchants", json={"kaspa_address": OTHER_ADDRESS, "display_name": "x", "email": "A@Example.com"}
-    )
-    assert same_email.status_code == 409
-    assert "email" in same_email.json()["detail"]
-
-
-async def test_concurrent_duplicate_registration_returns_one_409(client: httpx.AsyncClient) -> None:
-    body = {"kaspa_address": MERCHANT_ADDRESS, "display_name": "x"}
-    responses = await asyncio.gather(*(client.post("/v1/merchants", json=body) for _ in range(4)))
-    assert sorted(r.status_code for r in responses) == [201, 409, 409, 409]
+# ---------------------------------------------------------------- bounds
 
 
 @pytest.mark.parametrize(
@@ -418,39 +647,32 @@ async def test_settlement_pagination_bounds(
 
 
 async def test_merchant_registration_is_limited_to_5_per_hour_per_ip(client: httpx.AsyncClient, redis: Any) -> None:
-    keys = [PrivateKey(f"{i:02x}" * 32).to_address("testnet").to_string() for i in range(1, 8)]
-    for address in keys[:5]:
-        assert (
-            await client.post("/v1/merchants", json={"kaspa_address": address, "display_name": "x"})
-        ).status_code == 201
-    blocked = await client.post("/v1/merchants", json={"kaspa_address": keys[5], "display_name": "x"})
-    assert blocked.status_code == 429
-    assert 0 < int(blocked.headers["retry-after"]) <= 3600
-    assert 0 < await redis.ttl("kasgate:rl:merchants:ip:127.0.0.1") <= 3600
-    async with make_asgi_client(client, "10.9.9.9") as other_ip:
-        ok = await other_ip.post("/v1/merchants", json={"kaspa_address": keys[6], "display_name": "x"})
-        assert ok.status_code == 201
+    keys = [PrivateKey(f"{i:02x}" * 32) for i in range(10, 17)]
+    codes: list[int] = []
+    for key in keys:
+        address = key.to_address("testnet").to_string()
+        challenge = await get_challenge(client, address, "register")
+        response = await client.post("/v1/merchants", json=register_body(challenge.challenge, key, address))
+        codes.append(response.status_code)
+    assert codes == [201] * 5 + [429] * 2
+    assert 0 < int(await redis.ttl("kasgate:rl:merchants:ip:127.0.0.1")) <= 3600
 
 
-async def test_rate_limit_window_resets_when_key_expires(client: httpx.AsyncClient, redis: Any) -> None:
+async def test_challenge_is_limited_per_ip_only(client: httpx.AsyncClient, redis: Any) -> None:
     for _ in range(10):
         assert (await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})).status_code == 200
     blocked = await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})
     assert blocked.status_code == 429
     assert 0 < int(blocked.headers["retry-after"]) <= 60
-    await redis.delete("kasgate:rl:auth_challenge:ip:127.0.0.1", f"kasgate:rl:auth_challenge:addr:{MERCHANT_ADDRESS}")
-    assert (await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})).status_code == 200
-
-
-async def test_challenge_is_limited_per_address_independent_of_ip(client: httpx.AsyncClient, redis: Any) -> None:
-    for _ in range(10):
-        assert (await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})).status_code == 200
-    assert await redis.get(f"kasgate:rl:auth_challenge:addr:{MERCHANT_ADDRESS}") == "10"
+    assert await redis.keys("kasgate:rl:auth_challenge:addr:*") == []
+    # a different IP can still ask for the same address: a per-address limit would let anyone lock a victim out
     async with make_asgi_client(client, "10.1.1.1") as other_ip:
-        blocked = await other_ip.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})
-        assert blocked.status_code == 429
-        assert "retry-after" in blocked.headers
-        assert (await other_ip.post("/v1/auth/challenge", json={"kaspa_address": OTHER_ADDRESS})).status_code == 200
+        for _ in range(10):
+            assert (
+                await other_ip.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})
+            ).status_code == 200
+    await redis.delete("kasgate:rl:auth_challenge:ip:127.0.0.1")
+    assert (await client.post("/v1/auth/challenge", json={"kaspa_address": MERCHANT_ADDRESS})).status_code == 200
 
 
 async def test_challenge_is_limited_per_ip_across_addresses(client: httpx.AsyncClient) -> None:
