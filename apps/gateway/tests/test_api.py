@@ -8,32 +8,45 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import get_settings
 from app.models import Endpoint, Settlement, SettlementStatus
+from app.proxy import nonce_key
 from app.schemas import (
+    HEADER_PAYMENT_SIGNATURE,
     TAX_CSV_COLUMNS,
     DirectoryManifest,
     EndpointRead,
     MerchantAnalytics,
-    MerchantCreated,
     PaymentRequired,
     SettlementRead,
+    compute_fee_split,
     min_price_sompi,
 )
 from app.security import decrypt_headers
 from tests.conftest import (
     MERCHANT_ADDRESS,
     OTHER_ADDRESS,
+    OTHER_KEY,
     PAYER_ADDRESS,
     PRICE_SOMPI,
     TREASURY,
     Seed,
+    StubEngine,
+    Upstream,
+    fetch_challenge,
+    get_challenge,
+    make_signature_header,
+    proof_fields,
+    register,
     seed_endpoint,
 )
 
 NEW_ADDRESS = OTHER_ADDRESS
+SPLIT = compute_fee_split(PRICE_SOMPI)
 
 
 def bearer(seed: Seed) -> dict[str, str]:
@@ -66,14 +79,15 @@ async def add_settlement(
                 merchant_address=MERCHANT_ADDRESS,
                 treasury_address=TREASURY,
                 amount_sompi=PRICE_SOMPI,
-                merchant_amount_sompi=1_970_000_000,
-                fee_amount_sompi=30_000_000,
+                merchant_amount_sompi=SPLIT.merchant_sompi,
+                fee_amount_sompi=SPLIT.fee_sompi,
                 kas_usd_rate=Decimal("0.125"),
                 usd_value_at_settlement=Decimal(usd),
                 status=SettlementStatus.SETTLED,
                 request_method="GET",
                 request_path="/p/weather",
                 upstream_status_code=200,
+                payment_nonce=uuid.uuid4().hex,
                 created_at=at,
                 settled_at=at,
             )
@@ -85,14 +99,11 @@ async def add_settlement(
 
 
 async def test_create_merchant_returns_key_once(client: httpx.AsyncClient) -> None:
-    response = await client.post(
-        "/v1/merchants", json={"kaspa_address": NEW_ADDRESS, "display_name": "Shop", "email": "Owner@Example.com"}
-    )
-    assert response.status_code == 201
-    created = MerchantCreated.model_validate(response.json())
+    created = await register(client, OTHER_KEY, email="Owner@Example.com")
     assert created.api_key.startswith("kg_")
+    assert created.session_token.startswith("kgs_")
     assert created.merchant.email == "owner@example.com"
-    assert "api_key_hash" not in response.text
+    assert "api_key_hash" not in created.model_dump_json()
 
     me = await client.get("/v1/merchants/me", headers={"Authorization": f"Bearer {created.api_key}"})
     assert me.status_code == 200
@@ -100,9 +111,15 @@ async def test_create_merchant_returns_key_once(client: httpx.AsyncClient) -> No
     assert "api_key" not in me.json()
 
 
+async def test_create_merchant_without_wallet_proof_is_422(client: httpx.AsyncClient) -> None:
+    body = {"kaspa_address": NEW_ADDRESS, "display_name": "Shop", "email": "Owner@Example.com"}
+    assert (await client.post("/v1/merchants", json=body)).status_code == 422
+
+
 async def test_duplicate_merchant_address_is_409(client: httpx.AsyncClient) -> None:
-    body = {"kaspa_address": NEW_ADDRESS, "display_name": "Shop"}
-    assert (await client.post("/v1/merchants", json=body)).status_code == 201
+    await register(client, OTHER_KEY)
+    challenge = await get_challenge(client, NEW_ADDRESS, "register")
+    body = {"kaspa_address": NEW_ADDRESS, "display_name": "Shop", **proof_fields(challenge.challenge, OTHER_KEY)}
     assert (await client.post("/v1/merchants", json=body)).status_code == 409
 
 
@@ -238,8 +255,20 @@ async def test_endpoint_validation(client: httpx.AsyncClient, seeded: Seed) -> N
     assert nulled.status_code == 422
 
 
-async def test_minimum_price_is_the_architect_floor() -> None:
-    assert min_price_sompi() == 1_333_333_267
+async def test_minimum_price_follows_the_fee_floor() -> None:
+    floor = get_settings().min_output_sompi
+    assert (
+        min_price_sompi() == 3 * floor
+    )  # v2.3: fee floor + a merchant output of 2 * floor, so change fits the mass cap
+    at_minimum = compute_fee_split(min_price_sompi())
+    assert (at_minimum.fee_sompi, at_minimum.merchant_sompi) == (floor, 2 * floor)
+    with pytest.raises(ValueError):
+        compute_fee_split(min_price_sompi() - 1)
+    # the fee is the flat floor until 1.5 % overtakes it, then 1.5 % rounded up
+    assert compute_fee_split(PRICE_SOMPI).fee_sompi == -(-PRICE_SOMPI * 150 // 10_000) > floor
+    knee = floor * 10_000 // 150
+    assert compute_fee_split(knee).fee_sompi == floor
+    assert compute_fee_split(knee + 1).fee_sompi == floor + 1
 
 
 async def test_endpoints_are_scoped_to_their_merchant(
@@ -280,7 +309,8 @@ async def test_settlements_pagination_and_scoping(
 async def test_analytics_totals_daily_and_by_endpoint(
     client: httpx.AsyncClient, seeded: Seed, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    # Noon yesterday: always in the past (noon today is still in the future before 12:00 UTC).
+    now = (datetime.now(UTC) - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
     await add_settlement(sessionmaker, seeded, tx=f"{1:064x}", at=now)
     await add_settlement(sessionmaker, seeded, tx=f"{2:064x}", at=now - timedelta(days=1))
     await add_settlement(sessionmaker, seeded, tx=f"{3:064x}", at=now - timedelta(days=90))
@@ -290,8 +320,8 @@ async def test_analytics_totals_daily_and_by_endpoint(
     data = MerchantAnalytics.model_validate(response.json())
     assert data.total_calls == 2
     assert data.gross_sompi == 2 * PRICE_SOMPI
-    assert data.merchant_sompi == 2 * 1_970_000_000
-    assert data.fee_sompi == 2 * 30_000_000
+    assert data.merchant_sompi == 2 * SPLIT.merchant_sompi
+    assert data.fee_sompi == 2 * SPLIT.fee_sompi
     assert data.usd_value == Decimal("5")
     assert [d.call_count for d in data.daily] == [1, 1]
     assert data.daily[0].day < data.daily[1].day
@@ -379,15 +409,33 @@ async def test_directory_is_public_listed_only_and_cached_for_30s(
     assert {e["slug"] for e in third.json()["endpoints"]} == {"weather", "newly-listed"}
 
 
-async def test_quote_returns_payment_required(client: httpx.AsyncClient, seeded: Seed) -> None:
+async def test_quote_returns_a_payable_nonce_bound_payment_required(
+    client: httpx.AsyncClient, seeded: Seed, redis: Any
+) -> None:
     response = await client.get("/v1/quote/weather")
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
     required = PaymentRequired.model_validate(response.json())
     assert required.payTo == MERCHANT_ADDRESS
     assert required.amount == str(PRICE_SOMPI)
     assert required.platformFee.feeTo == TREASURY
-    assert required.fee_amount_sompi == 30_000_000
-    assert required.merchant_amount_sompi == 1_970_000_000
+    assert required.fee_amount_sompi == SPLIT.fee_sompi
+    assert required.merchant_amount_sompi == SPLIT.merchant_sompi
+    assert len(required.nonce) == 32
+    assert 0 < await redis.ttl(nonce_key(required.nonce)) <= 120
+    assert (await client.get("/v1/quote/weather")).json()["nonce"] != required.nonce
+
+
+async def test_a_quote_can_be_paid_at_the_proxy(
+    client: httpx.AsyncClient, seeded: Seed, stub_engine: StubEngine, upstream: Upstream
+) -> None:
+    quote = PaymentRequired.model_validate((await client.get("/v1/quote/weather")).json())
+    headers = {HEADER_PAYMENT_SIGNATURE: make_signature_header("cd" * 32, quote.nonce)}
+    assert (await client.get("/p/weather", headers=headers)).status_code == 200
+    assert stub_engine.calls == ["cd" * 32]
+    # a quote and a 402 challenge are interchangeable but each nonce settles once
+    assert (await client.get("/p/weather", headers=headers)).status_code == 409
+    assert (await fetch_challenge(client)).nonce != quote.nonce
 
 
 async def test_quote_unknown_slug_is_404(client: httpx.AsyncClient, seeded: Seed) -> None:

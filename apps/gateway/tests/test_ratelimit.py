@@ -1,6 +1,6 @@
 """Settings-driven rate limits, fail-closed/open behaviour, unpaid /p/* limiting, and Redis outages."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -14,24 +14,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import get_settings
 from app.models import Settlement
 from app.proxy import lock_key
-from app.schemas import HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_SIGNATURE, X402ErrorBody
-from tests.conftest import MERCHANT_ADDRESS, Seed, StubEngine, Upstream, make_asgi_client, make_signature_header
+from app.schemas import HEADER_PAYMENT_REQUIRED, X402ErrorBody
+from tests.conftest import (
+    MERCHANT_ADDRESS,
+    Seed,
+    SettingsOverride,
+    StubEngine,
+    Upstream,
+    get_challenge,
+    make_asgi_client,
+    paid_headers,
+    proof_fields,
+)
 
 TX = "cd" * 32
-
-SettingsOverride = Callable[..., None]
-
-
-@pytest.fixture
-def override_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[SettingsOverride]:
-    def apply(**values: object) -> None:
-        for name, value in values.items():
-            monkeypatch.setenv(name.upper(), str(value))
-        get_settings.cache_clear()
-
-    yield apply
-    monkeypatch.undo()
-    get_settings.cache_clear()
 
 
 class DownPipeline:
@@ -67,11 +63,17 @@ class DownRedis:
         return fail
 
 
-class ForbiddenRedis:
-    """Fails the test if anything touches Redis."""
+class LimiterDownRedis:
+    """Redis that works for everything except the rate limiter's MULTI/EXEC pipeline."""
+
+    def __init__(self, healthy: Any) -> None:
+        self._healthy = healthy
+
+    def pipeline(self, *args: Any, **kwargs: Any) -> DownPipeline:
+        return DownPipeline()
 
     def __getattr__(self, name: str) -> Any:
-        raise AssertionError(f"Redis was touched: {name}")
+        return getattr(self._healthy, name)
 
 
 def new_address(index: int) -> str:
@@ -79,8 +81,12 @@ def new_address(index: int) -> str:
 
 
 async def register(client: httpx.AsyncClient, index: int) -> int:
-    response = await client.post("/v1/merchants", json={"kaspa_address": new_address(index), "display_name": "x"})
-    return response.status_code
+    """Register through the wallet-proof flow and return the status of the final POST /v1/merchants."""
+    key = PrivateKey(f"{index:02x}" * 32)
+    address = new_address(index)
+    challenge = await get_challenge(client, address, "register")
+    body = {"kaspa_address": address, "display_name": "x", **proof_fields(challenge.challenge, key)}
+    return (await client.post("/v1/merchants", json=body)).status_code
 
 
 # ---------------------------------------------------------------- limits come from settings
@@ -89,7 +95,10 @@ async def register(client: httpx.AsyncClient, index: int) -> int:
 async def test_v1_429_keeps_the_detail_body(client: httpx.AsyncClient, override_settings: SettingsOverride) -> None:
     override_settings(rl_merchant_create_per_hour=1)
     assert await register(client, 1) == 201
-    blocked = await client.post("/v1/merchants", json={"kaspa_address": new_address(2), "display_name": "x"})
+    key = PrivateKey(f"{2:02x}" * 32)
+    challenge = await get_challenge(client, new_address(2), "register")
+    body = {"kaspa_address": new_address(2), "display_name": "x", **proof_fields(challenge.challenge, key)}
+    blocked = await client.post("/v1/merchants", json=body)
     assert blocked.status_code == 429
     assert blocked.json() == {"detail": "rate limit exceeded; retry later"}
     assert int(blocked.headers["retry-after"]) > 0
@@ -166,15 +175,27 @@ async def test_unknown_slugs_also_count_as_unpaid(
 async def test_paid_requests_are_never_limited(
     client: httpx.AsyncClient, seeded: Seed, stub_engine: StubEngine, redis: Any, override_settings: SettingsOverride
 ) -> None:
+    all_headers = [await paid_headers(client, f"{i:064x}") for i in range(1, 6)]  # 5 unpaid hits at the default limit
     override_settings(rl_unpaid_proxy_per_minute=1)
-    for i in range(1, 6):
-        response = await client.get(
-            "/p/weather", headers={HEADER_PAYMENT_SIGNATURE: make_signature_header(f"{i:064x}")}
-        )
-        assert response.status_code == 200
-    assert await redis.get("kasgate:rl:proxy_unpaid:ip:127.0.0.1") is None
-    assert (await client.get("/p/weather")).status_code == 402
+    hits_before = await redis.get("kasgate:rl:proxy_unpaid:ip:127.0.0.1")
+    for headers in all_headers:
+        assert (await client.get("/p/weather", headers=headers)).status_code == 200
+    assert await redis.get("kasgate:rl:proxy_unpaid:ip:127.0.0.1") == hits_before == "5"
     assert (await client.get("/p/weather")).status_code == 429
+
+
+async def test_new_challenges_after_a_bad_or_expired_payment_count_as_unpaid(
+    client: httpx.AsyncClient, seeded: Seed, redis: Any, override_settings: SettingsOverride
+) -> None:
+    override_settings(rl_unpaid_proxy_per_minute=2)
+    headers = await paid_headers(client)  # hit 1
+    await redis.delete(*await redis.keys("kasgate:nonce:*"))
+    expired = await client.get("/p/weather", headers=headers)  # hit 2: payment_expired mints a fresh challenge
+    assert expired.status_code == 402 and expired.json()["error"] == "payment_expired"
+    limited = await client.get("/p/weather", headers=headers)  # hit 3
+    assert limited.status_code == 429
+    assert limited.json()["error"] == "rate_limited"
+    assert int(limited.headers["retry-after"]) > 0
 
 
 async def test_directory_is_not_limited(
@@ -182,14 +203,21 @@ async def test_directory_is_not_limited(
 ) -> None:
     override_settings(rl_unpaid_proxy_per_minute=1, rl_merchant_create_per_hour=1, rl_auth_challenge_per_minute=1)
     assert [(await client.get("/v1/directory")).status_code for _ in range(15)] == [200] * 15
-    assert [(await client.get("/v1/quote/weather")).status_code for _ in range(5)] == [200] * 5
 
 
 # ---------------------------------------------------------------- disabled
 
 
-async def test_disabled_limiter_never_limits_and_never_touches_redis(
-    client: httpx.AsyncClient, app: FastAPI, seeded: Seed, override_settings: SettingsOverride
+async def test_quotes_share_the_unpaid_bucket_because_they_mint_a_challenge(
+    client: httpx.AsyncClient, seeded: Seed, override_settings: SettingsOverride
+) -> None:
+    override_settings(rl_unpaid_proxy_per_minute=2)
+    assert [(await client.get("/v1/quote/weather")).status_code for _ in range(3)] == [200, 200, 429]
+    assert (await client.get("/p/weather")).status_code == 429
+
+
+async def test_disabled_limiter_never_limits_and_never_touches_the_limiter_keys(
+    client: httpx.AsyncClient, seeded: Seed, redis: Any, override_settings: SettingsOverride
 ) -> None:
     override_settings(
         rate_limit_enabled="false",
@@ -198,7 +226,6 @@ async def test_disabled_limiter_never_limits_and_never_touches_redis(
         rl_auth_verify_per_minute=1,
         rl_unpaid_proxy_per_minute=1,
     )
-    app.state.redis = ForbiddenRedis()
     assert [await register(client, i) for i in range(6, 10)] == [201] * 4
     body = {
         "kaspa_address": MERCHANT_ADDRESS,
@@ -208,6 +235,8 @@ async def test_disabled_limiter_never_limits_and_never_touches_redis(
     }
     assert [(await client.post("/v1/auth/verify", json=body)).status_code for _ in range(4)] == [401] * 4
     assert [(await client.get("/p/ghost")).status_code for _ in range(5)] == [404] * 5
+    assert [(await client.get("/p/weather")).status_code for _ in range(5)] == [402] * 5
+    assert await redis.keys("kasgate:rl:*") == []
 
 
 # ---------------------------------------------------------------- Redis outage
@@ -245,15 +274,24 @@ async def test_fail_closed_returns_503_when_redis_is_down(
         assert response.json() == {"detail": "service temporarily unavailable"}
 
 
-async def test_fail_open_passes_when_redis_is_down(
-    client: httpx.AsyncClient, app: FastAPI, seeded: Seed, override_settings: SettingsOverride
+async def test_fail_open_passes_when_the_limiter_is_down(
+    client: httpx.AsyncClient, app: FastAPI, seeded: Seed, redis: Any, override_settings: SettingsOverride
 ) -> None:
     override_settings(rate_limit_fail_closed="false")
-    app.state.redis = DownRedis()
+    app.state.redis = LimiterDownRedis(redis)
     assert await register(client, 31) == 201
     unpaid = await client.get("/p/weather")
     assert unpaid.status_code == 402
     assert HEADER_PAYMENT_REQUIRED in unpaid.headers
+
+
+async def test_fail_closed_blocks_when_only_the_limiter_is_down(
+    client: httpx.AsyncClient, app: FastAPI, seeded: Seed, redis: Any
+) -> None:
+    app.state.redis = LimiterDownRedis(redis)
+    unpaid = await client.get("/p/weather")
+    assert unpaid.status_code == 503
+    assert X402ErrorBody.model_validate(unpaid.json()).error == "service_unavailable"
 
 
 async def test_paid_proxy_request_is_503_not_500_when_redis_is_down(
@@ -265,10 +303,11 @@ async def test_paid_proxy_request_is_503_not_500_when_redis_is_down(
     sessionmaker: async_sessionmaker[AsyncSession],
     override_settings: SettingsOverride,
 ) -> None:
+    headers = await paid_headers(client, TX)
     for fail_closed in ("true", "false"):
         override_settings(rate_limit_fail_closed=fail_closed)
         app.state.redis = DownRedis()
-        response = await client.get("/p/weather", headers={HEADER_PAYMENT_SIGNATURE: make_signature_header(TX)})
+        response = await client.get("/p/weather", headers=headers)
         assert response.status_code == 503
         assert response.json()["error"] == "service_unavailable"
         assert response.headers["retry-after"] == "5"
@@ -283,8 +322,8 @@ async def test_lock_is_not_counted_as_taken_after_a_redis_outage(
     client: httpx.AsyncClient, app: FastAPI, seeded: Seed, stub_engine: StubEngine, redis: Any
 ) -> None:
     healthy = app.state.redis
+    header = await paid_headers(client, TX)
     app.state.redis = DownRedis()
-    header = {HEADER_PAYMENT_SIGNATURE: make_signature_header(TX)}
     assert (await client.get("/p/weather", headers=header)).status_code == 503
     app.state.redis = healthy
     assert await redis.get(lock_key(TX)) is None
