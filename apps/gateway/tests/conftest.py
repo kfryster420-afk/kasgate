@@ -161,16 +161,19 @@ async def clean_database(request: pytest.FixtureRequest) -> AsyncIterator[None]:
 
 
 class StubEngine:
-    """Stands in for `KaspaEngine`: `verify` is the pure pre-lock check, `verify_and_submit` the node round trip."""
+    """Stands in for `KaspaEngine`: pure `verify`, then the node-facing `resolve_inputs` and `settle`."""
 
     def __init__(self) -> None:
-        self.calls: list[str] = []
+        self.calls: list[str] = []  # txIds that reached `settle`, i.e. the on-chain submission
         self.verify_calls: list[str] = []
+        self.resolve_calls: list[str] = []
         self.events: list[str] = []
-        self.error: Exception | None = None
+        self.error: Exception | None = None  # raised by `settle`
+        self.resolve_error: Exception | None = None
         self.verify_error: Exception | None = None
         self.delay: float = 0.0
         self.on_verify: Callable[[PaymentSignature], None] | None = None
+        self.before_resolve: Callable[[PaymentSignature], Awaitable[None]] | None = None
         self.before_submit: Callable[[PaymentSignature], Awaitable[None]] | None = None
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
@@ -182,29 +185,44 @@ class StubEngine:
             fee_sompi=required.fee_amount_sompi,
         )
 
-    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPayment, object]:
+    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPayment, Any]:
         self.verify_calls.append(signature.txId)
         self.events.append("verify")
         if self.on_verify is not None:
             self.on_verify(signature)
         if self.verify_error is not None:
             raise self.verify_error
-        return self._verified(signature, required), object()
+        return self._verified(signature, required), signature
 
-    async def verify_and_submit(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
+    async def resolve_inputs(self, signature: PaymentSignature, tx: Any) -> object:
+        assert tx is signature  # the proxy hands back exactly what `verify` returned
+        self.resolve_calls.append(signature.txId)
+        self.events.append("resolve_inputs")
+        if self.before_resolve is not None:
+            await self.before_resolve(signature)
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        return object()
+
+    async def settle(self, tx: Any, verified: VerifiedPayment, required: PaymentRequired) -> VerifiedPayment:
+        signature: PaymentSignature = tx
         self.calls.append(signature.txId)
-        self.events.append("submit")
+        self.events.append("settle")
         if self.before_submit is not None:
             await self.before_submit(signature)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
-        return self._verified(signature, required)
+        return verified
 
     def fail(self, code: str, message: str = "rejected") -> None:
-        """Make the node round trip (`verify_and_submit`) fail."""
+        """Make the submission step (`settle`) fail with a verification error."""
         self.error = PaymentVerificationError(code, message)
+
+    def fail_resolve(self, code: str, message: str = "rejected") -> None:
+        """Make `resolve_inputs` fail with a verification error."""
+        self.resolve_error = PaymentVerificationError(code, message)
 
     def fail_verify(self, code: str, message: str = "rejected") -> None:
         """Make the pure pre-lock `verify` fail."""

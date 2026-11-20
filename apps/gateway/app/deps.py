@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 from fastapi import Depends, Request
@@ -31,13 +31,17 @@ class VerifiedPaymentLike(Protocol):
 
 
 class PaymentVerifier(Protocol):
-    """Structural type of `app.kaspa_engine.KaspaEngine` as used by the proxy."""
+    """Structural type of `app.kaspa_engine.KaspaEngine` as used by the proxy.
 
-    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPaymentLike, object]: ...
+    `verify` is pure; `resolve_inputs` and `settle` talk to the node. `tx` is the engine's own parsed transaction,
+    handed back to it untouched.
+    """
 
-    async def verify_and_submit(
-        self, signature: PaymentSignature, required: PaymentRequired
-    ) -> VerifiedPaymentLike: ...
+    def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPaymentLike, Any]: ...
+
+    async def resolve_inputs(self, signature: PaymentSignature, tx: Any) -> object: ...
+
+    async def settle(self, tx: Any, verified: Any, required: PaymentRequired) -> VerifiedPaymentLike: ...
 
 
 class RateProvider(Protocol):

@@ -10,10 +10,11 @@ Request lifecycle (CONTRACT v2)
 5. Load `required` FROM the stored nonce, never recompute it. A missing or expired nonce -> 402 `payment_expired` with a
    fresh `PAYMENT-REQUIRED`. A settlement that already exists for the txId may be re-delivered (see below) or is 409.
 6. `engine.verify()` (pure, network-free) runs BEFORE any lock, so garbage never touches the replay locks.
-7. Take the Redis replay lock `SET kasgate:tx:{txId} NX EX 600` BEFORE `engine.verify_and_submit` and before anything is
-   forwarded. A held lock -> 409 `payment_replayed`. ONLY a verification failure releases it; success keeps it.
-8. `engine.verify_and_submit`, then INSERT the SETTLED settlement (unique `tx_id` and `payment_nonce`; an IntegrityError
-   is 409), then consume the nonce (GETDEL), then forward upstream.
+7. Take the Redis replay lock `SET kasgate:tx:{txId} NX EX 600` BEFORE `engine.resolve_inputs` / `engine.settle` and
+   before anything is forwarded. A held lock -> 409 `payment_replayed`. ONLY a verification failure releases it;
+   success keeps it.
+8. `engine.resolve_inputs` then `engine.settle` (submit + finality), then INSERT the SETTLED settlement (unique `tx_id`
+   and `payment_nonce`; an IntegrityError is 409), then consume the nonce (GETDEL), then forward upstream.
 9. Return the upstream response with `PAYMENT-RESPONSE` (or 502 `upstream_error`, still with `PAYMENT-RESPONSE`).
 
 Redelivery: the same txId + nonce + slug (and the same payer, method and path) whose settlement has no upstream
@@ -790,15 +791,15 @@ async def paywalled_proxy(
 
     # Pure checks first: a malformed or mispaying transaction never reaches a lock or the node.
     try:
-        engine.verify(signature, required)
+        pre_verified, tx = engine.verify(signature, required)
     except PaymentVerificationError as exc:
         return _verification_failure(exc, required)
     except Exception:
         logger.exception("unexpected failure while checking tx %s", tx_id)
         return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
 
-    # The replay lock is taken BEFORE verify_and_submit and before anything is forwarded; the nonce claim
-    # first, so a refused tx lock never has to release a lock that belongs to another request.
+    # The replay lock is taken BEFORE anything that talks to the node (resolve_inputs, settle) and before anything
+    # is forwarded. The nonce claim comes first, so a refused tx lock never releases a lock owned by another request.
     tx_locked = False
     try:
         if await redis.set(nonce_lock_key(nonce), tx_id, nx=True, ex=REPLAY_LOCK_TTL_SECONDS):
@@ -811,8 +812,10 @@ async def paywalled_proxy(
     if not tx_locked:
         return _error(409, "payment_replayed", "this transaction or payment nonce is already being processed")
 
+    # Only a failure in here releases the locks; success keeps them for the rest of their TTL.
     try:
-        verified = await engine.verify_and_submit(signature, required)
+        await engine.resolve_inputs(signature, tx)
+        verified = await engine.settle(tx, pre_verified, required)
     except PaymentVerificationError as exc:
         await _release_payment_locks(redis, tx_id, nonce)
         return _verification_failure(exc, required)

@@ -440,14 +440,23 @@ async def test_pure_verify_runs_before_any_lock_and_the_tx_lock_is_held_before_s
     def at_verify(signature: PaymentSignature) -> None:
         seen["events_at_verify"] = list(stub_engine.events)
 
+    async def at_resolve(signature: PaymentSignature) -> None:
+        seen["tx_lock_at_resolve"] = await redis.get(lock_key(signature.txId))
+        seen["nonce_lock_at_resolve"] = await redis.get(nonce_lock_key(signature.nonce))
+        seen["upstream_at_resolve"] = len(upstream.requests)
+
     stub_engine.before_submit = at_submit
+    stub_engine.before_resolve = at_resolve
     stub_engine.on_verify = at_verify
     headers = await pay(client)
     # Not yet locked when the pure verify runs: checked from the outside with a direct Redis read afterwards.
     assert await redis.keys("kasgate:tx:*") == []
     assert (await client.get("/p/weather", headers=headers)).status_code == 200
-    assert stub_engine.events == ["verify", "submit"]
+    assert stub_engine.events == ["verify", "resolve_inputs", "settle"]
     assert seen["events_at_verify"] == ["verify"]
+    assert seen["tx_lock_at_resolve"] == "1"  # even the node lookups run under the lock
+    assert seen["nonce_lock_at_resolve"] == TX
+    assert seen["upstream_at_resolve"] == 0
     assert seen["tx_lock"] == "1"
     assert 0 < seen["tx_lock_ttl"] <= REPLAY_LOCK_TTL_SECONDS
     assert seen["nonce_still_stored"] == 1  # the nonce is consumed only after the settlement is stored
@@ -701,6 +710,55 @@ async def test_verification_failure_is_402_releases_locks_and_keeps_the_nonce(
     assert retry.status_code == 200
     assert await redis.get(lock_key(TX)) is not None
     assert await redis.exists(nonce_key(nonce)) == 0
+
+
+@pytest.mark.parametrize("code", ["invalid_payment_header", "tx_rejected"])
+async def test_input_resolution_failure_is_402_releases_locks_and_never_settles(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    stub_engine: StubEngine,
+    upstream: Upstream,
+    redis: Any,
+    code: str,
+) -> None:
+    stub_engine.fail_resolve(code, "inputs do not match the node")
+    headers = await pay(client)
+    response = await client.get("/p/weather", headers=headers)
+    assert response.status_code == 402
+    assert response.json()["error"] == code
+    assert PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED]).nonce == nonce_of(headers)
+    assert stub_engine.calls == []  # settle (the on-chain submission) was never reached
+    assert stub_engine.events == ["verify", "resolve_inputs"]
+    assert await redis.get(lock_key(TX)) is None
+    assert await redis.get(nonce_lock_key(nonce_of(headers))) is None
+    assert await redis.exists(nonce_key(nonce_of(headers))) == 1
+    assert upstream.requests == []
+    stub_engine.resolve_error = None
+    assert (await client.get("/p/weather", headers=headers)).status_code == 200
+
+
+async def test_node_unavailable_during_input_resolution_is_503_and_releases_locks(
+    client: httpx.AsyncClient, seeded: Seed, stub_engine: StubEngine, redis: Any
+) -> None:
+    stub_engine.resolve_error = RpcUnavailableError("node down")
+    headers = await pay(client)
+    response = await client.get("/p/weather", headers=headers)
+    assert response.status_code == 503
+    assert response.json()["error"] == "rpc_unavailable"
+    assert stub_engine.calls == []
+    assert await redis.get(lock_key(TX)) is None
+    assert await redis.get(nonce_lock_key(nonce_of(headers))) is None
+    assert await redis.exists(nonce_key(nonce_of(headers))) == 1
+
+
+async def test_unexpected_input_resolution_crash_is_503_and_releases_lock(
+    client: httpx.AsyncClient, seeded: Seed, stub_engine: StubEngine, redis: Any
+) -> None:
+    stub_engine.resolve_error = RuntimeError("boom")
+    response = await client.get("/p/weather", headers=await pay(client))
+    assert response.status_code == 503
+    assert response.json()["error"] == "service_unavailable"
+    assert await redis.get(lock_key(TX)) is None
 
 
 async def test_unknown_engine_code_maps_to_tx_rejected(
