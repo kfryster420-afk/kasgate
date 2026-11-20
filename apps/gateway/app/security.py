@@ -347,8 +347,8 @@ class AuthChallengeData:
 
 
 def auth_domain() -> str:
-    """Host of PUBLIC_BASE_URL: the domain every signed challenge is bound to."""
-    return urlsplit(get_settings().public_base_url).hostname or "localhost"
+    """`urlsplit(PUBLIC_BASE_URL).netloc` lowercased: the domain every signed challenge is bound to."""
+    return urlsplit(get_settings().public_base_url).netloc.lower()
 
 
 def _build_auth_message(purpose: AuthPurpose, address: str, nonce: str, expires_at: datetime) -> str:

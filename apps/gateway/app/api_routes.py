@@ -126,12 +126,28 @@ async def _owned_endpoint(session: AsyncSession, merchant: Merchant, endpoint_id
 # ---------------------------------------------------------------- merchants
 
 
-async def _rotate_api_key(session: AsyncSession, merchant: Merchant) -> MerchantCreated:
+async def _issue_session(redis: Redis, merchant_id: uuid.UUID) -> tuple[str, datetime]:
+    try:
+        return await create_session(redis, merchant_id)
+    except RedisError as exc:
+        logger.exception("could not store session")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="sessions are temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
+async def _rotate_api_key(session: AsyncSession, redis: Redis, merchant: Merchant) -> MerchantCreated:
+    """Replace the API key (the old one stops working at once) and return it with a fresh `kgs_` session."""
     api_key = generate_api_key()
+    token, expires_at = await _issue_session(redis, merchant.id)
     merchant.api_key_hash = hash_api_key(api_key)
     await session.commit()
     await session.refresh(merchant)
-    return MerchantCreated(merchant=MerchantRead.model_validate(merchant), api_key=api_key)
+    return MerchantCreated(
+        merchant=MerchantRead.model_validate(merchant), api_key=api_key, session_token=token, expires_at=expires_at
+    )
 
 
 REGISTRATION_FAILED_DETAIL = "registration failed: invalid challenge or signature"
@@ -166,7 +182,11 @@ async def create_merchant(
     if email is not None and await session.scalar(select(Merchant.id).where(Merchant.email == email)) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a merchant with this email already exists")
     api_key = generate_api_key()
+    merchant_id = uuid.uuid4()
+    # The session goes in first: once the merchant row is committed the one-time api_key must reach the caller.
+    token, expires_at = await _issue_session(redis, merchant_id)
     merchant = Merchant(
+        id=merchant_id,
         kaspa_address=payload.kaspa_address,
         display_name=payload.display_name,
         email=email,
@@ -182,7 +202,9 @@ async def create_merchant(
             detail="a merchant with this Kaspa address or email already exists",
         ) from exc
     await session.refresh(merchant)
-    return MerchantCreated(merchant=MerchantRead.model_validate(merchant), api_key=api_key)
+    return MerchantCreated(
+        merchant=MerchantRead.model_validate(merchant), api_key=api_key, session_token=token, expires_at=expires_at
+    )
 
 
 @router.get("/merchants/me", response_model=MerchantRead, tags=["merchants"])
@@ -191,8 +213,10 @@ async def read_current_merchant(merchant: CurrentMerchant) -> MerchantRead:
 
 
 @router.post("/merchants/me/rotate-key", response_model=MerchantCreated, tags=["merchants"])
-async def rotate_key(merchant: CurrentMerchant, session: DbSession) -> MerchantCreated:
-    return await _rotate_api_key(session, merchant)
+async def rotate_key(
+    merchant: CurrentMerchant, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]
+) -> MerchantCreated:
+    return await _rotate_api_key(session, redis, merchant)
 
 
 # ---------------------------------------------------------------- wallet-signature login
