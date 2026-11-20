@@ -47,7 +47,7 @@ export function AnalyticsPanel({ range, reloadKey }: { range: DateRange; reloadK
             <Stat icon={<Activity className="h-4 w-4" />} label="Paid calls" primary={data.total_calls.toLocaleString("en-US")} />
             <Stat icon={<Coins className="h-4 w-4" />} label="Gross volume" primary={`${formatKas(data.gross_sompi)} KAS`} secondary={`${formatSompi(data.gross_sompi)} sompi`} />
             <Stat icon={<Wallet className="h-4 w-4" />} label="Your revenue" primary={`${formatKas(data.merchant_sompi)} KAS`} secondary={`${formatSompi(data.merchant_sompi)} sompi`} tone="text-kas-300" />
-            <Stat icon={<Receipt className="h-4 w-4" />} label="USD at settlement" primary={formatUsd(data.usd_value)} secondary={`platform fee ${formatKas(data.fee_sompi)} KAS`} />
+            <Stat icon={<Receipt className="h-4 w-4" />} label="Gross USD at settlement" primary={formatUsd(data.usd_value)} secondary={`of ${formatKas(data.gross_sompi)} KAS gross (your share ${formatKas(data.merchant_sompi)} KAS, fee ${formatKas(data.fee_sompi)} KAS)`} />
           </div>
 
           <div className="card p-4">
@@ -64,7 +64,7 @@ export function AnalyticsPanel({ range, reloadKey }: { range: DateRange; reloadK
                     <th className="th">Day (UTC)</th>
                     <th className="th text-right">Calls</th>
                     <th className="th text-right">Revenue KAS</th>
-                    <th className="th text-right">USD</th>
+                    <th className="th text-right" title="USD value of the gross payment at settlement time, not of your share only">Gross USD</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800/70">
@@ -97,7 +97,7 @@ export function AnalyticsPanel({ range, reloadKey }: { range: DateRange; reloadK
                     <th className="th">Endpoint</th>
                     <th className="th text-right">Calls</th>
                     <th className="th text-right">Revenue KAS</th>
-                    <th className="th text-right">USD</th>
+                    <th className="th text-right" title="USD value of the gross payment at settlement time, not of your share only">Gross USD</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800/70">
@@ -191,7 +191,7 @@ function RevenueChart({ daily }: { daily: DailyRevenue[] }) {
             <g key={d.day} onMouseEnter={() => setActive(i)} onMouseLeave={() => setActive(null)} onFocus={() => setActive(i)} onBlur={() => setActive(null)} tabIndex={0}>
               <rect x={PAD.left + slot * i} y={PAD.top} width={slot} height={innerH} fill="transparent" />
               <rect x={x} y={y} width={barW} height={Math.max(h, 1)} rx={2} fill={active === i ? "#70e6cf" : "#49eacb"} opacity={active === null || active === i ? 1 : 0.55}>
-                <title>{`${d.day}: ${formatKas(d.merchant_sompi)} KAS (${formatSompi(d.merchant_sompi)} sompi) · ${formatUsd(d.usd_value)} · ${d.call_count} calls`}</title>
+                <title>{`${d.day}: ${formatKas(d.merchant_sompi)} KAS (${formatSompi(d.merchant_sompi)} sompi) · gross ${formatUsd(d.usd_value)} · ${d.call_count} calls`}</title>
               </rect>
               {i % labelEvery === 0 ? (
                 <text x={x + barW / 2} y={H - 8} textAnchor="middle" fontSize={10} fill="#71717a" fontFamily="ui-monospace, monospace">
