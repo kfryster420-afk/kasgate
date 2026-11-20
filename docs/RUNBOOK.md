@@ -384,7 +384,7 @@ For the live tiers, start the stack with **`RATE_LIMIT_ENABLED=false`** in `infr
 | Variable | Meaning |
 | --- | --- |
 | `KASGATE_GATEWAY_URL` | Gateway base URL. Default `http://localhost:8000`. |
-| `KASGATE_TEST_PAYER_KEY_FILE` | File with the funded payer's hex key. Default `/workspace/kg-secrets/buyer.key` (a path from the original dev box): **always set it explicitly**. The key is masked and never printed. |
+| `KASGATE_TEST_PAYER_KEY_FILE` | File with the funded payer's hex key. There is no default: set it explicitly (or use `KASGATE_TEST_PAYER_KEY`), otherwise the funded tests skip. The key is masked and never printed. |
 | `KASGATE_TEST_PAYER_KEY` | The same key inline; wins over the file. Without either, funded tests skip. |
 | `KASGATE_TEST_RPC_URL` | wRPC URL the test client uses for UTXO lookups. Default: public Resolver. |
 | `KASGATE_TEST_UPSTREAM_URL` | Public upstream the gateway proxies to. Default `https://httpbin.org/anything`. |
@@ -566,7 +566,7 @@ Offline suites on the commit this runbook was written against:
 | --- | --- |
 | Gateway (`apps/gateway`, `pytest -q`) | 430 passed; `ruff check .` clean; `mypy --strict app` clean |
 | Buyer SDK (`packages/buyer-sdk`) | 210 passed |
-| MCP server (`packages/mcp-server`) | 38 passed |
-| Integration, offline tier (`tests/integration`, no gateway running) | 207 passed, 113 skipped (live tests), 3 deselected |
+| MCP server (`packages/mcp-server`) | 83 passed |
+| Integration, offline tier (`tests/integration`, no gateway running) | 210 passed, 113 skipped (live tests), 3 deselected |
 
 Verified on Nov 20, 2026 (UTC+7): a merchant registration and a login signed by the real KasWare 0.11.6 Chrome extension on Testnet 10 (address kaspatest:qr347rhlq8u5qdx9m2yyvx9c242t44f2qwwtujtej38ufk6w9pdusnkmycha3), both accepted by the gateway. The mainnet switch ([section 7](#7-production-checklist)) has not been exercised.

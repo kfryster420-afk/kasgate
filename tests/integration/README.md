@@ -59,7 +59,7 @@ Inputs follow CONTRACT v2.3: change must be 0 or >= 0.3 KAS, and a payment may d
 
 ## Running against a local gateway without a node
 
-`/workspace/localgw/run.py` (not part of the repo) starts the gateway on embedded Postgres + fakeredis with the Kaspa
+A local launcher (not part of this repository) can start the gateway on embedded Postgres + fakeredis with the Kaspa
 engine stubbed out. It reports `kaspa_rpc=false`: catalog, auth, nonce and tampering tests run, the funded ones skip.
 
 ## Rate-limit (429) tests
