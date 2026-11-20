@@ -60,6 +60,17 @@ settings. Real mainnet and testnet-10 IBD depends on peers and the size of the p
 hours. The node is ready when `get_server_info` returns `isSynced: true` (see below). An open RPC port alone
 doesn't mean the node is synced.
 
+#### Finding: testnet-10 sync on the shared dev box (2026-11-20)
+
+We tried a native kaspad v2.1.0 testnet-10 sync (`--utxoindex`) on the shared dev box (8 vCPU, 15 GB RAM, no swap).
+The header stage (about 1.32M headers) took about 22–24 min both times. The UTXO-set download then never finished.
+Run 1 had received more than 187M UTXOs after about 16 min when a box reboot killed it and corrupted the database.
+Run 3 restarted the UTXO-set download four times, because periodic network stalls dropped every peer at once
+(`timeout expired after 120s`), and each restart begins again from zero. Peak use was about 5.1 GB RSS and 11.7 GB
+of disk. The UTXO-set stage needs a stable, uninterrupted connection for well over 16 min, and a clean shutdown on
+reboot, so run the node on a VPS with the `kasgate-kaspad.service` systemd unit from `provision.sh`, not on a
+shared or ephemeral machine.
+
 ## Firewall
 
 Open only SSH and the P2P port for the chosen network: TCP 16111 on mainnet, TCP 16211 on testnet-10.
