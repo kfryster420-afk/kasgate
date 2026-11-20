@@ -132,7 +132,7 @@ function MerchantStep({ onDone }: { onDone: (created: MerchantKeyIssued) => void
       <Field
         label="Kaspa payout address"
         htmlFor="kaspa-address"
-        error={touched && !addressCheck.ok ? addressCheck.error : null}
+        error={touched && address.trim() !== "" && !addressCheck.ok ? addressCheck.error : null}
         hint={`Must start with "${ADDRESS_PREFIX}" on ${NETWORK_LABEL}. Payments land here directly on-chain; you will sign a message to prove you own it.`}
       >
         <input id="kaspa-address" className="input font-mono" value={address} onChange={(e) => setAddress(e.target.value)} placeholder={`${ADDRESS_PREFIX}q…`} autoComplete="off" spellCheck={false} />
