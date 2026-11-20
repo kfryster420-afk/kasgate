@@ -27,7 +27,7 @@ Network prefixes: kaspa:testnet-10 -> "kaspatest:", kaspa:mainnet -> "kaspa:".
 
 ## Fee split (schemas.compute_fee_split)
 fee = max(ceil(total * 150 / 10_000), MIN_OUTPUT_SOMPI); merchant = total - fee, must be >= MIN_OUTPUT_SOMPI.
-Minimum endpoint price = 2 * MIN_OUTPUT_SOMPI = 40000000 sompi (0.4 KAS) at the default floor — schemas.min_price_sompi(). Flat 0.2 KAS fee up to 1333333333 sompi, 1.5% (ceil) above.
+Minimum endpoint price = 3 * MIN_OUTPUT_SOMPI = 60000000 sompi (0.6 KAS) at the default floor (merchant output >= 2*floor, see v2.3) — schemas.min_price_sompi(). Flat 0.2 KAS fee up to 1333333333 sompi, 1.5% (ceil) above.
 On-chain: outputs[0] = merchant (payTo) EXACT merchant amount, outputs[1] = treasury (feeTo) EXACT fee.
 outputs[2+] allowed only as change. Generator/create_transaction keep payment outputs first.
 
@@ -139,7 +139,7 @@ Error codes: + payment_expired (402).
 
 ## CONTRACT v2.1 — fee floor (Kyle approved 2026-11-20)
 - Treasury fee = max(ceil(total*150/10000), MIN_OUTPUT_SOMPI). Merchant = total - fee, must be >= MIN_OUTPUT_SOMPI.
-- min_price_sompi(floor) = 2*floor = 40_000_000 sompi (0.4 KAS) at the default 20_000_000 floor. Replaces 1_333_333_267 everywhere.
+- ~~min price 0.4 KAS~~ SUPERSEDED by v2.3: min_price_sompi(floor) = 3*floor = 60_000_000 sompi (0.6 KAS).
 - Below 1_333_333_334 sompi the fee is the flat floor (0.2 KAS); above that it is 1.5% (ceil).
 - Engine: exact-value checks against PaymentRequired still apply; the ">= 1.5%" check stays valid because fee >= 1.5% always.
 - Clients (web lib/sompi.ts, buyer SDK) must replicate: fee = max(ceil(amount*150/10000), min_output_sompi) using DirectoryManifest.min_output_sompi.
@@ -157,3 +157,13 @@ Error codes: + payment_expired (402).
 - Verified with kaspa.calculate_storage_mass: at >= 0.6 KAS a single-input payment with change >= ~0.3 KAS stays <= 100_000.
 - Buyer SDK MUST select inputs so change is 0 or >= 30_000_000 sompi (add another UTXO when needed); never emit small change.
 - Payments drawing from more than 16 payer addresses' UTXOs are rejected (invalid_payment_header).
+
+## CONTRACT v2.4 — answers to 03 (2026-11-20)
+- /v1/quote issues a stored, payable nonce and counts against the unpaid per-IP limit. Every /p response that mints a challenge counts as an unpaid hit.
+- kasgate:noncelock:{nonce} NX EX 600 is part of the contract (taken before kasgate:tx:{txId}); the unique payment_nonce index is the backstop.
+- Slug mismatch on a paid retry -> 402 invalid_payment_header + fresh challenge (no new code).
+- Redelivery: not re-verified on-chain (the Settlement row is the proof); bound to payer, method, path. Query string and body are not bound in the MVP.
+- Sessions: Redis set kasgate:sessions:{merchant_id} indexes the merchant's session hashes. DELETE /v1/auth/session [Bearer kgs_] logs out the current session.
+  rotate-key revokes ALL sessions of that merchant, then issues the new one returned in MerchantCreated.
+- Challenge Domain includes :port when PUBLIC_BASE_URL has one (exact netloc.lower()).
+- Registration/login require Redis regardless of RATE_LIMIT_ENABLED.
