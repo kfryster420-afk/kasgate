@@ -181,3 +181,8 @@ Error codes: + payment_expired (402).
 - Verified with kaspa==2.1.0: PublicKey(xonly).to_address() round-trips and verify_message accepts sign_message output.
 - Payers MUST spend P2PK Schnorr UTXOs (kaspa:q... addresses); script-hash (P2SH) and ECDSA payers are refused with invalid_payment_header.
 - The proof binds nonce and txId (not method/path); the nonce itself is already bound to the endpoint that issued it.
+
+## Notes from the funded tn10 run (05, 7b5dc28)
+- Node RPC UTXO entries return scriptPublicKey as a hex string "<u16 BE version><script>" (e.g. "0000"+"20<xonly>ac"), not only the dict form; parsers MUST accept both.
+- A paid call whose upstream fails (5xx/connection error) is NOT refunded on-chain; buyers retry with the same PAYMENT-SIGNATURE within redelivery_window_seconds (max redelivery_max_attempts).
+- Test/dev hosts with synthetic DNS (every name -> 198.18.0.1) are correctly blocked by the SSRF guard; use an IP-literal public upstream such as https://1.1.1.1/cdn-cgi/trace for funded tests.
