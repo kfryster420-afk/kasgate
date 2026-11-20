@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     kaspa_network: KaspaNetwork = "kaspa:testnet-10"
     kaspa_rpc_url: str | None = None
-    kaspa_connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    kaspa_connect_timeout_seconds: float = Field(default=6.0, gt=0, le=120)
     kaspa_rpc_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     kasgate_treasury_address: str
     min_output_sompi: int = Field(default=DEFAULT_MIN_OUTPUT_SOMPI, ge=1)
