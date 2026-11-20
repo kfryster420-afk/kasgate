@@ -39,9 +39,12 @@ export function computeFeeSplit(total: bigint, minOutput: bigint): BigFeeSplit {
   return { total, merchant: total - fee, fee };
 }
 
-/** Mirrors schemas.min_price_sompi: 2 * F (fee = F and merchant = F). 40,000,000 sompi when F = 20,000,000. */
+/**
+ * Mirrors schemas.min_price_sompi (CONTRACT v2.3): 3 * F. The treasury fee is the flat floor F and the merchant output
+ * must be at least 2 * F, which leaves storage-mass room for a change output. 60,000,000 sompi when F = 20,000,000.
+ */
 export function minPriceSompi(minOutput: bigint): bigint {
-  return 2n * minOutput;
+  return 3n * minOutput;
 }
 
 /** True when the treasury fee is the flat floor F, i.e. ceil(price * 150 / 10_000) <= F. */
@@ -54,9 +57,14 @@ export function flatFeeMaxPriceSompi(minOutput: bigint): bigint {
   return (minOutput * BPS_DENOMINATOR) / PLATFORM_FEE_BPS;
 }
 
-/** Valid iff the merchant output clears the KIP-9 floor (the fee output is always >= F by construction). */
+/** Valid iff the merchant output is at least 2 * F (the fee output is always >= F by construction); equals price >= 3 * F. */
 export function meetsOutputFloor(total: bigint, minOutput: bigint): boolean {
-  return total - feeSompi(total, minOutput) >= minOutput;
+  return total - feeSompi(total, minOutput) >= 2n * minOutput;
+}
+
+/** User-facing reason for the minimum price, formatted from F (never hardcoded). */
+export function minPriceReason(minOutput: bigint): string {
+  return `the treasury output must be at least ${formatKas(minOutput)} KAS and the merchant output at least ${formatKas(2n * minOutput)} KAS, which leaves room for change under the storage-mass limit`;
 }
 
 /** Share of `part` in `total` as hundredths of a percent, rounded half up (e.g. 150 = 1.50%). */

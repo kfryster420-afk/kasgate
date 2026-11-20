@@ -1,5 +1,5 @@
 import { ADDRESS_PREFIX, MAX_SOMPI } from "./config";
-import { formatKas, formatSompi, meetsOutputFloor, minPriceSompi } from "./sompi";
+import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, minPriceSompi } from "./sompi";
 import { HTTP_METHODS, type HttpMethod } from "./types";
 
 /** Mirrors KASPA_ADDRESS_RE in schemas.py. */
@@ -129,8 +129,8 @@ export function checkUpstreamHeaders(input: unknown): Check<Record<string, strin
 }
 
 /**
- * Validates a decimal-string sompi price (max 18 digits, SompiStr) against the minimum price 2 * F derived from the
- * gateway's min_output_sompi `minOutput`, so both the treasury and merchant outputs clear the KIP-9 floor.
+ * Validates a decimal-string sompi price (max 18 digits, SompiStr) against the minimum price 3 * F derived from the
+ * gateway's min_output_sompi `minOutput` (CONTRACT v2.3: merchant output >= 2 * F, fee output >= F).
  */
 export function checkPriceSompi(input: unknown, minOutput: bigint): Check<string> {
   if (typeof input !== "string" || !/^[1-9][0-9]{0,17}$/.test(input.trim())) return fail("Price must be a positive whole number of sompi (at most 18 digits)");
@@ -138,7 +138,7 @@ export function checkPriceSompi(input: unknown, minOutput: bigint): Check<string
   if (value > MAX_SOMPI) return fail("Price exceeds the maximum supported amount");
   const floorPrice = minPriceSompi(minOutput);
   if (value < floorPrice || !meetsOutputFloor(value, minOutput)) {
-    return fail(`Minimum price is ${formatSompi(floorPrice)} sompi (${formatKas(floorPrice)} KAS) so both outputs clear the KIP-9 floor`);
+    return fail(`Minimum price is ${formatSompi(floorPrice)} sompi (${formatKas(floorPrice)} KAS): ${minPriceReason(minOutput)}`);
   }
   return ok(value.toString());
 }

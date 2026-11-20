@@ -3,7 +3,7 @@
 import { Loader2 } from "lucide-react";
 import { useId, useMemo, useState, type FormEvent } from "react";
 import { ADDRESS_PREFIX } from "@/lib/config";
-import { formatKas, formatSompi, meetsOutputFloor, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
+import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
 import { HTTP_METHODS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod } from "@/lib/types";
 import { checkEndpointName, checkOptionalSlug, checkUpstreamUrl } from "@/lib/validation";
@@ -45,7 +45,7 @@ export function EndpointForm(props: Props) {
     if (!u.ok) out.url = u.error;
     if (sompi === null) out.price = "Enter a price in KAS, e.g. 6.67 (up to 8 decimals)";
     else if (pricing.status === "ready" && !meetsOutputFloor(sompi, pricing.minOutput))
-      out.price = `Minimum price is ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): both outputs must clear the KIP-9 floor`;
+      out.price = `Minimum price is ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}`;
     else if (pricing.status === "error") out.price = `Cannot verify the minimum price: ${pricing.message}`;
     else if (pricing.status === "loading") out.price = "Loading the minimum price from the gateway…";
     if (methods.length === 0) out.methods = "Select at least one method";
@@ -62,7 +62,7 @@ export function EndpointForm(props: Props) {
 
   const minPriceHint =
     pricing.status === "ready"
-      ? `Fixed price per call. Minimum ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): both outputs must be at least ${formatKas(pricing.minOutput)} KAS (KIP-9 floor).`
+      ? `Fixed price per call. Minimum ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}.`
       : "Fixed price per call, entered in KAS and stored as sompi. The minimum is read from the gateway.";
   const hasErrors = Object.keys(errors).length > 0;
   const show = (key: keyof typeof errors) => (touched ? (errors[key] ?? null) : null);
