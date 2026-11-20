@@ -179,3 +179,5 @@ Error codes: + payment_expired (402).
   pay_to_address_script(payerAddress), kaspa.verify_message(msg, payerProof, PublicKey(xonly_hex)) must be True, else invalid_payment_header.
   resolve_inputs() already requires at least one input to be spent from payerAddress's script, so an observer of the tx cannot claim it.
 - Verified with kaspa==2.1.0: PublicKey(xonly).to_address() round-trips and verify_message accepts sign_message output.
+- Payers MUST spend P2PK Schnorr UTXOs (kaspa:q... addresses); script-hash (P2SH) and ECDSA payers are refused with invalid_payment_header.
+- The proof binds nonce and txId (not method/path); the nonce itself is already bound to the endpoint that issued it.

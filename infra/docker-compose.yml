@@ -74,6 +74,50 @@ services:
     ports:
       - "3000:3000"
 
+  # Optional own Kaspa node (rusty-kaspa) for the gateway's wRPC Borsh connection. Off unless the `node` profile
+  # is enabled: docker compose --profile node up -d. Then set KASPA_RPC_URL=ws://kaspad:<KASPAD_RPC_BORSH_PORT>
+  # in .env. The RPC port is only reachable on the compose network; only the P2P port is published.
+  # Image: release build of kaspanet/rusty-kaspa v2.1.0 (source github.com/supertypo/docker-rusty-kaspa),
+  # pinned by its multi-arch index digest. Sizing, firewall and upgrades: infra/node/README.md.
+  kaspad:
+    image: kaspanet/rusty-kaspad:v2.1.0@sha256:f85da74b9514584451f83a2cbea3aa93f700248302fe7e3e0ab17288f93c905b
+    profiles: ["node"]
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      # kaspad reads its network from the environment: true = testnet-10 (netsuffix 10), false = mainnet.
+      KASPAD_TESTNET: ${KASPAD_TESTNET:-true}
+      KASPAD_NETSUFFIX: "10"
+      KASPAD_RAM_SCALE: ${KASPAD_RAM_SCALE:-1.0}
+    command:
+      - kaspad
+      - --yes
+      - --nologfiles
+      - --disable-upnp
+      - --utxoindex
+      - --appdir=/app/data
+      - --listen=0.0.0.0:${KASPAD_P2P_PORT:-16211}
+      - --rpclisten-borsh=0.0.0.0:${KASPAD_RPC_BORSH_PORT:-17210}
+    volumes:
+      - kaspad-data:/app/data
+    expose:
+      - "${KASPAD_RPC_BORSH_PORT:-17210}"
+    ports:
+      - "${KASPAD_P2P_PORT:-16211}:${KASPAD_P2P_PORT:-16211}/tcp"
+    healthcheck:
+      # busybox nc ships in the image; open Borsh port = RPC up (not necessarily synced: check isSynced via RPC).
+      test: ["CMD-SHELL", "nc -z -w 3 127.0.0.1 ${KASPAD_RPC_BORSH_PORT:-17210}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
 volumes:
   pgdata:
   redisdata:
+  kaspad-data:
