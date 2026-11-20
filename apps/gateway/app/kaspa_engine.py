@@ -113,6 +113,7 @@ DEFAULT_BACKOFF_INITIAL_SECONDS: Final[float] = 1.0
 DEFAULT_BACKOFF_MAX_SECONDS: Final[float] = 30.0
 DEFAULT_ACCEPTANCE_POLL_SECONDS: Final[float] = 0.5
 HEALTH_POLL_SECONDS: Final[float] = 5.0
+CONNECT_ATTEMPTS: Final[int] = 3
 # CONTRACT v2.3: payments drawing from more than 16 payer addresses' UTXOs are rejected (invalid_payment_header).
 MAX_LOOKUP_ADDRESSES: Final[int] = 16
 
@@ -327,34 +328,44 @@ class KaspaEngine:
         return client is not None and bool(client.is_connected)
 
     async def _connect_once(self) -> RpcClientProtocol:
-        """Return a connected client, connecting under a lock so concurrent callers share one attempt."""
+        """Return a connected client, connecting under a lock so concurrent callers share one attempt.
+
+        The connect budget (``kaspa_connect_timeout_seconds``) is split over ``CONNECT_ATTEMPTS`` attempts, each
+        with a FRESH client after a failure: the public Resolver sometimes hands out a node that never answers
+        (seen live on testnet-10 for about half of the picks), and a new client re-resolves to another node.
+        """
         async with self._connect_lock:
             client = self._client
             if client is not None and client.is_connected:
                 return client
-            if client is None:
-                client = self._client_factory()
+            per_attempt = self._connect_timeout / CONNECT_ATTEMPTS
+            last_error = "Kaspa node connection could not be established"
+            for attempt in range(CONNECT_ATTEMPTS):
+                if client is None:
+                    client = self._client_factory()
                 self._client = client
-            try:
-                await asyncio.wait_for(
-                    client.connect(
-                        block_async_connect=True,
-                        strategy="retry",
-                        timeout_duration=int(self._connect_timeout * 1000),
-                    ),
-                    self._connect_timeout * 1.25,
-                )
-            except TimeoutError as exc:
+                try:
+                    await asyncio.wait_for(
+                        client.connect(
+                            block_async_connect=True,
+                            strategy="fallback",
+                            timeout_duration=max(1, int(per_attempt * 1000)),
+                        ),
+                        per_attempt * 1.25,
+                    )
+                except TimeoutError:
+                    last_error = "Kaspa node connection timed out"
+                except Exception as exc:
+                    last_error = f"Kaspa node connection failed: {exc}"
+                else:
+                    if client.is_connected:
+                        logger.info("connected to Kaspa node on %s", self._settings.kaspa_network)
+                        return client
+                    last_error = "Kaspa node connection could not be established"
+                logger.warning("Kaspa connect attempt %d/%d failed: %s", attempt + 1, CONNECT_ATTEMPTS, last_error)
                 self._client = None
-                raise RpcUnavailableError("Kaspa node connection timed out") from exc
-            except Exception as exc:
-                self._client = None
-                raise RpcUnavailableError(f"Kaspa node connection failed: {exc}") from exc
-            if not client.is_connected:
-                self._client = None
-                raise RpcUnavailableError("Kaspa node connection could not be established")
-            logger.info("connected to Kaspa node on %s", self._settings.kaspa_network)
-            return client
+                client = None
+            raise RpcUnavailableError(last_error)
 
     async def _supervise(self) -> None:
         delay = self._backoff_initial

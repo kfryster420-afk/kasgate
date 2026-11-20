@@ -30,6 +30,7 @@ os.environ.setdefault("KASPA_NETWORK", "kaspa:testnet-10")
 
 from app.config import BPS_DENOMINATOR, PLATFORM_FEE_BPS, SOMPI_PER_KAS, Settings, get_settings  # noqa: E402
 from app.kaspa_engine import (  # noqa: E402
+    CONNECT_ATTEMPTS,
     KaspaEngine,
     NodeInputs,
     PaymentVerificationError,
@@ -771,10 +772,34 @@ async def test_transport_error_reconnects_and_retries_once() -> None:
 async def test_connect_failure_raises_unavailable() -> None:
     required = build_required()
     tx = signed_transaction(standard_outputs(required))
-    engine, client = make_engine(FakeClient(connect_results=[ConnectionError("refused")]))
+    engine, client = make_engine(FakeClient(connect_results=[ConnectionError("refused")] * CONNECT_ATTEMPTS))
     error = await expect_error(engine, signature_for(tx), required, "rpc_unavailable")
     assert isinstance(error, RpcUnavailableError)
+    assert client.connect_calls == CONNECT_ATTEMPTS
     assert client.submitted == []
+
+
+async def test_connect_retries_with_a_fresh_client_after_a_dead_resolver_pick() -> None:
+    """Live testnet-10: about half of Resolver picks never answer; a new client re-resolves to another node."""
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    dead = FakeClient(connect_delay=5.0)
+    healthy = FakeClient()
+    clients = [dead, healthy]
+    created: list[FakeClient] = []
+
+    def factory() -> FakeClient:
+        created.append(clients[len(created)])
+        return created[-1]
+
+    engine = KaspaEngine(
+        get_settings(), client_factory=factory, connect_timeout_seconds=0.3, acceptance_poll_seconds=0.01
+    )
+    started = asyncio.get_running_loop().time()
+    assert (await engine.verify_and_submit(signature_for(tx), required)).tx_id == tx.id
+    assert asyncio.get_running_loop().time() - started < 0.3 * 1.25
+    assert created == [dead, healthy]
+    assert dead.submitted == [] and len(healthy.submitted) == 1
 
 
 async def test_connect_timeout_raises_unavailable() -> None:
@@ -808,12 +833,12 @@ async def test_start_connects_and_stop_disconnects() -> None:
 
 
 async def test_supervisor_reconnects_with_backoff_after_failed_start() -> None:
-    client = FakeClient(connect_results=[ConnectionError("down"), ConnectionError("down")])
+    client = FakeClient(connect_results=[ConnectionError("down")] * (2 * CONNECT_ATTEMPTS))
     engine, _ = make_engine(client)
     await engine.start()
     assert not engine.is_connected()
     await wait_until(engine.is_connected)
-    assert client.connect_calls == 3
+    assert client.connect_calls == 2 * CONNECT_ATTEMPTS + 1
     await engine.stop()
 
 
