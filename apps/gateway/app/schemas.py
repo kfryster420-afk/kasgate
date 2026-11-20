@@ -146,6 +146,11 @@ def normalise_signature(v: object) -> object:
     return raw.hex() if len(raw) == 64 else v
 
 
+def payer_proof_message(nonce: str, tx_id: str) -> str:
+    """Message the payer signs with the payerAddress key; binds the PAYMENT-SIGNATURE to its submitter."""
+    return f"{PAYMENT_PAYLOAD_PREFIX}{nonce}:{tx_id}"
+
+
 def new_payment_nonce() -> str:
     return secrets.token_hex(16)
 
@@ -262,6 +267,13 @@ class PaymentSignature(X402Header):
     rawTx: str = Field(min_length=2, max_length=MAX_RAW_TX_CHARS)
     payerAddress: str
     nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    payerProof: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+    """Schnorr sign_message(payer_proof_message(nonce, txId)) by payerAddress's key; stops mempool front-running."""
+
+    @field_validator("payerProof", mode="before")
+    @classmethod
+    def _proof(cls, v: object) -> object:
+        return normalise_signature(v)
 
     @field_validator("txId")
     @classmethod

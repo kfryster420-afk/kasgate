@@ -171,3 +171,11 @@ Error codes: + payment_expired (402).
 ## CONTRACT v2.5
 - Sompi int fields (e.g. EndpointCreate/Read.price_sompi) are capped at MAX_SOMPI = 999_999_999_999_999_999 (18 digits), same as SompiStr. 19 digits -> 422.
 - Representation is intentional: CRUD int fields (price_sompi) are JSON numbers, so clients must parse them big-int safe; x402 header amounts and SettlementRead/tax sompi fields stay strings.
+
+## CONTRACT v2.6 — payer proof (closes 05 GAP-1, mempool front-running)
+- PaymentSignature gains `payerProof`: 128-hex Schnorr kaspa.sign_message(schemas.payer_proof_message(nonce, txId), payer_private_key)
+  where payer_proof_message = "kasgate:v1:{nonce}:{txId}" (Base64 64/65-byte forms normalised to hex like auth signatures).
+- payerAddress must be a P2PK Schnorr address (script 0x20 <32-byte x-only pubkey> 0xac). Engine verify(): extract the x-only pubkey from
+  pay_to_address_script(payerAddress), kaspa.verify_message(msg, payerProof, PublicKey(xonly_hex)) must be True, else invalid_payment_header.
+  resolve_inputs() already requires at least one input to be spent from payerAddress's script, so an observer of the tx cannot claim it.
+- Verified with kaspa==2.1.0: PublicKey(xonly).to_address() round-trips and verify_message accepts sign_message output.
