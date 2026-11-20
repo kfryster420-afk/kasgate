@@ -40,7 +40,9 @@ from app.schemas import (
 from tests.conftest import (
     MERCHANT_ADDRESS,
     OTHER_ADDRESS,
+    OTHER_KEY,
     PAYER_ADDRESS,
+    PAYER_KEY,
     PRICE_SOMPI,
     TREASURY,
     UPSTREAM_SECRET,
@@ -50,7 +52,9 @@ from tests.conftest import (
     StubOracle,
     Upstream,
     fetch_challenge,
+    make_signature_header,
     paid_headers,
+    payer_proof,
     seed_endpoint,
 )
 
@@ -67,8 +71,8 @@ async def pay(client: httpx.AsyncClient, tx_id: str = TX, slug: str = "weather")
     return await paid_headers(client, tx_id, slug)
 
 
-def signature_header(tx_id: str, nonce: str, payer: str = PAYER_ADDRESS) -> str:
-    return PaymentSignature(txId=tx_id, rawTx="{}", payerAddress=payer, nonce=nonce).to_header()
+def signature_header(tx_id: str, nonce: str, payer_key: PrivateKey = PAYER_KEY, proof: str | None = None) -> str:
+    return make_signature_header(tx_id, nonce, payer_key=payer_key, proof=proof)
 
 
 def nonce_of(headers: dict[str, str]) -> str:
@@ -186,13 +190,67 @@ async def test_wrong_network_address_in_signature_is_402_wrong_network(
 ) -> None:
     mainnet_payer = PrivateKey("07" * 32).to_address("mainnet").to_string()
     header = base64.b64encode(
-        json.dumps({"txId": TX, "rawTx": "{}", "payerAddress": mainnet_payer, "nonce": "a" * 32}).encode()
+        json.dumps(
+            {
+                "txId": TX,
+                "rawTx": "{}",
+                "payerAddress": mainnet_payer,
+                "nonce": "a" * 32,
+                "payerProof": payer_proof("a" * 32, TX, PrivateKey("07" * 32)),
+            }
+        ).encode()
     ).decode()
     response = await client.get("/p/weather", headers={HEADER_PAYMENT_SIGNATURE: header})
     assert response.status_code == 402
     assert response.json()["error"] == "wrong_network"
     PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])
     assert stub_engine.calls == []
+
+
+async def test_wrong_payer_proof_is_402_invalid_payment_header_and_takes_no_locks(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    stub_engine: StubEngine,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    redis: Any,
+    upstream: Upstream,
+) -> None:
+    """CONTRACT v2.6: `engine.verify` rejects a proof the payer key did not sign; the proxy just relays that."""
+    required = await fetch_challenge(client)
+    wrong_proofs = {
+        "signed by another key": payer_proof(required.nonce, TX, OTHER_KEY),
+        "signed for another txId": payer_proof(required.nonce, "cd" * 32),
+        "signed for another nonce": payer_proof("b" * 32, TX),
+    }
+    for label, proof in wrong_proofs.items():
+        header = make_signature_header(TX, required.nonce, payer_key=PAYER_KEY, proof=proof)
+        response = await client.get("/p/weather", headers={HEADER_PAYMENT_SIGNATURE: header})
+        assert response.status_code == 402, label
+        assert response.json()["error"] == "invalid_payment_header", label
+        PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])  # a fresh challenge to retry with
+        assert await redis.keys("kasgate:tx:*") == [], label
+        assert await redis.keys("kasgate:noncelock:*") == [], label
+        assert await settlements(sessionmaker) == [], label
+        assert stub_engine.resolve_calls == [] and stub_engine.calls == [], label  # never reached the node
+        assert upstream.requests == [], label
+    assert stub_engine.verify_calls == [TX] * len(wrong_proofs)
+    # the original challenge is untouched, and the right proof still pays with it
+    assert await redis.exists(nonce_key(required.nonce)) == 1
+    paid = {HEADER_PAYMENT_SIGNATURE: make_signature_header(TX, required.nonce)}
+    assert (await client.get("/p/weather", headers=paid)).status_code == 200
+
+
+async def test_payment_signature_without_payer_proof_is_402_invalid_payment_header(
+    client: httpx.AsyncClient, seeded: Seed, stub_engine: StubEngine, redis: Any
+) -> None:
+    required = await fetch_challenge(client)
+    header = base64.b64encode(
+        json.dumps({"txId": TX, "rawTx": "{}", "payerAddress": PAYER_ADDRESS, "nonce": required.nonce}).encode()
+    ).decode()
+    response = await client.get("/p/weather", headers={HEADER_PAYMENT_SIGNATURE: header})
+    assert response.status_code == 402
+    assert response.json()["error"] == "invalid_payment_header"
+    assert stub_engine.verify_calls == [] and await redis.keys("kasgate:tx:*") == []
 
 
 # ---------------------------------------------------------------- nonce binding on the paid retry
@@ -1055,7 +1113,7 @@ async def test_redelivery_requires_the_same_payer(client: httpx.AsyncClient, see
     headers = await pay(client)
     assert (await client.get("/p/weather", headers=headers)).status_code == 502
     upstream.handler = None
-    swapped = {HEADER_PAYMENT_SIGNATURE: signature_header(TX, nonce_of(headers), payer=OTHER_ADDRESS)}
+    swapped = {HEADER_PAYMENT_SIGNATURE: signature_header(TX, nonce_of(headers), payer_key=OTHER_KEY)}
     assert (await client.get("/p/weather", headers=swapped)).status_code == 409
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet
-from kaspa import PrivateKey, sign_message
+from kaspa import Address, PrivateKey, PublicKey, pay_to_address_script, sign_message, verify_message
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key().decode()
 TREASURY = "kaspatest:qzxwgn9qu5mxn379rkp54zs729hrsr5v6045eu8hpze0x8r8caq57w49l62en"
@@ -60,6 +60,7 @@ from app.schemas import (  # noqa: E402
     PaymentRequired,
     PaymentSignature,
     SessionIssued,
+    payer_proof_message,
 )
 from app.security import encrypt_headers, generate_api_key, hash_api_key  # noqa: E402
 
@@ -171,6 +172,7 @@ class StubEngine:
         self.error: Exception | None = None  # raised by `settle`
         self.resolve_error: Exception | None = None
         self.verify_error: Exception | None = None
+        self.check_payer_proof = True  # CONTRACT v2.6, as the real engine's `verify` does it
         self.delay: float = 0.0
         self.on_verify: Callable[[PaymentSignature], None] | None = None
         self.before_resolve: Callable[[PaymentSignature], Awaitable[None]] | None = None
@@ -185,9 +187,21 @@ class StubEngine:
             fee_sompi=required.fee_amount_sompi,
         )
 
+    @staticmethod
+    def _check_payer_proof(signature: PaymentSignature) -> None:
+        """CONTRACT v2.6: the x-only key in payerAddress's P2PK script must verify `payerProof` over (nonce, txId)."""
+        script = str(pay_to_address_script(Address(signature.payerAddress)).script).lower()
+        if not (len(script) == 68 and script.startswith("20") and script.endswith("ac")):
+            raise PaymentVerificationError("invalid_payment_header", "payerAddress is not a P2PK Schnorr address")
+        message = payer_proof_message(signature.nonce, signature.txId)
+        if not verify_message(message, signature.payerProof, PublicKey(script[2:66])):
+            raise PaymentVerificationError("invalid_payment_header", "payerProof does not verify for this payment")
+
     def verify(self, signature: PaymentSignature, required: PaymentRequired) -> tuple[VerifiedPayment, Any]:
         self.verify_calls.append(signature.txId)
         self.events.append("verify")
+        if self.check_payer_proof:
+            self._check_payer_proof(signature)
         if self.on_verify is not None:
             self.on_verify(signature)
         if self.verify_error is not None:
@@ -365,13 +379,32 @@ async def seeded(sessionmaker: async_sessionmaker[AsyncSession]) -> Seed:
     return await seed_endpoint(sessionmaker)
 
 
-def make_signature_header(tx_id: str | None, nonce: str) -> str:
+def payer_proof(nonce: str, tx_id: str, key: PrivateKey = PAYER_KEY) -> str:
+    """CONTRACT v2.6 `payerProof`: the payer key's `sign_message(payer_proof_message(nonce, txId))`, 128 hex."""
+    return str(sign_message(payer_proof_message(nonce, tx_id), key))
+
+
+def make_signature(
+    tx_id: str | None,
+    nonce: str,
+    *,
+    payer_key: PrivateKey = PAYER_KEY,
+    proof: str | None = None,
+    network: str = "testnet",
+) -> PaymentSignature:
+    """A PaymentSignature whose `payerProof` is valid for (nonce, txId) unless `proof` overrides it."""
+    tx = tx_id or uuid.uuid4().hex + uuid.uuid4().hex
     return PaymentSignature(
-        txId=tx_id or uuid.uuid4().hex + uuid.uuid4().hex,
+        txId=tx,
         rawTx="{}",
-        payerAddress=PAYER_ADDRESS,
+        payerAddress=payer_key.to_address(network).to_string(),
         nonce=nonce,
-    ).to_header()
+        payerProof=proof if proof is not None else payer_proof(nonce, tx, payer_key),
+    )
+
+
+def make_signature_header(tx_id: str | None, nonce: str, **kwargs: Any) -> str:
+    return make_signature(tx_id, nonce, **kwargs).to_header()
 
 
 async def fetch_challenge(client: httpx.AsyncClient, slug: str = "weather") -> PaymentRequired:
