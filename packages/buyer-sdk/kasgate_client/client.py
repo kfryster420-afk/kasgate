@@ -85,7 +85,7 @@ class KasGateClient:
       * `max_network_fee_sompi` bounds the miner fee on top of the quoted price.
       * CONTRACT v2.1 floor: both outputs are at least `min_output_sompi` (taken from the gateway's
         `/v1/directory` manifest unless pinned in the constructor; contract default 20_000_000 as fallback), so no
-        price below 2 * floor (0.4 KAS) is ever paid. An expired challenge is refused before anything is signed.
+        price below 3 * floor (0.6 KAS) is ever paid. An expired challenge is refused before anything is signed.
       * CONTRACT v2 nonce binding: the signed transaction carries `kasgate:v1:<nonce>` as its payload and the nonce
         is echoed in PAYMENT-SIGNATURE. A 402 `payment_expired` triggers exactly one re-challenge (the expired
         nonce never reached the node, so nothing was spent).

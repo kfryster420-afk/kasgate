@@ -19,7 +19,7 @@ from app.schemas import compute_fee_split, min_price_sompi, payment_payload
 from kasgate_client.transaction import build_payment_transaction
 
 from conftest import OFFLINE_PAYER_KEY, address_for_key
-from txforge import forge_payment, tamper_raw_tx
+from txforge import forge_exact, forge_payment, tamper_raw_tx
 
 KAS = 100_000_000
 MERCHANT_KEY = "c7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef"
@@ -302,11 +302,12 @@ def test_payload_swap_with_recomputed_id_still_fails_at_the_node_not_in_verify(e
 
 
 def test_gateway_boundary_values() -> None:
-    assert FLOOR == 20_000_000 and MIN_PRICE == 40_000_000
-    with pytest.raises(ValueError):
-        compute_fee_split(39_999_999, min_output_sompi=FLOOR)
+    assert FLOOR == 20_000_000 and MIN_PRICE == 60_000_000 == 3 * FLOOR  # CONTRACT v2.3
+    for total in (1, 39_999_999, 40_000_000, 59_999_999):
+        with pytest.raises(ValueError):
+            compute_fee_split(total, min_output_sompi=FLOOR)
     expected = {
-        40_000_000: (20_000_000, 20_000_000),
+        60_000_000: (40_000_000, 20_000_000),
         1_333_333_332: (1_313_333_332, 20_000_000),
         1_333_333_333: (1_313_333_333, 20_000_000),
         1_333_333_334: (1_313_333_333, 20_000_001),
@@ -318,7 +319,7 @@ def test_gateway_boundary_values() -> None:
 
 
 def test_below_minimum_price_cannot_even_be_challenged() -> None:
-    for price in (1, FLOOR, MIN_PRICE - 1):
+    for price in (1, FLOOR, 39_999_999, 40_000_000, MIN_PRICE - 1):
         with pytest.raises(ValueError):
             make_required(price)
 
@@ -355,29 +356,119 @@ def test_one_sompi_off_is_rejected_at_every_boundary_price(engine, price) -> Non
         assert verdict(engine, required, forge_tx(outputs)) == code, (price, label)
 
 
-def test_far_below_floor_outputs_are_unrelayable_and_cannot_even_be_forged() -> None:
-    """Pre-v2.1 clients paid ceil(1.5%) = 600_000 to the treasury at 40_000_000. KIP-9 storage mass makes such a
-    transaction unrelayable: kaspa.Generator refuses to build it, so no payer can be charged for one."""
+@pytest.mark.parametrize("fee", [900_000, 1_000_000, 1])
+def test_far_below_floor_outputs_are_unrelayable_and_cannot_even_be_forged(fee: int) -> None:
+    """Pre-v2.1 clients paid ceil(1.5%) to the treasury. KIP-9 storage mass makes such a transaction unrelayable:
+    kaspa.Generator refuses to build it, so no payer can be charged for one."""
     required = make_required(MIN_PRICE)
-    for fee in (600_000, 1_000_000, 1):
-        with pytest.raises(Exception, match="Storage mass"):
-            forge_tx([(MERCHANT, MIN_PRICE - fee), (required.platformFee.feeTo, fee)])
+    with pytest.raises(Exception, match="Storage mass"):
+        forge_tx([(MERCHANT, MIN_PRICE - fee), (required.platformFee.feeTo, fee)])
 
 
 @pytest.mark.parametrize(
-    ("outputs", "code"),
+    ("merchant_delta", "fee_delta", "code"),
     [
-        ([(MERCHANT, 20_000_000), (None, 19_999_999)], "invalid_fee_split"),  # total 39_999_999: under the minimum price
-        ([(MERCHANT, 20_000_001), (None, 19_999_999)], "invalid_fee_split"),  # treasury one sompi under the floor
-        ([(MERCHANT, 19_999_999), (None, 20_000_001)], "invalid_fee_split"),
-        ([(MERCHANT, 19_999_999), (None, 20_000_000)], "underpaid"),  # merchant one sompi under the floor
+        (0, -1, "invalid_fee_split"),  # treasury one sompi under the floor
+        (-1, 0, "underpaid"),  # merchant one sompi under 2*floor
+        (-1, +1, "invalid_fee_split"),
+        (+1, -1, "invalid_fee_split"),
+        (-20_000_000, 0, "underpaid"),  # the v2.1 split (20M merchant): below the v2.3 merchant minimum
     ],
 )
-def test_one_sompi_below_the_floor_is_buildable_but_rejected_by_the_engine(engine, outputs, code) -> None:
-    """Storage mass tolerates 19_999_999, so the verifier's exact-split check is the only defence."""
+def test_one_sompi_off_the_minimum_price_split_is_rejected_by_the_engine(engine, merchant_delta, fee_delta, code) -> None:
     required = make_required(MIN_PRICE)
-    forged = forge_tx([(address or required.platformFee.feeTo, amount) for address, amount in outputs])
+    forged = forge_tx(
+        [
+            (MERCHANT, required.merchant_amount_sompi + merchant_delta),
+            (required.platformFee.feeTo, required.fee_amount_sompi + fee_delta),
+        ]
+    )
     assert verdict(engine, required, forged) == code
+
+
+# ---------------------------------------------------------------- CONTRACT v2.3: storage mass with change, 16 addresses
+
+
+def _change_forge(required, change: int, *, key: str = OFFLINE_PAYER_KEY, address: str = PAYER):
+    total = required.merchant_amount_sompi + required.fee_amount_sompi
+    fee = 300_000
+    return forge_exact(
+        private_keys=[key],
+        network=NETWORK,
+        utxos=[utxo(0, total + change + fee)],
+        outputs=[(MERCHANT, required.merchant_amount_sompi), (required.platformFee.feeTo, required.fee_amount_sompi), (address, change)],
+        payer_address=address,
+        nonce=NONCE,
+    )
+
+
+def test_minimum_price_payment_with_comfortable_change_is_accepted(engine) -> None:
+    required = make_required(MIN_PRICE)
+    assert verdict(engine, required, _change_forge(required, 30_000_000)) == "accepted"
+    assert verdict(engine, required, _change_forge(required, 100 * KAS)) == "accepted"
+
+
+def test_minimum_price_payment_with_small_change_is_a_non_standard_transaction(engine) -> None:
+    """CONTRACT v2.3: at the minimum price the outputs use most of the 100_000 storage mass, so change below ~0.3 KAS
+    makes the transaction non-standard. The SDK never builds one; the engine must refuse one a hand-rolled client sends."""
+    required = make_required(MIN_PRICE)
+    for change in (100_000, 1_000_000, 5_000_000, 10_000_000):
+        assert verdict(engine, required, _change_forge(required, change)) == "tx_rejected", change
+
+
+def test_change_threshold_matches_the_contract() -> None:
+    """The SDK's 30_000_000 minimum change is on the safe side of the engine's mass limit at the minimum price."""
+    required = make_required(MIN_PRICE)
+    accepted = [c for c in range(10_000_000, 40_000_001, 1_000_000) if verdict(FakeNodeEngine([]), required, _change_forge(required, c)) == "accepted"]
+    assert accepted, "no change value in 10M..40M was accepted"
+    assert min(accepted) <= 30_000_000, min(accepted)
+    assert 27_000_000 not in accepted  # measured threshold at the minimum price: 27_477_812 sompi
+
+
+def _addresses(count: int) -> tuple[list[str], list[str]]:
+    keys = [f"{i + 1:064x}" for i in range(count)]
+    return keys, [address_for_key(k) for k in keys]
+
+
+def _multi_address_forge(required, count: int):
+    keys, addresses = _addresses(count)
+    funds = [utxo(i, 2 * KAS, address) for i, address in enumerate(addresses)]
+    total = required.merchant_amount_sompi + required.fee_amount_sompi
+    forged = forge_exact(
+        private_keys=keys,
+        network=NETWORK,
+        utxos=funds,
+        outputs=[
+            (required.payTo, required.merchant_amount_sompi),
+            (required.platformFee.feeTo, required.fee_amount_sompi),
+            (addresses[0], sum(f["amount"] for f in funds) - total - 1_000_000),
+        ],
+        payer_address=addresses[0],
+        nonce=NONCE,
+    )
+    return forged, funds
+
+
+async def test_payment_from_sixteen_addresses_is_the_accepted_maximum() -> None:
+    required = make_required(PRICE)
+    forged, funds = _multi_address_forge(required, 16)
+    signature = _signature_for(forged)
+    engine = FakeNodeEngine(funds)
+    _, tx = engine.verify(signature, required)
+    resolved = await engine.resolve_inputs(signature, tx)
+    assert len(resolved.values) == 16
+
+
+async def test_payment_from_seventeen_addresses_is_rejected() -> None:
+    required = make_required(PRICE)
+    forged, funds = _multi_address_forge(required, 17)
+    assert len(forged.tx.inputs) == 17
+    signature = _signature_for(forged)
+    engine = FakeNodeEngine(funds)
+    _, tx = engine.verify(signature, required)  # the pure pass cannot see it: only the node lookup enforces the cap
+    with pytest.raises(PaymentVerificationError) as caught:
+        await engine.resolve_inputs(signature, tx)
+    assert caught.value.code == "invalid_payment_header" and "16" in str(caught.value)
 
 
 # ---------------------------------------------------------------- CONTRACT v2: node-verified inputs (GAP-4 fix)

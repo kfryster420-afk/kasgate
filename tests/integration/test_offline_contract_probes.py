@@ -250,9 +250,10 @@ def test_min_price_is_the_exact_boundary_for_many_floors() -> None:
     rng = random.Random(7)
     for floor in [1, 2, 3, 99, 100, 101, 10_000_000, 20_000_000, *(rng.randint(1, 10**9) for _ in range(300))]:
         price = min_price_sompi(floor)
-        assert price == 2 * floor
+        assert price == 3 * floor
         split = compute_fee_split(price, min_output_sompi=floor)
-        assert split.merchant_sompi >= floor and split.fee_sompi >= floor
+        assert split.merchant_sompi >= 2 * floor and split.fee_sompi >= floor
+        assert (split.merchant_sompi, split.fee_sompi) == (2 * floor, floor) or floor > 100_000_000
         with pytest.raises(ValueError):
             compute_fee_split(price - 1, min_output_sompi=floor)
 
@@ -260,13 +261,13 @@ def test_min_price_is_the_exact_boundary_for_many_floors() -> None:
 def test_v2_1_fee_split_invariants_hold_for_a_dense_sweep() -> None:
     floor = get_settings().min_output_sompi
     start = min_price_sompi(floor)
-    assert (floor, start) == (20_000_000, 40_000_000)
+    assert (floor, start) == (20_000_000, 60_000_000)
     for total in range(start, start + 20_000):
         split = compute_fee_split(total, min_output_sompi=floor)
         assert split.merchant_sompi + split.fee_sompi == total
         assert split.fee_sompi == max(-(-total * 150 // 10_000), floor)
         assert split.fee_sompi * 10_000 >= total * 150  # never under 1.5 %
-        assert split.merchant_sompi >= floor
+        assert split.merchant_sompi >= 2 * floor
 
 
 def test_v2_1_crossover_window_is_exact() -> None:

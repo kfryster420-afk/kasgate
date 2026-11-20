@@ -38,12 +38,14 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 if str(GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR))
 
-from kasgate_client import PaymentRequired, PlatformFee  # noqa: E402
-from kasgate_client.protocol import min_price_sompi  # noqa: E402
+from kasgate_client import PaymentRequired, PlatformFee
+from kasgate_client.protocol import min_price_sompi
 
 PRICE = 1_500_000_000
 FLOOR = 20_000_000
-MIN_PRICE = min_price_sompi(FLOOR)  # CONTRACT v2.1: 40_000_000 sompi (0.4 KAS)
+MIN_PRICE = min_price_sompi(
+    FLOOR
+)  # CONTRACT v2.3: 3 * floor = 60_000_000 sompi (0.6 KAS)
 NONCE = "0123456789abcdef" * 2
 
 
@@ -51,11 +53,16 @@ def future(seconds: float = 120.0) -> datetime:
     return (datetime.now(UTC) + timedelta(seconds=seconds)).replace(microsecond=0)
 
 
-def make_utxo(index: int, amount: int, address: str = PAYER, tx_prefix: int = 0xAA) -> dict[str, Any]:
+def make_utxo(
+    index: int, amount: int, address: str = PAYER, tx_prefix: int = 0xAA
+) -> dict[str, Any]:
     script = kaspa.pay_to_address_script(kaspa.Address(address)).script
     return {
         "address": address,
-        "outpoint": {"transactionId": f"{tx_prefix:02x}" * 31 + f"{index:02x}", "index": 0},
+        "outpoint": {
+            "transactionId": f"{tx_prefix:02x}" * 31 + f"{index:02x}",
+            "index": 0,
+        },
         "amount": amount,
         "scriptPublicKey": {"version": 0, "script": script},
         "blockDaaScore": 1000,
@@ -76,7 +83,9 @@ def challenge(
     expires_in: float = 120.0,
     **overrides: Any,
 ) -> PaymentRequired:
-    fee = max(-(-price * 150 // 10_000), floor)  # independent of the SDK: v2.1 fee = max(ceil(1.5%), floor)
+    fee = max(
+        -(-price * 150 // 10_000), floor
+    )  # independent of the SDK: v2.1 fee = max(ceil(1.5%), floor)
     fields: dict[str, Any] = {
         "x402Version": 2,
         "scheme": "kaspa-exact-v1",
@@ -84,7 +93,9 @@ def challenge(
         "asset": "KAS",
         "amount": str(price),
         "payTo": pay_to,
-        "platformFee": PlatformFee(feeTo=fee_to, feeAmount=str(fee if fee_amount is None else fee_amount)),
+        "platformFee": PlatformFee(
+            feeTo=fee_to, feeAmount=str(fee if fee_amount is None else fee_amount)
+        ),
         "nonce": nonce,
         "expiresAt": future(expires_in),
     }
@@ -95,21 +106,34 @@ def challenge(
 class FakeGateway:
     """Programmable stand-in for the gateway's paywalled route. Records every request it receives."""
 
-    def __init__(self, required: PaymentRequired | None = None, challenge_header: str | None = None) -> None:
+    def __init__(
+        self,
+        required: PaymentRequired | None = None,
+        challenge_header: str | None = None,
+    ) -> None:
         self.required = required or challenge()
         self.challenge_header = challenge_header
         self.requests: list[httpx.Request] = []
         self.signatures: list[dict[str, Any]] = []
         self.directory_calls = 0
-        self.manifest_floor: int | None = None  # None: the gateway has no manifest (404)
-        self.paid_handler: Callable[[httpx.Request, dict[str, Any]], httpx.Response] | None = None
+        self.manifest_floor: int | None = (
+            None  # None: the gateway has no manifest (404)
+        )
+        self.paid_handler: (
+            Callable[[httpx.Request, dict[str, Any]], httpx.Response] | None
+        ) = None
 
     def directory_response(self) -> httpx.Response:
         self.directory_calls += 1
         if self.manifest_floor is None:
             return httpx.Response(404, json={"detail": "not found"})
         return httpx.Response(
-            200, json={"network": "kaspa:testnet-10", "min_output_sompi": self.manifest_floor, "endpoints": []}
+            200,
+            json={
+                "network": "kaspa:testnet-10",
+                "min_output_sompi": self.manifest_floor,
+                "endpoints": [],
+            },
         )
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -124,18 +148,30 @@ class FakeGateway:
             return httpx.Response(
                 402,
                 headers={"PAYMENT-REQUIRED": header},
-                json={"error": "payment_required", "message": "payment required", "accepts": None},
+                json={
+                    "error": "payment_required",
+                    "message": "payment required",
+                    "accepts": None,
+                },
             )
         signature = PaymentSignature.from_header(raw)
         tx = kaspa.Transaction.from_dict(json.loads(signature.rawTx))
-        parsed = {"signature": signature, "tx": tx, "payload": bytes.fromhex(tx.payload)}
+        parsed = {
+            "signature": signature,
+            "tx": tx,
+            "payload": bytes.fromhex(tx.payload),
+        }
         self.signatures.append(parsed)
         if self.paid_handler is not None:
             return self.paid_handler(request, parsed)
         receipt = PaymentResponse(
-            txId=signature.txId, network="kaspa:testnet-10", usdValueAtSettlement="1.23456789"
+            txId=signature.txId,
+            network="kaspa:testnet-10",
+            usdValueAtSettlement="1.23456789",
         ).to_header()
-        return httpx.Response(200, headers={"PAYMENT-RESPONSE": receipt}, json={"ok": True})
+        return httpx.Response(
+            200, headers={"PAYMENT-RESPONSE": receipt}, json={"ok": True}
+        )
 
 
 @pytest.fixture
@@ -160,9 +196,15 @@ def make_client():
 
     clients: list[KasGateClient] = []
 
-    def factory(gw: FakeGateway, utxos: list[dict[str, Any]] | None = None, **kwargs: Any) -> KasGateClient:
-        provider = static_utxos(utxos if utxos is not None else [make_utxo(0, 500 * 100_000_000)])
-        http = httpx.AsyncClient(transport=httpx.MockTransport(gw), base_url="http://gateway.test")
+    def factory(
+        gw: FakeGateway, utxos: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> KasGateClient:
+        provider = static_utxos(
+            utxos if utxos is not None else [make_utxo(0, 500 * 100_000_000)]
+        )
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(gw), base_url="http://gateway.test"
+        )
         client = KasGateClient(
             kwargs.pop("private_key_hex", PAYER_KEY),
             utxo_provider=provider,

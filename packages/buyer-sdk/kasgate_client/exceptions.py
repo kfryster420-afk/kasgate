@@ -55,6 +55,11 @@ class InsufficientFundsError(KasGateError):
     """The payer address cannot fund price plus network fee."""
 
 
+class DustChangeError(InsufficientFundsError):
+    """Every UTXO of the payer was used and the change would still be in (0, 30_000_000) sompi. CONTRACT v2.3 forbids
+    small change (storage mass), and the SDK never donates it to the miner fee."""
+
+
 class TransactionBuildError(KasGateError):
     """The payment transaction could not be built safely (fragmented UTXOs, fee too high, wrong output layout)."""
 

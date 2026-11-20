@@ -40,7 +40,10 @@ def test_quote_endpoint_matches_the_402_challenge(gateway_url, proxy_url, endpoi
     challenge = decode_challenge(httpx.get(proxy_url, timeout=15))
     quote = httpx.get(f"{gateway_url}/v1/quote/{endpoint['slug']}", timeout=10)
     assert quote.status_code == 200
-    assert PaymentRequired.model_validate(quote.json()) == challenge
+    quoted = PaymentRequired.model_validate(quote.json())
+    assert quoted.nonce != challenge.nonce, "every quote and every 402 mints its own payment nonce"
+    volatile = {"nonce", "expiresAt"}
+    assert quoted.model_dump(exclude=volatile) == challenge.model_dump(exclude=volatile)
 
 
 def test_unknown_slug_is_404_and_bad_method_is_405(gateway_url, proxy_url) -> None:
@@ -69,7 +72,7 @@ def test_oversized_payment_signature_never_causes_a_server_error(proxy_url) -> N
 
 
 def test_price_below_the_floor_is_422(gateway_url, auth, min_price) -> None:
-    for price in (min_price - 1, 1, 0, -5):
+    for price in (min_price - 1, 40_000_000, 1, 0, -5):
         response = httpx.post(
             f"{gateway_url}/v1/endpoints",
             headers=auth,

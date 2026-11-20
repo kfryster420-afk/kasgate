@@ -43,11 +43,15 @@ MIN_CHALLENGE_TTL_SECONDS = 3.0
 # the gateway's own limit, so the SDK refuses to emit a PAYMENT-SIGNATURE larger than this by default.
 DEFAULT_MAX_SIGNATURE_HEADER_BYTES = 12_000
 
-DEFAULT_MAX_PRICE_SOMPI = 2_000_000_000  # 20 KAS: far above the 0.4 KAS minimum endpoint price, far below a drain.
+DEFAULT_MAX_PRICE_SOMPI = 2_000_000_000  # 20 KAS: far above the 0.6 KAS minimum endpoint price, far below a drain.
 # KIP-9 storage-mass floor per output (gateway DEFAULT_MIN_OUTPUT_SOMPI). CONTRACT v2.1: the treasury fee is
-# max(ceil(1.5%), floor) and the merchant output is total - fee, so the minimum price is 2 * floor = 0.4 KAS.
+# max(ceil(1.5%), floor) and the merchant output is total - fee, so the minimum price is 3 * floor = 0.6 KAS.
 DEFAULT_MIN_OUTPUT_SOMPI = 20_000_000
 DEFAULT_MAX_REDELIVERIES = 1
+# CONTRACT v2.3: change must be 0 or >= this, else the tx can exceed the KIP-9 storage-mass limit.
+DEFAULT_MIN_CHANGE_SOMPI = 30_000_000
+# CONTRACT v2.3: the gateway rejects payments drawing inputs from more than this many distinct addresses.
+MAX_INPUT_ADDRESSES = 16
 MAX_RETRY_AFTER_SECONDS = 10.0
 DEFAULT_MAX_NETWORK_FEE_SOMPI = (
     5_000_000  # 0.05 KAS ceiling on the miner fee the payer funds on top of the price.

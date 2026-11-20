@@ -3,7 +3,8 @@
 Live tests need a running gateway and, for payments, a funded testnet key:
 
     KASGATE_GATEWAY_URL        default http://localhost:8000
-    KASGATE_TEST_PAYER_KEY     hex private key of a funded kaspa:testnet-10 address (skips funded tests if unset)
+    KASGATE_TEST_PAYER_KEY_FILE path of a file holding that key (default /workspace/kg-secrets/buyer.key); never printed
+    KASGATE_TEST_PAYER_KEY     hex private key of a funded kaspa:testnet-10 address (skips the real-settlement tests if unset)
     KASGATE_TEST_RPC_URL       optional wRPC URL used by the test client (default: public resolver)
     KASGATE_TEST_UPSTREAM_URL  public upstream the gateway proxies to (default https://httpbin.org/anything)
     KASGATE_TEST_RPC_DOWN=1    set only when the gateway runs with an unreachable node: enables the 503 test
@@ -46,6 +47,7 @@ for path in (GATEWAY_DIR, SDK_DIR, Path(__file__).resolve().parent):
 
 from app.schemas import TAX_CSV_COLUMNS, min_price_sompi  # noqa: E402,F401
 from kasgate_client import PaymentRequired  # noqa: E402
+from wallet import Wallet, register  # noqa: E402
 
 GATEWAY_URL = os.environ.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip("/")
 UPSTREAM_URL = os.environ.get("KASGATE_TEST_UPSTREAM_URL", "https://httpbin.org/anything")
@@ -91,13 +93,55 @@ def min_price(directory: dict[str, Any]) -> int:
     return min_price_sompi(int(directory["min_output_sompi"]))
 
 
+class SecretKey(str):
+    """A private key that cannot leak through reprs, f-strings, assertion messages or `pytest -l`/`--showlocals`.
+
+    It is still a real `str` for the code that must use it (`kaspa.PrivateKey(...)`, the SDK client), but every way of
+    rendering it as text yields a mask.
+    """
+
+    def __repr__(self) -> str:
+        return "<SecretKey ****>"
+
+    def __str__(self) -> str:
+        return "****"
+
+    def __format__(self, spec: str) -> str:
+        return "****"
+
+
+DEFAULT_PAYER_KEY_FILE = "/workspace/kg-secrets/buyer.key"
+
+
+def _funded_key() -> str:
+    """The funded payer key from KASGATE_TEST_PAYER_KEY or the file named by KASGATE_TEST_PAYER_KEY_FILE.
+
+    The file defaults to /workspace/kg-secrets/buyer.key. The key is never printed, logged or put in a message; an
+    unreadable, empty or malformed value just means "no funded key" (the real-settlement tests skip).
+    """
+    value = os.environ.get("KASGATE_TEST_PAYER_KEY", "").strip()
+    if not value:
+        path = Path(os.environ.get("KASGATE_TEST_PAYER_KEY_FILE", DEFAULT_PAYER_KEY_FILE))
+        try:
+            value = path.read_text().strip()
+        except OSError:
+            return ""
+    if len(value) != 64 or any(c not in "0123456789abcdefABCDEF" for c in value):
+        return ""
+    return SecretKey(value.lower())
+
+
 @pytest.fixture(scope="session")
 def payer_key(network: str, health: dict[str, Any]) -> str:
-    key = os.environ.get("KASGATE_TEST_PAYER_KEY", "").strip()
-    if not key:
-        pytest.skip("KASGATE_TEST_PAYER_KEY is not set: export the hex private key of a funded kaspa:testnet-10 address")
+    """The funded key. Tests that use it spend testnet KAS and need a node behind the gateway."""
     if not health.get("kaspa_rpc"):
         pytest.skip("gateway reports kaspa_rpc=false: payments cannot be submitted")
+    key = _funded_key()
+    if not key:
+        pytest.skip(
+            "no funded payer key: set KASGATE_TEST_PAYER_KEY or KASGATE_TEST_PAYER_KEY_FILE "
+            f"(default {DEFAULT_PAYER_KEY_FILE}) to a funded kaspa:testnet-10 key"
+        )
     return key
 
 
@@ -115,18 +159,17 @@ def pool(payer_key: str, payer_address: str, network: str):
     return UtxoPool(payer_address, network, RPC_URL)
 
 
-@pytest.fixture(scope="session")
-def forge(pool, payer_key: str, network: str):
-    """forge(outputs) -> ForgedPayment signed by the funded payer; spends are tracked only via forge.commit()."""
+def _forger(pool, key: str, network: str):
     from txforge import forge_payment
 
-    def _forge(outputs: list[tuple[str, int]], key: str | None = None, **kwargs: Any):
-        needed = sum(amount for _, amount in outputs) + 5_000_000
+    def _forge(outputs: list[tuple[str, int]], nonce: str, key_hex: str | None = None, **kwargs: Any):
+        needed = sum(amount for _, amount in outputs) + 5_000_000 + 30_000_000
         return forge_payment(
-            private_key_hex=key or payer_key,
+            private_key_hex=key_hex or key,
             network=network,
             utxos=pool.available(needed),
             outputs=outputs,
+            nonce=nonce,
             **kwargs,
         )
 
@@ -135,30 +178,89 @@ def forge(pool, payer_key: str, network: str):
 
 
 @pytest.fixture(scope="session")
-def merchant_key() -> str:
-    return secrets.token_hex(32)
+def real_forge_for(pool, payer_key: str, network: str):
+    """forge(outputs, nonce) -> ForgedPayment spending the funded payer's REAL UTXOs (skips without funds / a node)."""
+    return _forger(pool, payer_key, network)
 
 
 @pytest.fixture(scope="session")
-def merchant_address(merchant_key: str) -> str:
-    return address_for_key(merchant_key)
+def synthetic_forge_for(network: str):
+    """Same API over made-up UTXOs. Valid for every rejection the gateway makes before it asks the node (the pure
+    `verify` pass, nonce handling, the 16-address cap), and never able to settle."""
+    from txforge import SyntheticPool
+
+    return _forger(SyntheticPool(address_for_key(OFFLINE_PAYER_KEY)), OFFLINE_PAYER_KEY, network)
+
+
+@pytest.fixture
+def quote(gateway_url: str, endpoint: dict[str, Any]) -> PaymentRequired:
+    """A fresh, stored, payable challenge for the shared endpoint (every quote mints its own nonce)."""
+    return fresh_quote(gateway_url, endpoint["slug"])
+
+
+@pytest.fixture
+def forge(synthetic_forge_for, quote: PaymentRequired):
+    """forge(outputs) -> ForgedPayment for `quote`'s nonce over synthetic UTXOs: for tests that must be rejected
+    before the node is consulted."""
+
+    def _forge(outputs: list[tuple[str, int]], **kwargs: Any):
+        kwargs.setdefault("nonce", quote.nonce)
+        return synthetic_forge_for(outputs, **kwargs)
+
+    _forge.commit = synthetic_forge_for.commit  # type: ignore[attr-defined]
+    return _forge
+
+
+@pytest.fixture
+def real_forge(real_forge_for, quote: PaymentRequired):
+    """Like `forge`, over the funded payer's real UTXOs; the forged tx can settle on chain."""
+
+    def _forge(outputs: list[tuple[str, int]], **kwargs: Any):
+        kwargs.setdefault("nonce", quote.nonce)
+        return real_forge_for(outputs, **kwargs)
+
+    _forge.commit = real_forge_for.commit  # type: ignore[attr-defined]
+    return _forge
+
+
+def fresh_quote(gateway_url: str, slug: str) -> PaymentRequired:
+    response = httpx.get(f"{gateway_url}/v1/quote/{slug}", timeout=10)
+    assert response.status_code == 200, response.text
+    return PaymentRequired.model_validate(response.json())
 
 
 @pytest.fixture(scope="session")
-def merchant(gateway_url: str, network: str, merchant_address: str) -> dict[str, Any]:
-    response = httpx.post(
-        f"{gateway_url}/v1/merchants",
-        json={"kaspa_address": merchant_address, "display_name": f"qa-merchant-{secrets.token_hex(3)}"},
-        timeout=10,
-    )
+def wallet() -> Wallet:
+    return Wallet()
+
+
+@pytest.fixture(scope="session")
+def merchant_key(wallet: Wallet) -> str:
+    return wallet.key_hex
+
+
+@pytest.fixture(scope="session")
+def merchant_address(wallet: Wallet) -> str:
+    return wallet.address
+
+
+@pytest.fixture(scope="session")
+def merchant(gateway_url: str, network: str, wallet: Wallet) -> dict[str, Any]:
+    """A merchant registered with a wallet proof (CONTRACT v2.2: purpose=register challenge + signature)."""
+    response = register(gateway_url, wallet)
     if response.status_code == 429:
         pytest.skip(
             "POST /v1/merchants is rate limited: run the gateway with RATE_LIMIT_ENABLED=false for this suite "
-            f"(or wait Retry-After={response.headers.get('retry-after')}s / delete the kasgate:rl:merchants:* Redis keys)"
+            f"(or wait Retry-After={response.headers.get('retry-after')}s / delete the kasgate:rl:* Redis keys)"
         )
     assert response.status_code == 201, response.text
     body = response.json()
-    return {"id": body["merchant"]["id"], "api_key": body["api_key"], "address": merchant_address}
+    return {
+        "id": body["merchant"]["id"],
+        "api_key": body["api_key"],
+        "session_token": body["session_token"],
+        "address": wallet.address,
+    }
 
 
 @pytest.fixture(scope="session")
@@ -193,13 +295,6 @@ def endpoint(gateway_url: str, auth: dict[str, str], min_price: int) -> dict[str
 @pytest.fixture(scope="session")
 def proxy_url(gateway_url: str, endpoint: dict[str, Any]) -> str:
     return f"{gateway_url}/p/{endpoint['slug']}"
-
-
-@pytest.fixture(scope="session")
-def quote(gateway_url: str, endpoint: dict[str, Any]) -> PaymentRequired:
-    response = httpx.get(f"{gateway_url}/v1/quote/{endpoint['slug']}", timeout=10)
-    assert response.status_code == 200, response.text
-    return PaymentRequired.model_validate(response.json())
 
 
 def merchant_fee_outputs(required: PaymentRequired) -> list[tuple[str, int]]:

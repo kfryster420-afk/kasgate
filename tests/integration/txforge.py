@@ -17,6 +17,7 @@ from typing import Any
 import kaspa
 from kasgate_client import PaymentSignature, payment_payload
 
+MIN_CHANGE_SOMPI = 30_000_000  # CONTRACT v2.3: change is 0 or >= 0.3 KAS, else the tx is non-standard (storage mass)
 NETWORK_IDS = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}
 
 
@@ -94,9 +95,9 @@ def forge_payment(
     payer = key.to_address("mainnet" if network == "kaspa:mainnet" else "testnet")
     total = sum(amount for _, amount in outputs)
     candidates = sorted(utxos, key=_amount, reverse=True)
-    chosen = next((u for u in candidates if _amount(u) >= total + 5_000_000), None)
+    chosen = next((u for u in candidates if _amount(u) >= total + 5_000_000 + MIN_CHANGE_SOMPI), None)
     if chosen is None:
-        raise RuntimeError(f"no single UTXO of {payer.to_string()} covers {total} sompi plus fees")
+        raise RuntimeError(f"no single UTXO of {payer.to_string()} covers {total} sompi plus fees and {MIN_CHANGE_SOMPI} change")
     generator = kaspa.Generator(
         entries=[kaspa.UtxoEntryReference.from_dict(chosen)],
         change_address=payer,
@@ -125,6 +126,33 @@ def tamper_raw_tx(forged: ForgedPayment, mutate) -> str:
     data = json.loads(forged.raw_tx)
     mutate(data)
     return json.dumps(data)
+
+
+def synthetic_utxo(address: str, index: int = 0, amount: int = 500 * 100_000_000) -> dict[str, Any]:
+    """A UTXO entry that exists nowhere but in the test: enough for every check the gateway makes BEFORE it asks the node."""
+    script = kaspa.pay_to_address_script(kaspa.Address(address)).script
+    return {
+        "address": address,
+        "outpoint": {"transactionId": f"{0xCD:02x}" * 30 + f"{index:04x}", "index": 0},
+        "amount": amount,
+        "scriptPublicKey": {"version": 0, "script": script},
+        "blockDaaScore": 1000,
+        "isCoinbase": False,
+        "covenantId": None,
+    }
+
+
+class SyntheticPool:
+    """Stands in for `UtxoPool` when no funded key is configured: one big made-up UTXO, never spent on any chain."""
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+    def available(self, minimum: int, timeout: float = 0.0) -> list[dict[str, Any]]:
+        return [synthetic_utxo(self.address, amount=max(minimum * 10, 500 * 100_000_000))]
+
+    def mark_spent(self, forged: ForgedPayment) -> None:
+        return None
 
 
 class UtxoPool:
@@ -159,3 +187,40 @@ class UtxoPool:
 
     def mark_spent(self, forged: ForgedPayment) -> None:
         self.spent.update(forged.spent_outpoints)
+
+
+def forge_exact(
+    *,
+    private_keys: Sequence[str],
+    network: str,
+    utxos: Sequence[dict[str, Any]],
+    outputs: Sequence[tuple[str, int]],
+    payer_address: str,
+    nonce: str | None = None,
+    payload: bytes | None = None,
+) -> ForgedPayment:
+    """Sign a transaction that spends ALL `utxos` and pays EXACTLY `outputs` (change included, in that order).
+
+    Whatever the inputs hold beyond the outputs becomes the miner fee. Unlike `forge_payment` this goes through
+    `kaspa.create_transaction`, so the caller controls every output (small change, many inputs) and may sign inputs
+    that belong to several keys. `kaspa.Generator` would refuse (storage mass) or reorder such shapes.
+    """
+    keys = [kaspa.PrivateKey(k) for k in private_keys]
+    data = payload if payload is not None else (payment_payload(nonce) if nonce else None)
+    tx = kaspa.create_transaction(
+        [kaspa.UtxoEntryReference.from_dict(u) for u in utxos],
+        [kaspa.PaymentOutput(kaspa.Address(address), amount) for address, amount in outputs],
+        0,
+        data,
+    )
+    signed = kaspa.sign_transaction(tx, keys, False)
+    spent = tuple((str(i.previous_outpoint.transaction_id), int(i.previous_outpoint.index)) for i in signed.inputs)
+    return ForgedPayment(
+        tx_id=signed.id,
+        raw_tx=json.dumps(signed.to_dict()),
+        payer_address=payer_address,
+        tx=signed,
+        spent_outpoints=spent,
+        nonce=nonce,
+        payload=bytes.fromhex(signed.payload),
+    )

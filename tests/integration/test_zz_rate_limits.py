@@ -2,7 +2,7 @@
 
 The normal suite runs against a gateway started with RATE_LIMIT_ENABLED=false (all host traffic reaches the gateway
 from one Docker bridge IP, so default limits such as 5 merchant sign-ups per hour would starve every other test).
-To run THESE tests, start the gateway separately with limiting on and low limits, e.g. in infra/.env:
+To run THESE tests, start the gateway separately with limiting on and low limits (limits are per caller IP only), e.g. in infra/.env:
 
     RATE_LIMIT_ENABLED=true
     RL_MERCHANT_CREATE_PER_HOUR=3
@@ -31,6 +31,7 @@ import pytest
 from app.config import get_settings
 
 from conftest import address_for_key
+from wallet import Wallet, get_challenge, proof
 
 ENABLED = os.environ.get("KASGATE_RATE_LIMIT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
 
@@ -95,13 +96,6 @@ def test_auth_challenge_is_rate_limited(gateway_url: str) -> None:
     wait_for_window(responses[-1])
 
 
-def test_auth_challenge_is_also_limited_per_address(gateway_url: str) -> None:
-    address = fresh_address()
-    responses = hammer(f"{gateway_url}/v1/auth/challenge", lambda: {"kaspa_address": address}, RATE_LIMIT_AUTH_CHALLENGE.limit + 1)
-    assert_limited(responses, RATE_LIMIT_AUTH_CHALLENGE.limit)
-    wait_for_window(responses[-1])
-
-
 def test_auth_verify_is_rate_limited(gateway_url: str) -> None:
     rule = RATE_LIMIT_AUTH_VERIFY
 
@@ -120,11 +114,15 @@ def test_auth_verify_is_rate_limited(gateway_url: str) -> None:
 
 
 def test_merchant_registration_is_rate_limited(gateway_url: str) -> None:
+    """Registration needs a wallet proof (v2.2), so each attempt signs a fresh `register` challenge. The limit is per
+    caller IP only: every attempt uses a different wallet and they all share one budget."""
     rule = RATE_LIMIT_CREATE_MERCHANT
-    responses = hammer(
-        f"{gateway_url}/v1/merchants",
-        lambda: {"kaspa_address": fresh_address(), "display_name": f"qa-rl-{secrets.token_hex(3)}"},
-        rule.limit + 1,
-    )
+
+    def body() -> dict[str, Any]:
+        wallet = Wallet()
+        text = get_challenge(gateway_url, wallet.address, "register")["challenge"]
+        return proof(wallet, text, display_name=f"qa-rl-{secrets.token_hex(3)}")
+
+    responses = hammer(f"{gateway_url}/v1/merchants", body, rule.limit + 1)
     assert_limited(responses, rule.limit)
     assert all(r.status_code == 201 for r in responses[:-1])

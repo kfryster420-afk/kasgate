@@ -213,20 +213,20 @@ def test_config_from_env() -> None:
         Config.from_env({"KASGATE_MAX_PRICE_KAS": "-3"})
 
 
-async def test_call_at_the_minimum_price_splits_20_000_000_each() -> None:
+async def test_call_at_the_minimum_price_splits_40_20() -> None:
     fake = FakeGateway(challenge(MIN_PRICE))
     server, _ = make_server(fake)
     async with Client(server) as client:
         result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123", "max_price_kas": 1})
     assert not result.is_error
     data = structured(result)
-    assert data["payment"]["paid_kas"] == "0.4" and data["payment"]["platform_fee_kas"] == "0.2"
+    assert data["payment"]["paid_kas"] == "0.6" and data["payment"]["platform_fee_kas"] == "0.2"
     tx = fake.signatures[0]["tx"]
-    assert [o.value for o in tx.outputs[:2]] == [20_000_000, 20_000_000]
+    assert [o.value for o in tx.outputs[:2]] == [40_000_000, 20_000_000]
     assert fake.signatures[0]["payload"] == b"kasgate:v1:" + NONCE.encode()
 
 
-@pytest.mark.parametrize("price", [39_999_999, 20_000_000])
+@pytest.mark.parametrize("price", [59_999_999, 40_000_000, 39_999_999, 20_000_000])
 async def test_sub_floor_challenge_is_refused_before_signing(price: int) -> None:
     fake = FakeGateway(challenge(price))
     server, buyer = make_server(fake)

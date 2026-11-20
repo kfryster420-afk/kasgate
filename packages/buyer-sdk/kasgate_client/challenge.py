@@ -104,16 +104,17 @@ def validate_challenge(
         merchant, fee = compute_fee_split(total, min_output_sompi)
     except ValueError as exc:
         raise FeeSplitMismatchError(
-            f"amount {total} cannot be split with both outputs >= {min_output_sompi} sompi: {exc}"
+            f"amount {total} cannot be split (fee >= {min_output_sompi}, merchant >= {2 * min_output_sompi} sompi): {exc}"
         ) from exc
     if challenge.fee_sompi != fee:
         raise FeeSplitMismatchError(
             f"platformFee.feeAmount={challenge.fee_sompi} but max(ceil({total} * 150 / 10000), "
             f"{min_output_sompi}) = {fee}"
         )
-    if merchant < min_output_sompi or fee < min_output_sompi:
+    if merchant < 2 * min_output_sompi or fee < min_output_sompi:
         raise FeeSplitMismatchError(
-            f"split {merchant}/{fee} puts an output below the minimum of {min_output_sompi} sompi"
+            f"split {merchant}/{fee} puts an output below the minimum "
+            f"(merchant {2 * min_output_sompi}, fee {min_output_sompi} sompi)"
         )
     if challenge.payTo == challenge.platformFee.feeTo:
         raise FeeSplitMismatchError(

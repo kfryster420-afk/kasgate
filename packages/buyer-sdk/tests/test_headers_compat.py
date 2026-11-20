@@ -5,17 +5,37 @@ from __future__ import annotations
 import json
 import random
 
-import kasgate_client as sdk
 import pytest
 from app import schemas as gw
-from conftest import FLOOR, MERCHANT, MIN_PRICE, NONCE, OTHER, PAYER, PRICE, TREASURY, challenge, future
+from conftest import (
+    FLOOR,
+    MERCHANT,
+    MIN_PRICE,
+    NONCE,
+    OTHER,
+    PAYER,
+    PRICE,
+    TREASURY,
+    challenge,
+    future,
+)
+
+import kasgate_client as sdk
 
 TX_ID = "ab" * 32
 
 
 @pytest.mark.parametrize(
     "price",
-    [MIN_PRICE, 1_333_333_333, 1_333_333_334, 1_333_333_335, PRICE, 2_000_000_000, 123_456_789_012],
+    [
+        MIN_PRICE,
+        1_333_333_333,
+        1_333_333_334,
+        1_333_333_335,
+        PRICE,
+        2_000_000_000,
+        123_456_789_012,
+    ],
 )
 def test_payment_required_identical_bytes_and_cross_decode(price: int) -> None:
     gateway_model = gw.PaymentRequired.for_endpoint(price, MERCHANT, NONCE, future())
@@ -34,8 +54,12 @@ def test_payment_required_identical_bytes_and_cross_decode(price: int) -> None:
 
 def test_payment_signature_identical_bytes_both_directions() -> None:
     raw_tx = json.dumps({"id": TX_ID, "inputs": [], "outputs": []})
-    sdk_model = sdk.PaymentSignature(txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE)
-    gateway_model = gw.PaymentSignature(txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE)
+    sdk_model = sdk.PaymentSignature(
+        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE
+    )
+    gateway_model = gw.PaymentSignature(
+        txId=TX_ID, rawTx=raw_tx, payerAddress=PAYER, nonce=NONCE
+    )
 
     assert sdk_model.to_header() == gateway_model.to_header()
     assert gw.PaymentSignature.from_header(sdk_model.to_header()).rawTx == raw_tx
@@ -44,17 +68,26 @@ def test_payment_signature_identical_bytes_both_directions() -> None:
 
 
 def test_payment_response_identical_bytes_both_directions() -> None:
-    gateway_model = gw.PaymentResponse(txId=TX_ID, network="kaspa:testnet-10", usdValueAtSettlement="12.50000000")
-    sdk_model = sdk.PaymentResponse(txId=TX_ID, network="kaspa:testnet-10", usdValueAtSettlement="12.50000000")
+    gateway_model = gw.PaymentResponse(
+        txId=TX_ID, network="kaspa:testnet-10", usdValueAtSettlement="12.50000000"
+    )
+    sdk_model = sdk.PaymentResponse(
+        txId=TX_ID, network="kaspa:testnet-10", usdValueAtSettlement="12.50000000"
+    )
 
     assert sdk_model.to_header() == gateway_model.to_header()
     parsed = sdk.PaymentResponse.from_header(gateway_model.to_header())
     assert parsed.settled is True and parsed.txId == TX_ID
-    assert gw.PaymentResponse.from_header(sdk_model.to_header()).network == "kaspa:testnet-10"
+    assert (
+        gw.PaymentResponse.from_header(sdk_model.to_header()).network
+        == "kaspa:testnet-10"
+    )
 
 
 def test_header_alphabet_is_standard_padded_base64() -> None:
-    header = gw.PaymentRequired.for_endpoint(PRICE, MERCHANT, NONCE, future()).to_header()
+    header = gw.PaymentRequired.for_endpoint(
+        PRICE, MERCHANT, NONCE, future()
+    ).to_header()
     assert header.isascii() and "-" not in header and "_" not in header
     assert len(header) % 4 == 0
 
@@ -72,7 +105,11 @@ def test_sdk_rejects_what_the_gateway_rejects() -> None:
 def test_unknown_fields_are_rejected_like_the_gateway() -> None:
     import base64
 
-    payload = json.loads(gw.PaymentRequired.for_endpoint(PRICE, MERCHANT, NONCE, future()).model_dump_json())
+    payload = json.loads(
+        gw.PaymentRequired.for_endpoint(
+            PRICE, MERCHANT, NONCE, future()
+        ).model_dump_json()
+    )
     payload["extra"] = 1
     header = base64.b64encode(json.dumps(payload).encode()).decode()
     with pytest.raises(ValueError):
@@ -84,21 +121,32 @@ def test_unknown_fields_are_rejected_like_the_gateway() -> None:
 def test_signature_rejects_mainnet_payer_like_the_gateway() -> None:
     mainnet_payer = "kaspa:" + PAYER.split(":", 1)[1]
     raw_tx = "{}"
-    sdk_model = sdk.PaymentSignature(txId=TX_ID, rawTx=raw_tx, payerAddress=mainnet_payer, nonce=NONCE)
+    sdk_model = sdk.PaymentSignature(
+        txId=TX_ID, rawTx=raw_tx, payerAddress=mainnet_payer, nonce=NONCE
+    )
     with pytest.raises(ValueError):
         gw.PaymentSignature.from_header(sdk_model.to_header())
 
 
 @pytest.mark.parametrize(
     "total",
-    [MIN_PRICE, MIN_PRICE + 1, 100_000_000, 1_333_333_332, 1_333_333_333, 1_333_333_334, 1_333_333_335, 2**62],
+    [
+        MIN_PRICE,
+        MIN_PRICE + 1,
+        100_000_000,
+        1_333_333_332,
+        1_333_333_333,
+        1_333_333_334,
+        1_333_333_335,
+        2**62,
+    ],
 )
 def test_fee_math_matches_gateway(total: int) -> None:
     merchant, fee = sdk.compute_fee_split(total, FLOOR)
     gateway_split = gw.compute_fee_split(total, min_output_sompi=FLOOR)
     assert (merchant, fee) == (gateway_split.merchant_sompi, gateway_split.fee_sompi)
     assert merchant + fee == total
-    assert merchant >= FLOOR and fee >= FLOOR
+    assert merchant >= 2 * FLOOR and fee >= FLOOR
     assert fee * 10_000 >= total * 150  # fee never drops below the 1.5% share
     assert fee == max(-(-total * 150 // 10_000), FLOOR)
 
@@ -114,11 +162,22 @@ def test_fee_math_random_sweep_matches_gateway() -> None:
             with pytest.raises(ValueError):
                 sdk.compute_fee_split(total, floor)
             continue
-        assert sdk.compute_fee_split(total, floor) == (expected.merchant_sompi, expected.fee_sompi)
+        assert sdk.compute_fee_split(total, floor) == (
+            expected.merchant_sompi,
+            expected.fee_sompi,
+        )
 
 
 def test_below_minimum_price_is_refused_by_both_sides() -> None:
-    for total in (1, 20_000_000, 39_999_998, MIN_PRICE - 1):
+    for total in (
+        1,
+        20_000_000,
+        39_999_999,
+        40_000_000,
+        59_999_998,
+        59_999_999,
+        MIN_PRICE - 1,
+    ):
         with pytest.raises(ValueError):
             sdk.compute_fee_split(total, FLOOR)
         with pytest.raises(ValueError):
@@ -127,34 +186,68 @@ def test_below_minimum_price_is_refused_by_both_sides() -> None:
         sdk.compute_fee_split(0)
 
 
-def test_exact_minimum_price_splits_in_half() -> None:
-    """CONTRACT v2.1: 40_000_000 sompi -> treasury 20_000_000 (flat floor), merchant 20_000_000."""
-    assert gw.min_price_sompi(FLOOR) == MIN_PRICE == 40_000_000 == sdk.min_price_sompi(FLOOR)
-    assert sdk.compute_fee_split(MIN_PRICE, FLOOR) == (20_000_000, 20_000_000)
+def test_exact_minimum_price_splits_40_20() -> None:
+    """CONTRACT v2.3: 60_000_000 sompi -> treasury 20_000_000 (flat floor), merchant 40_000_000 (= 2 * floor)."""
+    assert (
+        gw.min_price_sompi(FLOOR)
+        == MIN_PRICE
+        == 60_000_000
+        == sdk.min_price_sompi(FLOOR)
+        == 3 * FLOOR
+    )
+    assert sdk.compute_fee_split(MIN_PRICE, FLOOR) == (40_000_000, 20_000_000)
     split = gw.compute_fee_split(MIN_PRICE, min_output_sompi=FLOOR)
-    assert (split.merchant_sompi, split.fee_sompi) == (20_000_000, 20_000_000)
+    assert (split.merchant_sompi, split.fee_sompi) == (40_000_000, 20_000_000)
     assert sdk.DEFAULT_MIN_OUTPUT_SOMPI == 20_000_000
+
+
+def test_v2_1_minimum_price_of_40_000_000_is_now_refused_by_both_sides() -> None:
+    for total in (39_999_999, 40_000_000, 59_999_999):
+        with pytest.raises(ValueError):
+            sdk.compute_fee_split(total, FLOOR)
+        with pytest.raises(ValueError):
+            gw.compute_fee_split(total, min_output_sompi=FLOOR)
 
 
 @pytest.mark.parametrize(
     ("total", "merchant", "fee"),
     [
-        (1_333_333_332, 1_313_333_332, 20_000_000),  # 1.5% = 19_999_999.98 -> ceil 20_000_000: floor == percentage
-        (1_333_333_333, 1_313_333_333, 20_000_000),  # 1.5% = 19_999_999.995 -> ceil 20_000_000: last flat-fee price
-        (1_333_333_334, 1_313_333_333, 20_000_001),  # 1.5% = 20_000_000.01 -> ceil 20_000_001: first percentage fee
+        (
+            1_333_333_332,
+            1_313_333_332,
+            20_000_000,
+        ),  # 1.5% = 19_999_999.98 -> ceil 20_000_000: floor == percentage
+        (
+            1_333_333_333,
+            1_313_333_333,
+            20_000_000,
+        ),  # 1.5% = 19_999_999.995 -> ceil 20_000_000: last flat-fee price
+        (
+            1_333_333_334,
+            1_313_333_333,
+            20_000_001,
+        ),  # 1.5% = 20_000_000.01 -> ceil 20_000_001: first percentage fee
         (1_333_333_335, 1_313_333_334, 20_000_001),
     ],
 )
-def test_crossover_boundary_matches_gateway(total: int, merchant: int, fee: int) -> None:
+def test_crossover_boundary_matches_gateway(
+    total: int, merchant: int, fee: int
+) -> None:
     assert sdk.compute_fee_split(total, FLOOR) == (merchant, fee)
     split = gw.compute_fee_split(total, min_output_sompi=FLOOR)
     assert (split.merchant_sompi, split.fee_sompi) == (merchant, fee)
-    header = gw.PaymentRequired.for_endpoint(total, MERCHANT, NONCE, future()).to_header()
+    header = gw.PaymentRequired.for_endpoint(
+        total, MERCHANT, NONCE, future()
+    ).to_header()
     assert sdk.PaymentRequired.from_header(header).fee_sompi == fee
 
 
 def test_flat_fee_regime_ends_exactly_at_1_333_333_334() -> None:
-    last_flat = max(t for t in range(1_333_333_300, 1_333_333_400) if sdk.compute_fee_split(t, FLOOR)[1] == FLOOR)
+    last_flat = max(
+        t
+        for t in range(1_333_333_300, 1_333_333_400)
+        if sdk.compute_fee_split(t, FLOOR)[1] == FLOOR
+    )
     assert last_flat == 1_333_333_333
     assert sdk.compute_fee_split(last_flat + 1, FLOOR)[1] == FLOOR + 1
 
@@ -166,7 +259,11 @@ def test_gateway_and_sdk_floor_default_agree() -> None:
 
 
 def test_payment_payload_matches_gateway() -> None:
-    assert sdk.payment_payload(NONCE) == gw.payment_payload(NONCE) == b"kasgate:v1:" + NONCE.encode()
+    assert (
+        sdk.payment_payload(NONCE)
+        == gw.payment_payload(NONCE)
+        == b"kasgate:v1:" + NONCE.encode()
+    )
 
 
 def test_limits_match_gateway_v2() -> None:
@@ -178,8 +275,12 @@ def test_limits_match_gateway_v2() -> None:
     assert constants.DEFAULT_MAX_SIGNATURE_HEADER_BYTES <= gw.MAX_HEADER_BYTES
 
 
-def test_gateway_enforces_the_flat_fee_so_old_percentage_only_challenges_are_invalid() -> None:
-    old_fee = -(-MIN_PRICE * 150 // 10_000)  # 600_000: what v2 (pre-2.1) would have asked for
+def test_gateway_enforces_the_flat_fee_so_old_percentage_only_challenges_are_invalid() -> (
+    None
+):
+    old_fee = -(
+        -MIN_PRICE * 150 // 10_000
+    )  # 900_000: what v2 (pre-2.1) would have asked for
     forged = challenge(MIN_PRICE, fee_amount=old_fee)
     with pytest.raises(ValueError):
         gw.PaymentRequired.from_header(forged.to_header())
@@ -195,7 +296,12 @@ def test_gateway_accepts_every_challenge_the_sdk_validates() -> None:
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("1", 100_000_000), ("6.66666601", 666_666_601), (0.5, 50_000_000), ("0.00000001", 1)],
+    [
+        ("1", 100_000_000),
+        ("6.66666601", 666_666_601),
+        (0.5, 50_000_000),
+        ("0.00000001", 1),
+    ],
 )
 def test_kas_to_sompi_exact(value: object, expected: int) -> None:
     assert sdk.kas_to_sompi(value) == expected  # type: ignore[arg-type]

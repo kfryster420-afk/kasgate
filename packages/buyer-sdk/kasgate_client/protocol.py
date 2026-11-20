@@ -53,17 +53,21 @@ def normalize_tx_id(value: str) -> str:
 
 
 def min_price_sompi(min_output_sompi: int = DEFAULT_MIN_OUTPUT_SOMPI) -> int:
-    """Cheapest valid total: fee = floor (1.5% is below it here) and merchant = floor."""
-    return 2 * min_output_sompi
+    """Cheapest valid total (CONTRACT v2.3): fee = floor (flat) and merchant = 2 * floor, i.e. 3 * floor.
+
+    Two floor-sized outputs already use the whole 100_000 standard storage mass, so a payment that must also carry
+    a change output needs a merchant output of at least 2 * floor.
+    """
+    return 3 * min_output_sompi
 
 
 def compute_fee_split(
     total_sompi: int, min_output_sompi: int = DEFAULT_MIN_OUTPUT_SOMPI
 ) -> tuple[int, int]:
-    """Return (merchant_sompi, fee_sompi) under CONTRACT v2.1.
+    """Return (merchant_sompi, fee_sompi) under CONTRACT v2.1 / v2.3.
 
     fee = max(ceil(total * 150 / 10_000), min_output_sompi); merchant = total - fee. Raises ValueError when the
-    merchant output would fall below `min_output_sompi` (total < 2 * min_output_sompi).
+    merchant output would fall below 2 * min_output_sompi (total < 3 * min_output_sompi).
     """
     if total_sompi <= 0:
         raise ValueError("total_sompi must be positive")
@@ -74,10 +78,10 @@ def compute_fee_split(
     ) // BPS_DENOMINATOR
     fee = max(percentage_fee, min_output_sompi)
     merchant = total_sompi - fee
-    if merchant < min_output_sompi:
+    if merchant < 2 * min_output_sompi:
         raise ValueError(
-            f"price {total_sompi} sompi leaves a merchant output below {min_output_sompi} sompi; "
-            f"minimum price is {min_price_sompi(min_output_sompi)} sompi"
+            f"price {total_sompi} sompi leaves a merchant output below {2 * min_output_sompi} sompi "
+            f"(2 * min_output_sompi); minimum price is {min_price_sompi(min_output_sompi)} sompi"
         )
     return merchant, fee
 
