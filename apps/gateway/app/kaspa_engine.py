@@ -21,7 +21,8 @@ Error-code decisions:
 
 * ``wrong_network``       network mismatch or an address prefix that does not belong to the network.
 * ``invalid_payment_header`` malformed JSON/transaction, txId mismatch, nonce or payload mismatch, payer address not
-                          an input owner, input UTXO missing on the node or different from the embedded entry.
+                          P2PK Schnorr or not an input owner, payerProof invalid (CONTRACT v2.6), input UTXO
+                          missing on the node or different from the embedded entry.
 * ``underpaid``           ``outputs[0]`` pays the right script but strictly less than the merchant amount, or the
                           merchant output is below ``2 * MIN_OUTPUT_SOMPI`` (CONTRACT v2.3).
 * ``invalid_fee_split``   missing ``outputs[1]``, wrong script, swapped order, ANY fee value other than the
@@ -56,6 +57,7 @@ from typing import Any, Final, Protocol, TypeVar
 from kaspa import (
     Address,
     NetworkId,
+    PublicKey,
     Resolver,
     RpcClient,
     ScriptPublicKey,
@@ -65,6 +67,7 @@ from kaspa import (
     calculate_transaction_mass,
     maximum_standard_transaction_mass,
     pay_to_address_script,
+    verify_message,
 )
 
 from app.config import (
@@ -74,7 +77,7 @@ from app.config import (
     Settings,
     get_settings,
 )
-from app.schemas import PaymentRequired, PaymentSignature, payment_payload
+from app.schemas import PaymentRequired, PaymentSignature, payer_proof_message, payment_payload
 
 logger = logging.getLogger("kasgate.kaspa_engine")
 
@@ -90,6 +93,8 @@ NETWORK_TYPE_BY_CONFIG: Final[dict[str, str]] = {
 NATIVE_SUBNETWORK_ID: Final[str] = "0" * 40
 TX_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 HEX_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{2})*")
+P2PK_SCHNORR_SCRIPT: Final[re.Pattern[str]] = re.compile(r"20([0-9a-f]{64})ac")
+PAYER_PROOF_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{128}")
 ALREADY_ACCEPTED_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"already been accepted|already accepted|was accepted by the consensus", re.IGNORECASE
 )
@@ -398,6 +403,7 @@ class KaspaEngine:
         self._check_network(signature, required)
         tx = self._parse_transaction(signature)
         self._check_payload(tx, signature.nonce, required.nonce)
+        self._check_payer_proof(signature)
         input_values, input_scripts = self._read_inputs(tx.to_dict())
         self._check_payer(signature.payerAddress, set(input_scripts))
         merchant_paid, fee_paid = self._check_outputs(tx, required)
@@ -533,6 +539,29 @@ class KaspaEngine:
         if actual != payment_payload(required_nonce).hex():
             raise PaymentVerificationError(
                 "invalid_payment_header", "transaction payload does not bind this payment's nonce"
+            )
+
+    @staticmethod
+    def _check_payer_proof(signature: PaymentSignature) -> None:
+        """CONTRACT v2.6: ``payerProof`` is a Schnorr signature by the payerAddress key over
+        ``payer_proof_message(nonce, txId)``, so someone who only saw the tx in the mempool cannot claim it."""
+        version, script = _script_key(signature.payerAddress, what="payerAddress", code="invalid_payment_header")
+        match = P2PK_SCHNORR_SCRIPT.fullmatch(script)
+        if version != 0 or match is None:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "payerAddress must be a P2PK Schnorr address (script 20 <x-only key> ac)"
+            )
+        proof = str(signature.payerProof).lower()
+        if not PAYER_PROOF_PATTERN.fullmatch(proof):
+            raise PaymentVerificationError("invalid_payment_header", "payerProof must be a 128-hex Schnorr signature")
+        message = payer_proof_message(signature.nonce, signature.txId)
+        try:
+            valid = bool(verify_message(message, proof, PublicKey(match.group(1))))
+        except Exception as exc:
+            raise PaymentVerificationError("invalid_payment_header", "payerProof is not a valid signature") from exc
+        if not valid:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "payerProof is not a signature by payerAddress over this nonce and txId"
             )
 
     @staticmethod

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from collections.abc import Callable
@@ -16,8 +17,11 @@ from kaspa import (
     Transaction,
     UtxoEntry,
     UtxoEntryReference,
+    address_from_script_public_key,
     create_transaction,
     pay_to_address_script,
+    pay_to_script_hash_script,
+    sign_message,
     sign_transaction,
 )
 
@@ -45,6 +49,7 @@ from app.schemas import (  # noqa: E402
     PlatformFee,
     compute_fee_split,
     min_price_sompi,
+    payer_proof_message,
     payment_payload,
 )
 
@@ -157,12 +162,18 @@ def signature_for(
     raw: str | None = None,
     payer: PrivateKey = PAYER_KEY,
     nonce: str = NONCE,
+    proof_key: PrivateKey | None = None,
+    proof_tx_id: str | None = None,
 ) -> PaymentSignature:
+    """A PAYMENT-SIGNATURE whose payerProof (CONTRACT v2.6) is signed by ``proof_key`` (default: the payer)."""
+    claimed_id = tx_id or tx.id
+    proof = sign_message(payer_proof_message(nonce, proof_tx_id or claimed_id), proof_key or payer)
     return PaymentSignature(
-        txId=tx_id or tx.id,
+        txId=claimed_id,
         rawTx=raw if raw is not None else json.dumps(tx.to_dict()),
         payerAddress=address_of(payer).to_string(),
         nonce=nonce,
+        payerProof=proof,
     )
 
 
@@ -581,6 +592,7 @@ async def test_payer_address_prefix_mismatch_is_wrong_network() -> None:
         rawTx=json.dumps(tx.to_dict()),
         payerAddress=PAYER_KEY.to_address("mainnet").to_string(),
         nonce=NONCE,
+        payerProof=sign_message(payer_proof_message(NONCE, tx.id), PAYER_KEY),
     )
     engine, _ = make_engine()
     await expect_error(engine, signature, required, "wrong_network")
@@ -1325,3 +1337,120 @@ def test_more_than_sixteen_payer_addresses_is_invalid_payment_header() -> None:
         engine._lookup_addresses(payer, scripts)
     assert info.value.code == "invalid_payment_header"
     assert "more than 16 payer addresses" in info.value.message
+
+
+# ----------------------------------------------------------------------------- CONTRACT v2.6: payer proof
+
+
+async def test_valid_payer_proof_is_accepted() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    signature = signature_for(tx)
+    assert len(signature.payerProof) == 128
+    engine, client = make_engine()
+    assert (await engine.verify_and_submit(signature, required)).payer_address == address_of(PAYER_KEY).to_string()
+    assert len(client.submitted) == 1
+
+
+def test_base64_payer_proof_is_normalised_and_accepted() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    hex_proof = sign_message(payer_proof_message(NONCE, tx.id), PAYER_KEY)
+    signature = PaymentSignature(
+        txId=tx.id,
+        rawTx=json.dumps(tx.to_dict()),
+        payerAddress=address_of(PAYER_KEY).to_string(),
+        nonce=NONCE,
+        payerProof=base64.b64encode(bytes.fromhex(hex_proof)).decode(),
+    )
+    engine, _ = make_engine()
+    assert engine.verify(signature, required)[0].tx_id == tx.id
+
+
+async def test_front_runner_proof_by_another_key_is_rejected() -> None:
+    """An observer copies the tx from the mempool and claims it with their own key: rejected before any lock."""
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    engine, client = make_engine()
+    error = await expect_error(engine, signature_for(tx, proof_key=OTHER_KEY), required, "invalid_payment_header")
+    assert "payerProof" in error.message
+    assert client.submitted == [] and client.utxo_calls == []
+
+
+async def test_payer_proof_over_a_different_tx_id_is_rejected() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    engine, client = make_engine()
+    error = await expect_error(engine, signature_for(tx, proof_tx_id="ab" * 32), required, "invalid_payment_header")
+    assert "payerProof" in error.message
+    assert client.submitted == []
+
+
+async def test_payer_proof_over_a_different_nonce_is_rejected() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    good = signature_for(tx)
+    replayed = good.model_copy(update={"payerProof": sign_message(payer_proof_message(OTHER_NONCE, tx.id), PAYER_KEY)})
+    engine, _ = make_engine()
+    await expect_error(engine, replayed, required, "invalid_payment_header")
+
+
+async def test_p2sh_payer_address_is_rejected() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    redeem = bytes.fromhex(str(pay_to_address_script(address_of(PAYER_KEY)).script))
+    # The stub types the redeem script as the opaque `Binary` class; the binding accepts bytes.
+    p2sh_script = pay_to_script_hash_script(redeem)  # type: ignore[arg-type]
+    p2sh = address_from_script_public_key(p2sh_script, "testnet").to_string()
+    assert p2sh.startswith("kaspatest:p")
+    signature = signature_for(tx).model_copy(update={"payerAddress": p2sh})
+    engine, client = make_engine()
+    error = await expect_error(engine, signature, required, "invalid_payment_header")
+    assert "P2PK Schnorr" in error.message
+    assert client.submitted == []
+
+
+async def test_ecdsa_payer_address_is_rejected() -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    ecdsa = PAYER_KEY.to_address_ecdsa("testnet").to_string()
+    signature = signature_for(tx).model_copy(update={"payerAddress": ecdsa})
+    engine, _ = make_engine()
+    error = await expect_error(engine, signature, required, "invalid_payment_header")
+    assert "P2PK Schnorr" in error.message
+
+
+@pytest.mark.parametrize("proof", ["", "zz" * 64, "ab" * 63, "ab" * 65, "00" * 64, "ff" * 64])
+async def test_malformed_payer_proof_is_invalid_payment_header(proof: str) -> None:
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    signature = signature_for(tx).model_copy(update={"payerProof": proof})
+    engine, client = make_engine()
+    await expect_error(engine, signature, required, "invalid_payment_header")
+    assert client.submitted == []
+
+
+def test_payer_proof_schema_rejects_malformed_values() -> None:
+    tx = signed_transaction(standard_outputs(build_required()))
+    for proof in ("zz" * 64, "ab" * 10):
+        with pytest.raises(ValueError):
+            PaymentSignature(
+                txId=tx.id,
+                rawTx=json.dumps(tx.to_dict()),
+                payerAddress=address_of(PAYER_KEY).to_string(),
+                nonce=NONCE,
+                payerProof=proof,
+            )
+
+
+async def test_resolve_inputs_requires_an_input_from_the_payer_script() -> None:
+    """Even with a valid proof by its own key, a claimant who spent nothing in the tx is rejected on node data."""
+    required = build_required()
+    tx = signed_transaction(standard_outputs(required))
+    claim = signature_for(tx, payer=OTHER_KEY)
+    engine, _ = make_engine()
+    _, parsed = engine.verify(signature_for(tx), required)
+    with pytest.raises(PaymentVerificationError) as info:
+        await engine.resolve_inputs(claim, parsed)
+    assert info.value.code == "invalid_payment_header"
+    assert "does not own any input" in info.value.message
