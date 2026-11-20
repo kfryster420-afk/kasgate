@@ -86,28 +86,29 @@ class FeeSplit(BaseModel):
 
 
 def compute_fee_split(total_sompi: int, min_output_sompi: int | None = None) -> FeeSplit:
-    """Output 0 (merchant) = total - fee; Output 1 (treasury) = ceil(total * 150 / 10_000).
+    """Output 1 (treasury) fee = max(ceil(total * 150 / 10_000), MIN_OUTPUT_SOMPI); Output 0 (merchant) = total - fee.
 
-    Raises ValueError when either output would fall below the KIP-9 storage-mass floor.
+    The fee never drops below the KIP-9 output floor, so the treasury output is always relayable.
+    Raises ValueError when the merchant output would fall below the floor.
     """
     floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
     if total_sompi <= 0:
         raise ValueError("total_sompi must be positive")
-    fee = (total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
+    pct_fee = (total_sompi * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
+    fee = max(pct_fee, floor)
     merchant = total_sompi - fee
-    if fee < floor or merchant < floor:
+    if merchant < floor:
         raise ValueError(
-            f"price {total_sompi} sompi produces outputs below MIN_OUTPUT_SOMPI={floor}; "
+            f"price {total_sompi} sompi produces a merchant output below MIN_OUTPUT_SOMPI={floor}; "
             f"minimum price is {min_price_sompi(floor)} sompi"
         )
     return FeeSplit(total_sompi=total_sompi, merchant_sompi=merchant, fee_sompi=fee)
 
 
 def min_price_sompi(min_output_sompi: int | None = None) -> int:
+    """Cheapest valid total: fee = floor (percentage fee is below it here) and merchant = floor."""
     floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
-    by_fee = ((floor - 1) * BPS_DENOMINATOR) // PLATFORM_FEE_BPS + 1
-    by_merchant = floor + (floor * PLATFORM_FEE_BPS + BPS_DENOMINATOR - 1) // BPS_DENOMINATOR
-    return max(by_fee, by_merchant)
+    return 2 * floor
 
 
 def _reject_private_host(url: HttpUrl) -> HttpUrl:

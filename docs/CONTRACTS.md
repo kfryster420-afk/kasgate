@@ -136,3 +136,10 @@ Auth (GAP-12/13/14):
 - Challenge rate limit is per-IP only (per-address limit removed: it allowed victim lockout).
 Amounts (GAP-15): SompiStr max 18 digits. /healthz stays public but only returns status+network to unauthenticated callers is NOT required for MVP.
 Error codes: + payment_expired (402).
+
+## CONTRACT v2.1 — fee floor (Kyle approved 2026-11-20)
+- Treasury fee = max(ceil(total*150/10000), MIN_OUTPUT_SOMPI). Merchant = total - fee, must be >= MIN_OUTPUT_SOMPI.
+- min_price_sompi(floor) = 2*floor = 40_000_000 sompi (0.4 KAS) at the default 20_000_000 floor. Replaces 1_333_333_267 everywhere.
+- Below 1_333_333_334 sompi the fee is the flat floor (0.2 KAS); above that it is 1.5% (ceil).
+- Engine: exact-value checks against PaymentRequired still apply; the ">= 1.5%" check stays valid because fee >= 1.5% always.
+- Clients (web lib/sompi.ts, buyer SDK) must replicate: fee = max(ceil(amount*150/10000), min_output_sompi) using DirectoryManifest.min_output_sompi.
