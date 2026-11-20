@@ -3,7 +3,7 @@
 Live tests need a running gateway and, for payments, a funded testnet key:
 
     KASGATE_GATEWAY_URL        default http://localhost:8000
-    KASGATE_TEST_PAYER_KEY_FILE path of a file holding that key (default /workspace/kg-secrets/buyer.key); never printed
+    KASGATE_TEST_PAYER_KEY_FILE path of a file holding that key (no default); the key is never printed
     KASGATE_TEST_PAYER_KEY     hex private key of a funded kaspa:testnet-10 address (skips the real-settlement tests if unset)
     KASGATE_TEST_RPC_URL       optional wRPC URL used by the test client (default: public resolver)
     KASGATE_TEST_UPSTREAM_URL  public upstream the gateway proxies to (default https://httpbin.org/anything)
@@ -111,20 +111,19 @@ class SecretKey(str):
         return "****"
 
 
-DEFAULT_PAYER_KEY_FILE = "/workspace/kg-secrets/buyer.key"
-
-
 def _funded_key() -> str:
     """The funded payer key from KASGATE_TEST_PAYER_KEY or the file named by KASGATE_TEST_PAYER_KEY_FILE.
 
-    The file defaults to /workspace/kg-secrets/buyer.key. The key is never printed, logged or put in a message; an
-    unreadable, empty or malformed value just means "no funded key" (the real-settlement tests skip).
+    Neither variable has a default: with both unset there is no funded key and the real-settlement tests skip. The key
+    is never printed, logged or put in a message; an unreadable, empty or malformed value also means "no funded key".
     """
     value = os.environ.get("KASGATE_TEST_PAYER_KEY", "").strip()
     if not value:
-        path = Path(os.environ.get("KASGATE_TEST_PAYER_KEY_FILE", DEFAULT_PAYER_KEY_FILE))
+        file_name = os.environ.get("KASGATE_TEST_PAYER_KEY_FILE", "").strip()
+        if not file_name:
+            return ""
         try:
-            value = path.read_text().strip()
+            value = Path(file_name).read_text().strip()
         except OSError:
             return ""
     if len(value) != 64 or any(c not in "0123456789abcdefABCDEF" for c in value):
@@ -140,8 +139,8 @@ def payer_key(network: str, health: dict[str, Any]) -> str:
     key = _funded_key()
     if not key:
         pytest.skip(
-            "no funded payer key: set KASGATE_TEST_PAYER_KEY or KASGATE_TEST_PAYER_KEY_FILE "
-            f"(default {DEFAULT_PAYER_KEY_FILE}) to a funded kaspa:testnet-10 key"
+            "no funded payer key: set KASGATE_TEST_PAYER_KEY_FILE (path of a file holding the hex key) or "
+            "KASGATE_TEST_PAYER_KEY to a funded kaspa:testnet-10 key"
         )
     return key
 

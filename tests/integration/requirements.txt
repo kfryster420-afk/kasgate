@@ -6,6 +6,7 @@ pydantic>=2.9,<3.0
 pydantic-settings>=2.6,<3.0
 email-validator>=2.2,<3.0
 sqlalchemy[asyncio]>=2.0.36,<2.1
--e ../../packages/buyer-sdk
 fastapi>=0.115,<1.0
 redis>=5.2,<6.0
+cryptography>=43,<46
+asyncpg>=0.30,<1.0

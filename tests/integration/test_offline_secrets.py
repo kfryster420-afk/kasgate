@@ -61,8 +61,25 @@ def test_missing_file_means_no_funded_key(tmp_path, monkeypatch) -> None:
     assert _funded_key() == ""
 
 
-def test_default_key_file_path_is_the_secrets_dir() -> None:
-    assert conftest.DEFAULT_PAYER_KEY_FILE == "/workspace/kg-secrets/buyer.key"
+def test_with_neither_variable_set_there_is_no_funded_key_and_no_default_path(monkeypatch) -> None:
+    monkeypatch.delenv("KASGATE_TEST_PAYER_KEY", raising=False)
+    monkeypatch.delenv("KASGATE_TEST_PAYER_KEY_FILE", raising=False)
+    assert _funded_key() == ""
+    assert not hasattr(conftest, "DEFAULT_PAYER_KEY_FILE")
+
+
+def test_blank_file_variable_is_treated_as_unset(monkeypatch) -> None:
+    monkeypatch.delenv("KASGATE_TEST_PAYER_KEY", raising=False)
+    monkeypatch.setenv("KASGATE_TEST_PAYER_KEY_FILE", "   ")
+    assert _funded_key() == ""
+
+
+def test_the_skip_reason_names_both_variables_and_no_path() -> None:
+    import inspect
+
+    source = inspect.getsource(conftest.payer_key)
+    assert "KASGATE_TEST_PAYER_KEY_FILE" in source and "or KASGATE_TEST_PAYER_KEY" in source.replace('"\n            "', "")
+    assert "kg-secrets" not in inspect.getsource(conftest)
 
 
 async def test_sdk_client_accepts_a_secret_key_and_hides_it(monkeypatch) -> None:

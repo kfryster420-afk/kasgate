@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 from urllib.parse import unquote
@@ -28,6 +30,46 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server  # type: ignore[no-redef]
     from mcp.server.fastmcp.exceptions import ToolError  # type: ignore[no-redef]
 
+logger = logging.getLogger("kasgate_mcp")
+
+KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def read_key_file(path: str, *, allow_insecure: bool = False) -> str:
+    """Read a hex private key from `path` (strip whitespace). Exits with a message that never contains the contents.
+
+    A file that is readable by group or others (mode bits `077`) is refused unless `allow_insecure`, in which case a
+    warning is logged to stderr. The permissions are checked on the opened descriptor, not on the path.
+    """
+    expanded = os.path.expanduser(path)
+    try:
+        fd = os.open(expanded, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))  # never block on a FIFO
+    except OSError as exc:
+        raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be opened: {exc.strerror}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} is not a regular file")
+        if os.name != "nt" and info.st_mode & 0o077:
+            mode = stat.S_IMODE(info.st_mode)
+            if not allow_insecure:
+                raise SystemExit(
+                    f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} has mode {mode:04o}: it must not be readable by "
+                    f"group or others (chmod 600), or set KASGATE_ALLOW_INSECURE_KEY_FILE=1 to override"
+                )
+            logger.warning("buyer key file %s has mode %04o and is readable by others (override in effect)", expanded, mode)
+        try:
+            text = os.read(fd, 4096).decode("utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be read as text") from exc
+    finally:
+        os.close(fd)
+    if not KEY_RE.fullmatch(text):
+        raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} must contain one 64-character hex private key")
+    return text
+
+
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$")
 ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 MAX_RESULT_CHARS = 100_000
@@ -37,7 +79,7 @@ _BAD_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f\\#]")
 @dataclass(frozen=True)
 class Config:
     gateway_url: str = "http://localhost:8000"
-    buyer_private_key: str | None = None
+    buyer_private_key: str | None = field(default=None, repr=False)  # never rendered
     network: str = "kaspa:testnet-10"
     rpc_url: str | None = None
     max_price_sompi: int = DEFAULT_MAX_PRICE_SOMPI
@@ -50,13 +92,29 @@ class Config:
             max_price = kas_to_sompi(env.get("KASGATE_MAX_PRICE_KAS", "20"))
         except ValueError as exc:
             raise SystemExit(f"KASGATE_MAX_PRICE_KAS is invalid: {exc}") from exc
+        key_file = (env.get("KASGATE_BUYER_PRIVATE_KEY_FILE") or "").strip()
+        inline_key = (env.get("KASGATE_BUYER_PRIVATE_KEY") or "").strip() or None
+        if key_file:
+            if inline_key:
+                logger.warning("KASGATE_BUYER_PRIVATE_KEY_FILE is set: ignoring KASGATE_BUYER_PRIVATE_KEY")
+            buyer_key: str | None = read_key_file(
+                key_file, allow_insecure=env.get("KASGATE_ALLOW_INSECURE_KEY_FILE", "").strip().lower() in TRUTHY
+            )
+        else:
+            buyer_key = inline_key
+        try:
+            timeout = float(env.get("KASGATE_REQUEST_TIMEOUT", "60"))
+        except ValueError as exc:
+            raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a number of seconds") from exc
+        if not 0 < timeout < float("inf"):
+            raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a positive number of seconds")
         return cls(
             gateway_url=env.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip("/"),
-            buyer_private_key=(env.get("KASGATE_BUYER_PRIVATE_KEY") or "").strip() or None,
+            buyer_private_key=buyer_key,
             network=env.get("KASGATE_NETWORK", "kaspa:testnet-10"),
             rpc_url=(env.get("KASGATE_RPC_URL") or "").strip() or None,
             max_price_sompi=max_price,
-            timeout_seconds=float(env.get("KASGATE_REQUEST_TIMEOUT", "60")),
+            timeout_seconds=timeout,
         )
 
 
@@ -137,7 +195,10 @@ def build_server(
     def paying_client() -> KasGateClient:
         if state["buyer"] is None:
             if not cfg.buyer_private_key:
-                raise ToolError("KASGATE_BUYER_PRIVATE_KEY is not configured on this MCP server; paid calls are disabled")
+                raise ToolError(
+                    "no buyer key is configured on this MCP server (KASGATE_BUYER_PRIVATE_KEY_FILE or "
+                    "KASGATE_BUYER_PRIVATE_KEY); paid calls are disabled"
+                )
             try:
                 state["buyer"] = KasGateClient(
                     cfg.buyer_private_key,

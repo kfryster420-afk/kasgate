@@ -8,12 +8,25 @@ Stdio MCP server for KasGate. Tools:
 | `quote_endpoint(slug)` | `GET /v1/quote/{slug}`: price and fee split, nothing is paid. |
 | `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. |
 
-Environment: `KASGATE_BUYER_PRIVATE_KEY` (hex, required for paid calls), `KASGATE_GATEWAY_URL` (default
-`http://localhost:8000`), `KASGATE_NETWORK` (default `kaspa:testnet-10`), `KASGATE_RPC_URL` (optional),
-`KASGATE_MAX_PRICE_KAS` (hard ceiling per call, default `20`; `max_price_kas` can only lower it).
+## Environment
+
+| variable | meaning |
+| --- | --- |
+| `KASGATE_BUYER_PRIVATE_KEY_FILE` | **Preferred.** Path of a file holding the buyer's 64-character hex private key (`~` is expanded, surrounding whitespace and the trailing newline are stripped). Wins over `KASGATE_BUYER_PRIVATE_KEY` when both are set (a warning is logged to stderr, never the key). The file must be a regular file that is not readable by group or others: create it with `umask 077` or `chmod 600`, otherwise the server refuses to start. |
+| `KASGATE_ALLOW_INSECURE_KEY_FILE` | `1`/`true`/`yes`/`on` downgrades the permission refusal to a warning on stderr. Only for setups where file modes are meaningless (some mounted volumes). |
+| `KASGATE_BUYER_PRIVATE_KEY` | The key inline, as hex. Convenient but visible in the process environment and in MCP client config files; prefer the file. Without either variable the server still lists and quotes, but paid calls are disabled. |
+| `KASGATE_GATEWAY_URL` | Gateway base URL, default `http://localhost:8000`. |
+| `KASGATE_NETWORK` | `kaspa:testnet-10` (default) or `kaspa:mainnet`. |
+| `KASGATE_RPC_URL` | Optional wRPC URL for UTXO lookups (default: the public resolver). |
+| `KASGATE_MAX_PRICE_KAS` | Hard ceiling per call, default `20`; the `max_price_kas` tool argument can only lower it. |
+| `KASGATE_REQUEST_TIMEOUT` | Seconds the server waits for a gateway response (including the payment settlement), default `60`. Must be a positive number or the server exits at startup. |
+
+The key's contents are never logged, never part of an error message and not shown in `repr(Config)`. A missing, malformed
+(not exactly 64 hex characters), binary or non-regular key file makes the server exit with a message that names the path
+only.
 
 ```json
-{"mcpServers": {"kasgate": {"command": "kasgate-mcp", "env": {"KASGATE_BUYER_PRIVATE_KEY": "<hex>", "KASGATE_GATEWAY_URL": "http://localhost:8000"}}}}
+{"mcpServers": {"kasgate": {"command": "kasgate-mcp", "env": {"KASGATE_BUYER_PRIVATE_KEY_FILE": "/home/me/.config/kasgate/buyer.key", "KASGATE_GATEWAY_URL": "http://localhost:8000"}}}}
 ```
 
 Works with mcp 2.x (`MCPServer`) and falls back to mcp 1.x (`FastMCP`).

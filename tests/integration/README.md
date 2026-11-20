@@ -22,8 +22,9 @@ Offline unit tests for the SDK live in `packages/buyer-sdk/tests`, for the MCP s
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -r tests/integration/requirements.txt -e packages/mcp-server
-cd tests/integration && pytest -rs          # offline tests always run; live tests skip with a reason
+# from the repository root:
+pip install -e packages/buyer-sdk -e packages/mcp-server -r tests/integration/requirements.txt
+pytest -rs tests/integration          # offline tests always run; live tests skip with a reason
 ```
 
 ## Gateway configuration for this suite
@@ -35,8 +36,8 @@ All host traffic reaches the gateway from one Docker bridge IP, and the default 
 | variable | meaning |
 | --- | --- |
 | `KASGATE_GATEWAY_URL` | gateway base URL, default `http://localhost:8000` |
-| `KASGATE_TEST_PAYER_KEY_FILE` | file holding the funded payer's hex key, default `/workspace/kg-secrets/buyer.key`. The key is never printed or logged (`SecretKey` masks it); don't assert on it directly |
-| `KASGATE_TEST_PAYER_KEY` | the same key inline; wins over the file. Without either, the funded tests skip |
+| `KASGATE_TEST_PAYER_KEY_FILE` | file holding the funded payer's hex key (no default). The key is never printed or logged (`SecretKey` masks it); don't assert on it directly |
+| `KASGATE_TEST_PAYER_KEY` | the same key inline; wins over the file. With neither variable set, the funded tests skip with a reason naming both |
 | `KASGATE_TEST_RPC_URL` | wRPC URL for the test client's UTXO lookups (default: public resolver) |
 | `KASGATE_TEST_UPSTREAM_URL` | public upstream the gateway proxies to, default `https://httpbin.org/anything` |
 | `KASGATE_TEST_FAILING_UPSTREAM_URL` | upstream that answers 5xx or refuses, default `https://httpbin.org/status/503` |

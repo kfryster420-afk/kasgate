@@ -244,3 +244,147 @@ async def test_expired_challenge_is_refused_before_signing() -> None:
         result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123"})
     assert result.is_error and "ChallengeExpiredError" in result.content[0].text
     assert fake.signatures == [] and buyer._utxo_provider.calls == []  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------- KASGATE_BUYER_PRIVATE_KEY_FILE / KASGATE_REQUEST_TIMEOUT
+
+
+def key_file(tmp_path, content: str = PAYER_KEY + "\n", mode: int = 0o600):
+    path = tmp_path / "buyer.key"
+    path.write_text(content)
+    path.chmod(mode)
+    return path
+
+
+def test_key_file_is_read_and_whitespace_stripped(tmp_path) -> None:
+    for content in (PAYER_KEY, PAYER_KEY + "\n", f"  \t{PAYER_KEY}\r\n\n", f"\n{PAYER_KEY.upper()}  "):
+        path = key_file(tmp_path, content)
+        cfg = Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)})
+        assert cfg.buyer_private_key == content.strip()
+
+
+def test_key_file_wins_over_the_inline_variable(tmp_path, caplog) -> None:
+    other = "ab" * 32
+    path = key_file(tmp_path)
+    with caplog.at_level("WARNING", logger="kasgate_mcp"):
+        cfg = Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path), "KASGATE_BUYER_PRIVATE_KEY": other})
+    assert cfg.buyer_private_key == PAYER_KEY
+    assert "ignoring KASGATE_BUYER_PRIVATE_KEY" in caplog.text
+    assert PAYER_KEY not in caplog.text and other not in caplog.text
+
+
+def test_blank_file_variable_falls_back_to_the_inline_key() -> None:
+    cfg = Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": "  ", "KASGATE_BUYER_PRIVATE_KEY": PAYER_KEY})
+    assert cfg.buyer_private_key == PAYER_KEY
+
+
+def test_home_directory_is_expanded(tmp_path, monkeypatch) -> None:
+    key_file(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": "~/buyer.key"}).buyer_private_key == PAYER_KEY
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o644, 0o604, 0o660, 0o666, 0o700 | 0o010, 0o777])
+def test_key_file_readable_by_group_or_others_is_refused(tmp_path, mode: int) -> None:
+    path = key_file(tmp_path, mode=mode)
+    with pytest.raises(SystemExit) as caught:
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)})
+    message = str(caught.value)
+    assert "chmod 600" in message and f"{mode:04o}" in message
+    assert PAYER_KEY not in message
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400, 0o500])
+def test_owner_only_key_files_are_accepted(tmp_path, mode: int) -> None:
+    path = key_file(tmp_path, mode=mode)
+    assert Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)}).buyer_private_key == PAYER_KEY
+
+
+@pytest.mark.parametrize("flag", ["1", "true", "YES", "on"])
+def test_insecure_permissions_can_be_overridden_with_a_warning(tmp_path, caplog, flag: str) -> None:
+    path = key_file(tmp_path, mode=0o644)
+    with caplog.at_level("WARNING", logger="kasgate_mcp"):
+        cfg = Config.from_env(
+            {"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path), "KASGATE_ALLOW_INSECURE_KEY_FILE": flag}
+        )
+    assert cfg.buyer_private_key == PAYER_KEY
+    assert "0644" in caplog.text and str(path) in caplog.text
+    assert PAYER_KEY not in caplog.text
+
+
+@pytest.mark.parametrize("flag", ["", "0", "false", "no", "maybe"])
+def test_override_flag_must_be_truthy(tmp_path, flag: str) -> None:
+    path = key_file(tmp_path, mode=0o644)
+    with pytest.raises(SystemExit):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path), "KASGATE_ALLOW_INSECURE_KEY_FILE": flag})
+
+
+def test_a_missing_directory_or_unreadable_key_file_exits_without_leaking(tmp_path) -> None:
+    with pytest.raises(SystemExit, match="cannot be opened"):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(tmp_path / "absent")})
+    with pytest.raises(SystemExit, match="not a regular file"):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(tmp_path)})
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "\n", "not a key", PAYER_KEY[:-1], PAYER_KEY + "00", "zz" * 32, PAYER_KEY + "\n" + PAYER_KEY, "mnemonic words " * 10],
+)
+def test_malformed_key_file_exits_and_the_message_never_contains_the_contents(tmp_path, content: str) -> None:
+    path = key_file(tmp_path, content)
+    with pytest.raises(SystemExit) as caught:
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)})
+    message = str(caught.value)
+    assert "64-character hex" in message
+    for fragment in (content.strip()[:12], PAYER_KEY[:12]):
+        assert not fragment or fragment not in message.replace(str(path), "")
+
+
+def test_binary_key_file_exits_cleanly(tmp_path) -> None:
+    path = tmp_path / "buyer.key"
+    path.write_bytes(b"\xff\xfe\x00\x80" * 40)
+    path.chmod(0o600)
+    with pytest.raises(SystemExit):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)})
+
+
+def test_a_huge_key_file_is_not_read_in_full(tmp_path) -> None:
+    path = key_file(tmp_path, "a" * 5_000_000)
+    with pytest.raises(SystemExit, match="64-character hex"):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(path)})
+
+
+def test_config_repr_never_contains_the_key(tmp_path) -> None:
+    cfg = Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(key_file(tmp_path))})
+    assert PAYER_KEY not in repr(cfg) and PAYER_KEY not in str(cfg)
+    assert PAYER_KEY not in repr(Config.from_env({"KASGATE_BUYER_PRIVATE_KEY": PAYER_KEY}))
+
+
+async def test_a_key_loaded_from_a_file_pays(tmp_path) -> None:
+    cfg = Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(key_file(tmp_path))})
+    fake = FakeGateway(challenge())
+    server, _ = make_server(fake, key=cfg.buyer_private_key)
+    async with Client(server) as client:
+        result = await client.call_tool("call_paid_endpoint", {"slug": "demo-abc123"})
+    assert not result.is_error, result.content[0].text
+    assert PAYER_KEY not in result.content[0].text
+
+
+def test_request_timeout_default_and_override() -> None:
+    assert Config.from_env({}).timeout_seconds == 60.0
+    assert Config.from_env({"KASGATE_REQUEST_TIMEOUT": "7.5"}).timeout_seconds == 7.5
+
+
+@pytest.mark.parametrize("value", ["abc", "", "0", "-1", "inf", "nan", "1e999"])
+def test_invalid_request_timeout_exits(value: str) -> None:
+    with pytest.raises(SystemExit, match="KASGATE_REQUEST_TIMEOUT"):
+        Config.from_env({"KASGATE_REQUEST_TIMEOUT": value})
+
+
+def test_a_fifo_key_file_is_refused_without_blocking(tmp_path) -> None:
+    import os
+
+    fifo = tmp_path / "buyer.fifo"
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(SystemExit, match="not a regular file"):
+        Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(fifo)})

@@ -568,3 +568,31 @@ async def test_node_outage_during_input_lookup_is_retryable_not_a_verdict(requir
     _, tx = engine.verify(signature, required)
     with pytest.raises(RpcUnavailableError):
         await engine.resolve_inputs(signature, tx)
+
+
+# ---------------------------------------------------------------- fixtures must satisfy the gateway's startup checks
+
+
+def test_every_fixture_address_has_a_valid_checksum_and_the_gateway_settings_load() -> None:
+    """The gateway refuses to start with a bad-checksum treasury; no fixture may rely on one."""
+    from app.config import Settings
+
+    for address in (TREASURY, MERCHANT, ATTACKER, PAYER):
+        assert kaspa.Address.validate(address), address
+    settings = Settings(
+        kaspa_network=NETWORK,
+        kasgate_treasury_address=TREASURY,
+        encryption_key="A" * 43 + "=",
+        database_url="postgresql+asyncpg://u:p@localhost/db",
+        redis_url="redis://localhost:6379/0",
+    )
+    assert settings.kasgate_treasury_address == TREASURY
+    broken = TREASURY[:-1] + ("q" if TREASURY[-1] != "q" else "p")
+    with pytest.raises(ValueError):
+        Settings(
+            kaspa_network=NETWORK,
+            kasgate_treasury_address=broken,
+            encryption_key="A" * 43 + "=",
+            database_url="postgresql+asyncpg://u:p@localhost/db",
+            redis_url="redis://localhost:6379/0",
+        )
