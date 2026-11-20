@@ -284,3 +284,49 @@ def test_known_limitation_two_equal_utxos_that_each_nearly_cover_the_payment_rai
         build([60_300_000, 60_300_000])
     built = build([60_300_000, 60_300_000, 40_000_000])  # one more input and the plan is found
     assert built.change_sompi >= MIN_CHANGE
+
+
+def rpc_form(entry: dict) -> dict:
+    """The shape kaspad's get_utxos_by_addresses really returns: utxoEntry nested, scriptPublicKey = '<u16 version><script>'."""
+    script = entry["scriptPublicKey"]["script"]
+    return {
+        "address": entry["address"],
+        "outpoint": entry["outpoint"],
+        "utxoEntry": {
+            "amount": entry["amount"],
+            "scriptPublicKey": "0000" + script,
+            "blockDaaScore": 1000,
+            "isCoinbase": False,
+            "covenantId": None,
+        },
+    }
+
+
+def test_distinct_input_addresses_understands_the_nodes_rpc_script_encoding() -> None:
+    """Regression found on testnet-10: real RPC entries carry scriptPublicKey as a hex string with a 2-byte version."""
+    entries = [rpc_form(make_utxo(0, KAS)), rpc_form(make_utxo(1, KAS))]
+    assert distinct_input_addresses(entries, "kaspa:testnet-10") == {PAYER}
+    mixed = [rpc_form(make_utxo(0, KAS)), make_utxo(1, KAS), *map(rpc_form, other_utxos(2))]
+    assert len(distinct_input_addresses(mixed, "kaspa:testnet-10")) == 3
+
+
+def test_builder_pays_from_rpc_shaped_utxos() -> None:
+    built = build_payment_transaction(
+        private_key=kaspa.PrivateKey(PAYER_KEY),
+        network="kaspa:testnet-10",
+        utxo_entries=[rpc_form(make_utxo(0, 500 * KAS))],
+        pay_to=MERCHANT,
+        fee_to=TREASURY,
+        merchant_sompi=MERCHANT_SOMPI,
+        fee_sompi=FEE_SOMPI,
+        max_network_fee_sompi=5_000_000,
+        payload=sdk.payment_payload(NONCE),
+    )
+    assert built.change_sompi >= MIN_CHANGE and built.payer_address == PAYER
+
+
+def test_malformed_rpc_script_is_a_typed_error() -> None:
+    entry = rpc_form(make_utxo(0, KAS))
+    entry["utxoEntry"]["scriptPublicKey"] = "00"
+    with pytest.raises(sdk.TransactionBuildError):
+        distinct_input_addresses([entry], "kaspa:testnet-10")

@@ -39,6 +39,8 @@ All host traffic reaches the gateway from one Docker bridge IP, and the default 
 | `KASGATE_TEST_PAYER_KEY` | the same key inline; wins over the file. Without either, the funded tests skip |
 | `KASGATE_TEST_RPC_URL` | wRPC URL for the test client's UTXO lookups (default: public resolver) |
 | `KASGATE_TEST_UPSTREAM_URL` | public upstream the gateway proxies to, default `https://httpbin.org/anything` |
+| `KASGATE_TEST_FAILING_UPSTREAM_URL` | upstream that answers 5xx or refuses, default `https://httpbin.org/status/503` |
+| `KASGATE_TEST_TXLOG` | optional JSONL file: one line per presented payment (txId, status, latency) |
 | `KASGATE_TEST_RPC_DOWN=1` | only when the gateway runs with an unreachable node: enables the 503 `rpc_unavailable` test |
 | `KASGATE_TEST_REDIS_DOWN=1` | only when the gateway's Redis is stopped: enables the 503 test for `DELETE /v1/auth/session` |
 | `KASGATE_TEST_SLOW=1` | enables the test that waits for a payment challenge to expire (`payment_expired`) |
@@ -85,3 +87,10 @@ never run the normal suite against that low-limit configuration.
 `xfail(strict=True)` tests assert the *secure* behaviour and currently fail on purpose: each one is tagged with a
 `GAP-n` id from the red-team report. When the gateway fixes a gap the test XPASSes and, being strict, fails the run so
 the marker gets removed.
+
+## Funded runs from a sandboxed box
+
+The gateway's SSRF guard resolves the upstream host itself and refuses non-public addresses. A sandbox whose DNS answers
+with a fake range (for example `198.18.0.0/15`) therefore makes every hostname upstream fail with 502 AFTER the payment
+settled. Point the suite at a literal public IP instead, e.g. `KASGATE_TEST_UPSTREAM_URL=https://1.1.1.1/cdn-cgi/trace`.
+The `test_small_change_at_the_minimum_price...` probe needs a payer UTXO of about 1 KAS or less (it skips otherwise).

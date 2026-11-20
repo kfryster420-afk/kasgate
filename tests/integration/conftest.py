@@ -7,6 +7,7 @@ Live tests need a running gateway and, for payments, a funded testnet key:
     KASGATE_TEST_PAYER_KEY     hex private key of a funded kaspa:testnet-10 address (skips the real-settlement tests if unset)
     KASGATE_TEST_RPC_URL       optional wRPC URL used by the test client (default: public resolver)
     KASGATE_TEST_UPSTREAM_URL  public upstream the gateway proxies to (default https://httpbin.org/anything)
+    KASGATE_TEST_FAILING_UPSTREAM_URL  upstream that answers 5xx or refuses (default https://httpbin.org/status/503)
     KASGATE_TEST_RPC_DOWN=1    set only when the gateway runs with an unreachable node: enables the 503 test
 
 Offline tests (test_offline_*.py) import the gateway's own pydantic models and verifier and need no services.

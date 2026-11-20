@@ -182,8 +182,14 @@ def distinct_input_addresses(
     for raw in entries:
         inner = raw.get("utxoEntry", raw)
         script = inner["scriptPublicKey"]
-        script_hex = script["script"] if isinstance(script, dict) else str(script)
-        version = int(script["version"]) if isinstance(script, dict) else 0
+        if isinstance(script, dict):
+            script_hex, version = str(script["script"]), int(script["version"])
+        else:
+            # kaspad's RPC form: a hex string whose first two bytes are the big-endian script version
+            text = str(script)
+            if len(text) < 6:
+                raise TransactionBuildError(f"malformed scriptPublicKey {text!r}")
+            version, script_hex = int(text[:4], 16), text[4:]
         try:
             spk = kaspa.ScriptPublicKey(version, script_hex)
             owner = kaspa.address_from_script_public_key(spk, network_type)

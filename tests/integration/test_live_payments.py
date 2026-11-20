@@ -39,17 +39,58 @@ funded = pytest.mark.funded
 
 ATTACKER_ADDRESS = "kaspatest:qr0lr4ml9fn3chekrqmjdkergxl93l4wrk3dankcgvjq776s9wn9jhtkdksae"
 MAX_INPUT_ADDRESSES = 16
+FAILING_UPSTREAM_URL = os.environ.get("KASGATE_TEST_FAILING_UPSTREAM_URL", "https://httpbin.org/status/503")
 
 
 def challenge_of(response: httpx.Response) -> PaymentRequired:
     return PaymentRequired.from_header(response.headers["PAYMENT-REQUIRED"])
 
 
+def _trace(header: str, response: httpx.Response, elapsed: float, method: str, url: str) -> None:
+    """Append one JSON line per presented payment to $KASGATE_TEST_TXLOG (txId, status, latency) when it is set."""
+    path = os.environ.get("KASGATE_TEST_TXLOG")
+    if not path:
+        return
+    from kasgate_client import PaymentSignature
+
+    try:
+        signature = PaymentSignature.from_header(header)
+        tx_id, nonce = signature.txId, signature.nonce
+    except ValueError:
+        tx_id = nonce = None
+    error = None
+    try:
+        error = response.json().get("error")
+    except ValueError:
+        pass
+    with open(path, "a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "at": datetime.now(UTC).isoformat(),
+                    "test": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0],
+                    "method": method,
+                    "url": url,
+                    "txId": tx_id,
+                    "nonce": nonce,
+                    "status": response.status_code,
+                    "error": error,
+                    "seconds": round(elapsed, 3),
+                }
+            )
+            + "\n"
+        )
+
+
 async def send(url: str, header: str, *, method: str = "GET", client: httpx.AsyncClient | None = None) -> httpx.Response:
+    started = time.monotonic()
     if client is not None:
-        return await client.request(method, url, headers={"PAYMENT-SIGNATURE": header})
-    async with httpx.AsyncClient(timeout=60) as own:
-        return await own.request(method, url, headers={"PAYMENT-SIGNATURE": header})
+        response = await client.request(method, url, headers={"PAYMENT-SIGNATURE": header})
+    else:
+        async with httpx.AsyncClient(timeout=60) as own:
+            response = await own.request(method, url, headers={"PAYMENT-SIGNATURE": header})
+    _trace(header, response, time.monotonic() - started, method, url)
+    return response
 
 
 def assert_rejected(response: httpx.Response, *codes: str) -> None:
@@ -479,7 +520,7 @@ def _create_failing_endpoint(gateway_url: str, auth: dict[str, str], price: int)
         headers=auth,
         json={
             "name": f"qa-failing-{secrets.token_hex(3)}",
-            "upstream_url": "https://httpbin.org/status/503",
+            "upstream_url": FAILING_UPSTREAM_URL,
             "price_sompi": price,
             "allowed_methods": ["GET"],
             "is_public_listed": False,
