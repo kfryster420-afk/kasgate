@@ -206,6 +206,12 @@ def network_id_for(network: str) -> str:
         raise ValueError(f"unsupported Kaspa network: {network}") from exc
 
 
+def rpc_url_for(settings: Settings) -> str | None:
+    """``KASPA_RPC_URL`` stripped; None (use the public Resolver) when unset, empty or whitespace only."""
+    url = (settings.kaspa_rpc_url or "").strip()
+    return url or None
+
+
 def _script_key(address: str, *, what: str, code: str) -> ScriptKey:
     """Locking script of ``address`` as a comparable ``(version, script_hex)`` pair."""
     try:
@@ -298,10 +304,11 @@ class KaspaEngine:
     # ------------------------------------------------------------------ lifecycle
 
     def _default_client_factory(self) -> RpcClientProtocol:
-        network_id = self._network_id
-        if self._settings.kaspa_rpc_url:
-            return RpcClient(url=self._settings.kaspa_rpc_url, network_id=network_id)  # type: ignore[return-value]
-        return RpcClient(resolver=Resolver(), network_id=network_id)  # type: ignore[return-value]
+        """Fixed wRPC Borsh URL (our own kaspad, e.g. ``ws://kaspad:17210``) when set, else the public Resolver."""
+        url = rpc_url_for(self._settings)
+        if url is not None:
+            return RpcClient(url=url, encoding="borsh", network_id=self._network_id)  # type: ignore[return-value]
+        return RpcClient(resolver=Resolver(), encoding="borsh", network_id=self._network_id)  # type: ignore[return-value]
 
     async def start(self) -> None:
         """Connect (best effort) and launch the background reconnect supervisor. Async; idempotent."""

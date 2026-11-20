@@ -42,6 +42,7 @@ from app.kaspa_engine import (  # noqa: E402
     VerifiedPayment,
     minimum_fee_sompi,
     parse_script_key,
+    rpc_url_for,
 )
 from app.schemas import (  # noqa: E402
     PaymentRequired,
@@ -1454,3 +1455,70 @@ async def test_resolve_inputs_requires_an_input_from_the_payer_script() -> None:
         await engine.resolve_inputs(claim, parsed)
     assert info.value.code == "invalid_payment_header"
     assert "does not own any input" in info.value.message
+
+
+# ----------------------------------------------------------------------------- RPC endpoint selection
+
+
+@dataclass
+class RecordingRpcClient:
+    kwargs: dict[str, Any]
+
+
+class RecordingResolver:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("\t\n", None),
+        ("ws://kaspad:17210", "ws://kaspad:17210"),
+        ("  ws://kaspad:17110 \n", "ws://kaspad:17110"),
+    ],
+)
+def test_rpc_url_for_treats_blank_as_resolver(configured: str | None, expected: str | None) -> None:
+    settings = get_settings().model_copy(update={"kaspa_rpc_url": configured})
+    assert rpc_url_for(settings) == expected
+
+
+@pytest.mark.parametrize("configured", [None, "", "   "])
+def test_blank_rpc_url_uses_resolver_with_borsh(monkeypatch: pytest.MonkeyPatch, configured: str | None) -> None:
+    import app.kaspa_engine as module
+
+    monkeypatch.setattr(module, "RpcClient", lambda **kwargs: RecordingRpcClient(kwargs))
+    monkeypatch.setattr(module, "Resolver", RecordingResolver)
+    engine = KaspaEngine(get_settings().model_copy(update={"kaspa_rpc_url": configured}))
+    client = engine._default_client_factory()
+    assert isinstance(client, RecordingRpcClient)
+    assert set(client.kwargs) == {"resolver", "encoding", "network_id"}
+    assert isinstance(client.kwargs["resolver"], RecordingResolver)
+    assert client.kwargs["encoding"] == "borsh"
+    assert str(client.kwargs["network_id"]) == "testnet-10"
+
+
+def test_fixed_rpc_url_bypasses_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.kaspa_engine as module
+
+    def no_resolver() -> None:
+        raise AssertionError("Resolver must not be used when KASPA_RPC_URL is set")
+
+    monkeypatch.setattr(module, "RpcClient", lambda **kwargs: RecordingRpcClient(kwargs))
+    monkeypatch.setattr(module, "Resolver", no_resolver)
+    engine = KaspaEngine(get_settings().model_copy(update={"kaspa_rpc_url": " ws://kaspad:17210 "}))
+    client = engine._default_client_factory()
+    assert isinstance(client, RecordingRpcClient)
+    assert client.kwargs["url"] == "ws://kaspad:17210"
+    assert client.kwargs["encoding"] == "borsh"
+    assert "resolver" not in client.kwargs
+
+
+def test_real_rpc_client_accepts_a_fixed_borsh_url() -> None:
+    """The real binding builds a client for ws://host:port with Borsh encoding (no network needed)."""
+    engine = KaspaEngine(get_settings().model_copy(update={"kaspa_rpc_url": "ws://kaspad:17210"}))
+    client = engine._default_client_factory()
+    assert client.is_connected is False
+    assert str(getattr(client, "encoding", "borsh")).lower() == "borsh"
