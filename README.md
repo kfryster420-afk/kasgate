@@ -15,6 +15,8 @@ A public testnet-10 beta is being prepared. Testers should start at `/beta` on t
 
 The scheme is `kaspa-exact-v1`. The full wire format, error codes and routes are in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
+Listed endpoints are also published as a public, machine-readable catalog at `GET /.well-known/x402` and `GET /v1/catalog` on the gateway (and as `GET /llms.txt` for agents). The buyer SDK can fetch it with `KasGateClient.discover()`, and the MCP server can search it and pay under a session spend cap. The catalog never includes API keys, emails, upstream URLs, or merchant settlement addresses.
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:
@@ -33,8 +35,8 @@ The fee is `max(ceil(price x 150 / 10,000), 0.2 KAS)`. The minimum endpoint pric
 | --- | --- | --- | --- |
 | Gateway | [`apps/gateway`](apps/gateway) | Python 3.12, FastAPI, PostgreSQL 16, Redis 7 | The 402 paywall proxy, payment verification and settlement, merchant API, price oracle |
 | Web | [`apps/web`](apps/web) | Next.js 15, TypeScript, Tailwind | Landing page, wallet sign-up and login, dashboard, settlements, analytics, tax CSV, public directory |
-| Buyer SDK | [`packages/buyer-sdk`](packages/buyer-sdk) | Python, httpx | `KasGateClient`: pays 402 challenges automatically, with a client-side spend cap |
-| MCP server | [`packages/mcp-server`](packages/mcp-server) | Python, MCP over stdio | Lets an AI agent browse the directory, quote endpoints and pay for calls with a capped budget |
+| Buyer SDK | [`packages/buyer-sdk`](packages/buyer-sdk) | Python, httpx | `KasGateClient`: discovers the public catalog and pays 402 challenges automatically, with a client-side spend cap |
+| MCP server | [`packages/mcp-server`](packages/mcp-server) | Python, MCP over stdio | Lets an AI agent search the catalog, inspect an endpoint, and pay for calls under a per-call maximum and a session spend cap |
 | Integration tests | [`tests/integration`](tests/integration) | pytest | Offline, live and funded red-team suites against a running gateway |
 | Infra | [`infra`](infra) | Docker Compose | Postgres, Redis, gateway, web, and an optional own `kaspad` node |
 
