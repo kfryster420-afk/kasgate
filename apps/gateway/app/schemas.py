@@ -725,13 +725,21 @@ class CatalogEndpoint(StrictModel):
 
     `input_schema` is reserved for a future merchant-supplied JSON Schema. The endpoint row has no such
     column today, so this field is always null. It is never populated from upstream headers or other secrets.
+
+    The catalog does not live-convert USD prices. `price_sompi` / `price_kas` are set for KAS endpoints
+    and null for USD endpoints; `price_usd_micros` / `price_usd` are the inverse. Buyers get the payable
+    sompi amount from GET /v1/quote/{slug} or the 402 challenge.
     """
 
     slug: str
     name: str
     description: str | None
     methods: list[str]
-    price_sompi: Sompi
+    price_currency: PriceCurrency
+    price_sompi: int | None
+    price_kas: str | None
+    price_usd_micros: int | None
+    price_usd: str | None
     network: KaspaNetwork
     schemes: list[str]
     paid_url: str

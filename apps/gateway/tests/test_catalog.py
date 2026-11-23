@@ -27,7 +27,11 @@ SECRET_MARKERS = (
 def _assert_public_item(item: CatalogEndpoint | dict[str, Any], slug: str) -> CatalogEndpoint:
     parsed = item if isinstance(item, CatalogEndpoint) else CatalogEndpoint.model_validate(item)
     assert parsed.slug == slug
+    assert parsed.price_currency == "KAS"
     assert parsed.price_sompi == PRICE_SOMPI
+    assert parsed.price_kas is not None
+    assert parsed.price_usd_micros is None
+    assert parsed.price_usd is None
     assert parsed.network == "kaspa:testnet-10"
     assert parsed.schemes == ["kaspa-exact-v1"]
     assert parsed.paid_url == f"http://gateway.test/p/{slug}"

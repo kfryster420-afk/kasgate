@@ -823,7 +823,11 @@ def _catalog_item(endpoint: Endpoint, *, network: str, paid_url: str) -> Catalog
         name=endpoint.name,
         description=endpoint.description,
         methods=list(endpoint.allowed_methods),
+        price_currency=endpoint.price_currency,
         price_sompi=endpoint.price_sompi,
+        price_kas=None if endpoint.price_sompi is None else sompi_to_kas(endpoint.price_sompi),
+        price_usd_micros=endpoint.price_usd_micros,
+        price_usd=None if endpoint.price_usd_micros is None else usd_micros_to_usd(endpoint.price_usd_micros),
         network=network,
         schemes=[X402_SCHEME],
         paid_url=paid_url,
@@ -1051,7 +1055,10 @@ def render_llms_txt() -> str:
         "\n"
         "Query parameters: limit (1-200, default 50), cursor (opaque, from next_cursor), q (optional substring\n"
         "filter on slug, name, or description). Responses include Cache-Control and ETag; send If-None-Match for 304.\n"
-        "Each item has slug, name, description, methods, price_sompi, network, schemes, paid_url, and input_schema\n"
+        "Each item has slug, name, description, methods, price_currency, price_sompi, price_kas, "
+        "price_usd_micros, price_usd, network, schemes, paid_url, and input_schema. "
+        "USD prices are not live-converted in the catalog; call GET /v1/quote/{slug} "
+        "or the paid URL for the locked sompi amount.\n"
         "(null when the merchant has not published a schema). The catalog never includes API keys, emails, upstream\n"
         "URLs, or other merchant-private fields.\n"
         "\n"

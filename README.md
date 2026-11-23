@@ -8,7 +8,7 @@ A public testnet-10 beta is being prepared. Testers should start at `/beta` on t
 
 ## How it works
 
-1. A merchant signs in with a Kaspa wallet (KasWare), registers an upstream API URL and sets a price in KAS.
+1. A merchant signs in with a Kaspa wallet (KasWare), registers an upstream API URL and sets a price in KAS or USD. USD prices are converted to KAS at challenge time from a fail-closed multi-source oracle, and the sompi amount is locked so it cannot change between the 402 and payment.
 2. KasGate publishes a paywalled URL, `https://<gateway>/p/<slug>`. A request without payment gets **HTTP 402** and a `PAYMENT-REQUIRED` header describing the price, a one-time nonce and where the money goes.
 3. The buyer (or its agent) builds and signs **one Kaspa transaction** and retries with a `PAYMENT-SIGNATURE` header.
 4. The gateway verifies it, submits it to the Kaspa network, waits until it is accepted, then forwards the request to the merchant's upstream and returns the response with a `PAYMENT-RESPONSE` receipt.

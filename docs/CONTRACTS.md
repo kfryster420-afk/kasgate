@@ -188,7 +188,7 @@ Error codes: + payment_expired (402).
 
 ## CONTRACT v2.7 — agent discovery catalog (additive)
 GET /v1/catalog and GET /.well-known/x402 return CatalogPage{catalog_version:1, x402_version:2, scheme, asset, network, gateway_base_url, items, next_cursor, limit}.
-CatalogEndpoint{slug, name, description, methods, price_sompi, network, schemes, paid_url, input_schema}.
+CatalogEndpoint{slug, name, description, methods, price_currency, price_sompi, price_kas, price_usd_micros, price_usd, network, schemes, paid_url, input_schema}. The catalog does not live-convert USD prices: price_sompi is null for USD-priced endpoints; the payable amount comes from GET /v1/quote/{slug} or the 402.
 `input_schema` is optional and is null today: the endpoints table has no schema column; the field is reserved and omitted-or-null rather than inferred from secrets.
 limit 1..200 (default 50); cursor is an opaque base64url token from next_cursor (422 if malformed); q is an optional case-insensitive substring on slug, name, or description (max 120).
 Only Endpoint.is_public_listed and is_active of an active Merchant are included. Never email, api keys, upstream URL, upstream headers, or merchant settlement addresses.

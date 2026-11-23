@@ -43,7 +43,7 @@ gateway host:
 
 Query parameters: limit (1-200, default 50), cursor (opaque, from next_cursor), q (optional substring
 filter on slug, name, or description). Responses include Cache-Control and ETag; send If-None-Match for 304.
-Each item has slug, name, description, methods, price_sompi, network, schemes, paid_url, and input_schema
+Each item has slug, name, description, methods, price_currency, price_sompi, price_kas, price_usd_micros, price_usd, network, schemes, paid_url, and input_schema. USD prices are not live-converted in the catalog; call GET /v1/quote/{slug} or the paid URL for the locked sompi amount
 (null when the merchant has not published a schema). The catalog never includes API keys, emails, upstream
 URLs, or other merchant-private fields.
 

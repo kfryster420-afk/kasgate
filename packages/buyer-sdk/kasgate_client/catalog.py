@@ -16,14 +16,19 @@ class CatalogEndpoint(BaseModel):
     name: str
     description: str | None = None
     methods: list[str]
-    price_sompi: int = Field(gt=0)
+    price_currency: str = "KAS"
+    price_sompi: int | None = Field(default=None, gt=0)
+    price_kas: str | None = None
+    price_usd_micros: int | None = Field(default=None, gt=0)
+    price_usd: str | None = None
     network: str
     schemes: list[str]
     paid_url: str
     input_schema: dict[str, Any] | None = None
 
     def is_within_max_price(self, max_price_sompi: int) -> bool:
-        return self.price_sompi <= max_price_sompi
+        # USD listings have no locked sompi price until quote/402 time, so they are not payable from the catalog alone.
+        return self.price_sompi is not None and self.price_sompi <= max_price_sompi
 
 
 class CatalogPage(BaseModel):
