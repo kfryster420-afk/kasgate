@@ -144,3 +144,34 @@ def test_directory_manifest_is_consistent_with_the_contract(directory, network) 
     for entry in directory["endpoints"]:
         assert entry["pay_to"].startswith("kaspatest:")
         assert entry["price_sompi"] > 0
+
+
+def test_agent_catalog_matches_well_known_and_leaks_no_private_fields(gateway_url, network) -> None:
+    catalog = httpx.get(f"{gateway_url}/v1/catalog", timeout=10)
+    well_known = httpx.get(f"{gateway_url}/.well-known/x402", timeout=10)
+    assert catalog.status_code == 200, catalog.text
+    assert well_known.status_code == 200, well_known.text
+    assert catalog.json() == well_known.json()
+    body = catalog.json()
+    assert body["x402_version"] == 2 and body["scheme"] == "kaspa-exact-v1" and body["asset"] == "KAS"
+    assert body["network"] == network
+    assert "etag" in catalog.headers and "max-age=" in catalog.headers.get("cache-control", "")
+    not_modified = httpx.get(f"{gateway_url}/v1/catalog", headers={"If-None-Match": catalog.headers["etag"]}, timeout=10)
+    assert not_modified.status_code == 304
+    private_keys = {"upstream_url", "upstream_headers", "email", "api_key", "api_key_hash", "pay_to"}
+    for key in private_keys:
+        assert key not in body
+    for item in body["items"]:
+        assert set(item) >= {"slug", "name", "description", "methods", "price_sompi", "network", "schemes", "paid_url"}
+        assert "input_schema" in item
+        assert item["network"] == network
+        assert "kaspa-exact-v1" in item["schemes"]
+        assert not (private_keys & set(item))
+
+
+def test_llms_txt_is_served_on_the_gateway(gateway_url) -> None:
+    response = httpx.get(f"{gateway_url}/llms.txt", timeout=10)
+    assert response.status_code == 200
+    text = response.text
+    for needle in ("PAYMENT-REQUIRED", "PAYMENT-SIGNATURE", "PAYMENT-RESPONSE", "/v1/catalog", "0.6 KAS", "kasgate-mcp"):
+        assert needle in text

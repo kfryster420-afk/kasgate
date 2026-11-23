@@ -66,6 +66,10 @@ GET  /v1/settlements?limit=50&offset=0          -> list[SettlementRead] [Bearer]
 GET  /v1/analytics?start=ISO&end=ISO            -> MerchantAnalytics    [Bearer]
 GET  /v1/tax-report.csv?start=ISO&end=ISO       -> text/csv, header row = TAX_CSV_COLUMNS [Bearer]
 GET  /v1/directory                              -> DirectoryManifest (public, cached 30 s)
+GET  /v1/catalog?limit=50&cursor=&q=            -> CatalogPage (public, Cache-Control + ETag, 304 on If-None-Match)
+GET  /v1/catalog/{slug}                         -> CatalogEndpoint (public, listed only; 404 endpoint_not_found)
+GET  /.well-known/x402                          -> the same CatalogPage as /v1/catalog (same query params)
+GET  /llms.txt                                  -> text/plain agent payment guide (public, cached 30 s)
 GET  /v1/quote/{slug}                           -> PaymentRequired JSON (public, for agents/SDK)
 Auth: "Authorization: Bearer kg_<token_urlsafe(32)>"; DB stores sha256 hex in Merchant.api_key_hash.
 Slug auto-generated when omitted: slugify(name)[:55] + "-" + 6 hex chars.
@@ -181,6 +185,17 @@ Error codes: + payment_expired (402).
 - Verified with kaspa==2.1.0: PublicKey(xonly).to_address() round-trips and verify_message accepts sign_message output.
 - Payers MUST spend P2PK Schnorr UTXOs (kaspa:q... addresses); script-hash (P2SH) and ECDSA payers are refused with invalid_payment_header.
 - The proof binds nonce and txId (not method/path); the nonce itself is already bound to the endpoint that issued it.
+
+## CONTRACT v2.7 — agent discovery catalog (additive)
+GET /v1/catalog and GET /.well-known/x402 return CatalogPage{catalog_version:1, x402_version:2, scheme, asset, network, gateway_base_url, items, next_cursor, limit}.
+CatalogEndpoint{slug, name, description, methods, price_sompi, network, schemes, paid_url, input_schema}.
+`input_schema` is optional and is null today: the endpoints table has no schema column; the field is reserved and omitted-or-null rather than inferred from secrets.
+limit 1..200 (default 50); cursor is an opaque base64url token from next_cursor (422 if malformed); q is an optional case-insensitive substring on slug, name, or description (max 120).
+Only Endpoint.is_public_listed and is_active of an active Merchant are included. Never email, api keys, upstream URL, upstream headers, or merchant settlement addresses.
+Cache-Control: public, max-age=30; Redis kasgate:catalog:v1 holds the snapshot for 30 s. ETag is a strong SHA-256 of the exact JSON body of that page; If-None-Match (including the weak W/ form) yields 304 with the same ETag and Cache-Control.
+GET /v1/catalog/{slug} returns one listed CatalogEndpoint (same caching) or 404 X402ErrorBody error=endpoint_not_found.
+GET /llms.txt is a public text/plain description of headers, the fee split (98.5% merchant output 0 / 1.5% treasury output 1, 0.2 KAS min fee, 0.6 KAS min price), the catalog URLs, and SDK/MCP usage.
+The existing GET /v1/directory DirectoryManifest is unchanged.
 
 ## Notes from the funded testnet-10 run
 - Node RPC UTXO entries return scriptPublicKey as a hex string "<u16 BE version><script>" (e.g. "0000"+"20<xonly>ac"), not only the dict form; parsers MUST accept both.

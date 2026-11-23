@@ -346,7 +346,7 @@ Add the server to your MCP client configuration:
 {"mcpServers": {"kasgate": {"command": "kasgate-mcp", "env": {"KASGATE_BUYER_PRIVATE_KEY": "<hex key of a funded payer>", "KASGATE_GATEWAY_URL": "http://localhost:8000", "KASGATE_NETWORK": "kaspa:testnet-10", "KASGATE_MAX_PRICE_KAS": "1"}}}}
 ```
 
-Tools: `list_directory`, `quote_endpoint(slug)` (pays nothing) and `call_paid_endpoint(slug, method, path, body, max_price_kas)`. `KASGATE_MAX_PRICE_KAS` (default 20) is a hard ceiling per call; the tool argument can only lower it. `KASGATE_RPC_URL` is optional (empty = public Resolver). Paid calls need the funded key. The MCP server reads the key from the environment only (there is no key-file option), so keep that config file private (mode 600), use a small dedicated agent wallet, and keep the cap low.
+Tools: `list_directory`, `search_catalog`, `inspect_endpoint`, `quote_endpoint(slug)` (pays nothing), `get_budget`, `call_with_budget` (session spend cap; reserves the quoted price before signing) and `call_paid_endpoint(slug, method, path, body, max_price_kas)`. `KASGATE_MAX_PRICE_KAS` (default 20) is a hard ceiling per call; the tool argument can only lower it. `KASGATE_SESSION_BUDGET_KAS` (default 20) caps total spend for `call_with_budget` in one MCP session. `KASGATE_RPC_URL` is optional (empty = public Resolver). Paid calls need the funded key. The MCP server reads the key from the environment only (there is no key-file option), so keep that config file private (mode 600), use a small dedicated agent wallet, and keep the cap low.
 
 ## 6. Test suites
 

@@ -1,7 +1,11 @@
 """Merchant-facing REST API (`/v1/*`) and the public directory/quote routes."""
 
+import base64
+import binascii
 import csv
+import hashlib
 import io
+import json
 import logging
 import re
 import secrets
@@ -11,15 +15,15 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import Date, cast, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.config import get_settings
+from app.config import X402_SCHEME, get_settings
 from app.deps import get_db_session, get_redis, get_sessionmaker
 from app.models import Endpoint, Merchant, Settlement, SettlementStatus
 from app.proxy import issue_payment_challenge
@@ -29,6 +33,8 @@ from app.schemas import (
     AuthChallenge,
     AuthChallengeRequest,
     AuthVerifyRequest,
+    CatalogEndpoint,
+    CatalogPage,
     DailyRevenue,
     DirectoryEntry,
     DirectoryManifest,
@@ -701,4 +707,331 @@ async def quote(slug: str, session: DbSession, redis: Annotated[Redis, Depends(g
     return JSONResponse(content=required.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
 
 
-__all__ = ["router"]
+# ---------------------------------------------------------------- public agent catalog
+
+CATALOG_CACHE_KEY = "kasgate:catalog:v1"
+CATALOG_CACHE_TTL_SECONDS = DIRECTORY_CACHE_TTL_SECONDS
+CATALOG_MAX_ENTRIES = DIRECTORY_MAX_ENTRIES
+CATALOG_DEFAULT_LIMIT = 50
+CATALOG_MAX_LIMIT = 200
+CATALOG_QUERY_MAX_LENGTH = 120
+
+well_known_router = APIRouter(tags=["public"])
+
+
+def encode_catalog_cursor(created_at: datetime, endpoint_id: uuid.UUID) -> str:
+    stamp = created_at.astimezone(UTC).isoformat()
+    raw = f"{stamp}|{endpoint_id}".encode()
+    return base64_urlsafe(raw)
+
+
+def decode_catalog_cursor(value: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        raw = base64_urlsafe_decode(value).decode("ascii")
+        stamp, id_s = raw.split("|", 1)
+        created_at = datetime.fromisoformat(stamp)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return created_at.astimezone(UTC), uuid.UUID(id_s)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="invalid cursor") from exc
+
+
+def base64_urlsafe(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def base64_urlsafe_decode(value: str) -> bytes:
+    padded = value + "=" * ((4 - len(value) % 4) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def catalog_if_none_match_hits(header: str | None, etag: str) -> bool:
+    if header is None or not header.strip():
+        return False
+    raw = header.strip()
+    if raw == "*":
+        return True
+    token = etag.strip().strip('"')
+    for part in raw.split(","):
+        item = part.strip()
+        if item.startswith("W/"):
+            item = item[2:].strip()
+        if item.strip('"') == token:
+            return True
+    return False
+
+
+def _endpoint_input_schema(endpoint: Endpoint) -> dict[str, object] | None:
+    # The endpoints table has no input_schema column; getattr keeps this additive if one is added later.
+    value = getattr(endpoint, "input_schema", None)
+    return value if isinstance(value, dict) else None
+
+
+def _catalog_item(endpoint: Endpoint, *, network: str, paid_url: str) -> CatalogEndpoint:
+    return CatalogEndpoint(
+        slug=endpoint.slug,
+        name=endpoint.name,
+        description=endpoint.description,
+        methods=list(endpoint.allowed_methods),
+        price_sompi=endpoint.price_sompi,
+        network=network,
+        schemes=[X402_SCHEME],
+        paid_url=paid_url,
+        input_schema=_endpoint_input_schema(endpoint),
+    )
+
+
+async def _listed_catalog_rows(session: AsyncSession) -> list[tuple[Endpoint, str]]:
+    """Return (endpoint, cursor) for every active, publicly listed endpoint of an active merchant."""
+    rows = (
+        await session.execute(
+            select(Endpoint)
+            .join(Merchant, Merchant.id == Endpoint.merchant_id)
+            .where(
+                Endpoint.is_active.is_(True),
+                Endpoint.is_public_listed.is_(True),
+                Merchant.is_active.is_(True),
+            )
+            .order_by(Endpoint.created_at, Endpoint.id)
+            .limit(CATALOG_MAX_ENTRIES)
+        )
+    ).scalars().all()
+    return [(endpoint, encode_catalog_cursor(endpoint.created_at, endpoint.id)) for endpoint in rows]
+
+
+async def _catalog_snapshot(session: AsyncSession, redis: Redis) -> dict[str, Any]:
+    try:
+        cached = await redis.get(CATALOG_CACHE_KEY)
+    except RedisError:
+        logger.warning("catalog cache read failed", exc_info=True)
+        cached = None
+    if cached:
+        try:
+            payload = json.loads(cached)
+            if isinstance(payload, dict) and "etag" in payload and "entries" in payload:
+                return payload
+        except ValueError:
+            logger.warning("catalog cache contained invalid JSON", exc_info=True)
+    settings = get_settings()
+    packed = await _listed_catalog_rows(session)
+    entries: list[dict[str, Any]] = []
+    public_items: list[dict[str, Any]] = []
+    for endpoint, cursor in packed:
+        item = _catalog_item(
+            endpoint,
+            network=settings.kaspa_network,
+            paid_url=f"{settings.public_base_url}{PROXY_PATH_PREFIX}/{endpoint.slug}",
+        )
+        public = item.model_dump(mode="json")
+        public_items.append(public)
+        entries.append({"cursor": cursor, "item": public})
+    digest = hashlib.sha256(json.dumps(public_items, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+    payload = {
+        "etag": f'"{digest}"',
+        "network": settings.kaspa_network,
+        "gateway_base_url": settings.public_base_url,
+        "entries": entries,
+    }
+    try:
+        await redis.set(CATALOG_CACHE_KEY, json.dumps(payload), ex=CATALOG_CACHE_TTL_SECONDS)
+    except RedisError:
+        logger.warning("catalog cache write failed", exc_info=True)
+    return payload
+
+
+def _catalog_headers(etag: str) -> dict[str, str]:
+    return {
+        "Cache-Control": f"public, max-age={CATALOG_CACHE_TTL_SECONDS}",
+        "ETag": etag,
+    }
+
+
+def _paginate_catalog(
+    snapshot: dict[str, Any], *, limit: int, cursor: str | None, query: str
+) -> CatalogPage:
+    entries: list[dict[str, Any]] = list(snapshot["entries"])
+    if query:
+        needle = query.casefold()
+
+        def _hit(entry: dict[str, Any]) -> bool:
+            item = entry["item"]
+            haystacks = [item.get("slug") or "", item.get("name") or "", item.get("description") or ""]
+            return any(needle in str(text).casefold() for text in haystacks)
+
+        entries = [entry for entry in entries if _hit(entry)]
+    if cursor is not None:
+        # Validate even when the snapshot is empty so a junk cursor never looks like "no more pages".
+        decode_catalog_cursor(cursor)
+        start = 0
+        for index, entry in enumerate(entries):
+            if entry["cursor"] == cursor:
+                start = index + 1
+                break
+        else:
+            # Cursor is well-formed but not in this snapshot (expired, filtered out, or from another query).
+            start = len(entries)
+        entries = entries[start:]
+    page = entries[:limit]
+    next_cursor = page[-1]["cursor"] if len(entries) > limit else None
+    items = [CatalogEndpoint.model_validate(entry["item"]) for entry in page]
+    return CatalogPage(
+        network=snapshot["network"],
+        gateway_base_url=snapshot["gateway_base_url"],
+        items=items,
+        next_cursor=next_cursor,
+        limit=limit,
+    )
+
+
+async def build_catalog_response(
+    session: AsyncSession,
+    redis: Redis,
+    request: Request,
+    *,
+    limit: int,
+    cursor: str | None,
+    q: str | None,
+) -> Response:
+    query = (q or "").strip()
+    if len(query) > CATALOG_QUERY_MAX_LENGTH:
+        raise HTTPException(status_code=422, detail=f"q must be at most {CATALOG_QUERY_MAX_LENGTH} characters")
+    snapshot = await _catalog_snapshot(session, redis)
+    page = _paginate_catalog(snapshot, limit=limit, cursor=cursor, query=query)
+    body = page.model_dump_json()
+    etag = f'"{hashlib.sha256(body.encode()).hexdigest()}"'
+    headers = _catalog_headers(etag)
+    if catalog_if_none_match_hits(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+@router.get("/catalog", response_model=CatalogPage, tags=["public"])
+async def catalog(
+    request: Request,
+    session: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
+    limit: int = Query(default=CATALOG_DEFAULT_LIMIT, ge=1, le=CATALOG_MAX_LIMIT),
+    cursor: str | None = Query(default=None, min_length=1, max_length=200),
+    q: str | None = Query(default=None, max_length=CATALOG_QUERY_MAX_LENGTH),
+) -> Response:
+    """Public, paginated catalog of merchant-listed endpoints. Cacheable; never includes secrets or upstream URLs."""
+    return await build_catalog_response(session, redis, request, limit=limit, cursor=cursor, q=q)
+
+
+@well_known_router.get("/.well-known/x402", response_model=CatalogPage)
+async def well_known_x402(
+    request: Request,
+    session: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
+    limit: int = Query(default=CATALOG_DEFAULT_LIMIT, ge=1, le=CATALOG_MAX_LIMIT),
+    cursor: str | None = Query(default=None, min_length=1, max_length=200),
+    q: str | None = Query(default=None, max_length=CATALOG_QUERY_MAX_LENGTH),
+) -> Response:
+    """Same catalog as GET /v1/catalog, at the x402 well-known path."""
+    return await build_catalog_response(session, redis, request, limit=limit, cursor=cursor, q=q)
+
+
+@router.get("/catalog/{slug}", response_model=CatalogEndpoint, tags=["public"])
+async def catalog_item(
+    slug: str, request: Request, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]
+) -> Response:
+    snapshot = await _catalog_snapshot(session, redis)
+    match = next((entry["item"] for entry in snapshot["entries"] if entry["item"]["slug"] == slug), None)
+    if match is None:
+        body = X402ErrorBody(error="endpoint_not_found", message=f"no listed endpoint with slug '{slug}'")
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=body.model_dump(mode="json"))
+    item_digest = hashlib.sha256(json.dumps(match, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+    item_etag = f'"{item_digest}"'
+    item_headers = _catalog_headers(item_etag)
+    if catalog_if_none_match_hits(request.headers.get("if-none-match"), item_etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=item_headers)
+    return Response(
+        content=CatalogEndpoint.model_validate(match).model_dump_json(),
+        media_type="application/json",
+        headers=item_headers,
+    )
+
+
+def render_llms_txt() -> str:
+    settings = get_settings()
+    base = settings.public_base_url
+    network = settings.kaspa_network
+    return (
+        "# KasGate\n"
+        "\n"
+        "KasGate is an x402 v2 pay-per-call gateway on Kaspa. An agent calls a paid URL; without payment the\n"
+        "gateway answers HTTP 402 and a PAYMENT-REQUIRED header. The agent builds and signs one Kaspa transaction\n"
+        "and retries with PAYMENT-SIGNATURE. A successful call returns the upstream response plus PAYMENT-RESPONSE.\n"
+        "\n"
+        f"This deployment is on {network}.\n"
+        + (
+            "It is the Kaspa testnet-10 beta (address prefix kaspatest:). "
+            "Mainnet is not launched. Do not send mainnet funds.\n"
+            if network == "kaspa:testnet-10"
+            else ""
+        )
+        + "\n"
+        "## x402 v2 headers\n"
+        "\n"
+        "All three headers are Base64(JSON) using the standard alphabet, padded.\n"
+        "\n"
+        "- PAYMENT-REQUIRED: {x402Version: 2, scheme: \"kaspa-exact-v1\", network, asset: \"KAS\",\n"
+        "  amount (decimal sompi string), payTo, platformFee {feeTo, feeAmount}, nonce, expiresAt}.\n"
+        "- PAYMENT-SIGNATURE: {txId, rawTx, payerAddress, nonce, payerProof}. The signed transaction payload\n"
+        "  must be kasgate:v1:<nonce>. payerProof is a Schnorr signature over kasgate:v1:<nonce>:<txId>.\n"
+        "- PAYMENT-RESPONSE: {txId, settled: true, network, usdValueAtSettlement}.\n"
+        "\n"
+        "Scheme accepted: kaspa-exact-v1. Paid path prefix: /p/{slug} and /p/{slug}/{path}.\n"
+        "\n"
+        "## Fee split and price floor\n"
+        "\n"
+        "Every payment is a single non-custodial Kaspa transaction:\n"
+        "- output 0 is the merchant (payTo): the price minus the platform fee (98.5% once the fee is the 1.5% rate).\n"
+        "- output 1 is the platform treasury (feeTo): max(1.5% of the price, 0.2 KAS).\n"
+        "- outputs 2+ may only be change back to the buyer.\n"
+        "\n"
+        "The minimum endpoint price is 0.6 KAS (60,000,000 sompi). At that price the merchant receives 0.4 KAS and\n"
+        "the treasury receives the 0.2 KAS floor. Funds never pass through KasGate custody.\n"
+        "\n"
+        "## Catalog\n"
+        "\n"
+        "A public machine-readable catalog of endpoints the merchant marked listed (active merchants only):\n"
+        f"- {base}/.well-known/x402\n"
+        f"- {base}/v1/catalog\n"
+        "\n"
+        "Query parameters: limit (1-200, default 50), cursor (opaque, from next_cursor), q (optional substring\n"
+        "filter on slug, name, or description). Responses include Cache-Control and ETag; send If-None-Match for 304.\n"
+        "Each item has slug, name, description, methods, price_sompi, network, schemes, paid_url, and input_schema\n"
+        "(null when the merchant has not published a schema). The catalog never includes API keys, emails, upstream\n"
+        "URLs, or other merchant-private fields.\n"
+        "\n"
+        f"Inspect one listed endpoint: GET {base}/v1/catalog/{{slug}}.\n"
+        f"Quote without paying (mints a one-time nonce): GET {base}/v1/quote/{{slug}}.\n"
+        "\n"
+        "## Buyer SDK and MCP\n"
+        "\n"
+        "Python SDK (kasgate-client): KasGateClient.discover(gateway_url) and KasGateSyncClient.discover fetch the\n"
+        "catalog (read-only, follows pagination). Payments go through KasGateClient / KasGateSyncClient, which honour\n"
+        "the max_price_sompi circuit breaker and never sign a challenge above that cap. Catalog entries priced above\n"
+        "the cap are still listed and can be filtered with DiscoverResult.payable.\n"
+        "\n"
+        "MCP server (kasgate-mcp, stdio): search_catalog, inspect_endpoint, get_budget, call_with_budget, plus the\n"
+        "original list_directory, quote_endpoint, and call_paid_endpoint tools. call_with_budget reserves the quoted\n"
+        "price before signing, enforces a per-call maximum and a session spend cap (sompi), releases the reservation\n"
+        "on failure, and never logs buyer keys. get_budget reports spent, reserved, and remaining sompi.\n"
+        "\n"
+        "Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kfryster420-afk/kasgate).\n"
+    )
+
+
+@well_known_router.get("/llms.txt")
+async def llms_txt() -> PlainTextResponse:
+    return PlainTextResponse(
+        render_llms_txt(),
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": f"public, max-age={CATALOG_CACHE_TTL_SECONDS}"},
+    )
+
+
+__all__ = ["router", "well_known_router", "render_llms_txt"]

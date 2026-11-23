@@ -13,7 +13,13 @@ import httpx
 import kaspa
 
 from .challenge import decode_challenge, validate_challenge
+from .catalog import CatalogPage, DiscoverResult
 from .constants import (
+    CATALOG_DEFAULT_LIMIT,
+    CATALOG_MAX_LIMIT,
+    CATALOG_MAX_PAGES,
+    CATALOG_PATH,
+    CATALOG_TIMEOUT_SECONDS,
     DEFAULT_MAX_NETWORK_FEE_SOMPI,
     DEFAULT_MAX_PRICE_SOMPI,
     DEFAULT_MAX_REDELIVERIES,
@@ -29,6 +35,7 @@ from .constants import (
     MAX_RETRY_AFTER_SECONDS,
     NETWORK_ADDRESS_PREFIX,
     NETWORK_TYPE,
+    WELL_KNOWN_X402_PATH,
 )
 from .exceptions import (
     ConfigurationError,
@@ -36,6 +43,7 @@ from .exceptions import (
     PaymentReceiptError,
     PaymentRejectedError,
     PaymentReplayedError,
+    ProtocolMismatchError,
     TransactionBuildError,
     error_details,
 )
@@ -276,6 +284,81 @@ class KasGateClient:
 
     async def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("DELETE", url, **kwargs)
+
+
+    async def discover(
+        self,
+        gateway_url: str | httpx.URL,
+        *,
+        query: str | None = None,
+        limit: int = CATALOG_DEFAULT_LIMIT,
+        cursor: str | None = None,
+        follow_pages: bool = True,
+        well_known: bool = False,
+    ) -> DiscoverResult:
+        """Fetch the public catalog of listed endpoints. This never pays and never signs.
+
+        By default every page is followed (up to CATALOG_MAX_PAGES) and `next_cursor` is None.
+        Pass `follow_pages=False` to return a single page and keep `next_cursor` for the caller.
+        Endpoints priced above `max_price_sompi` are included in `items` and omitted from `payable`.
+        """
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= CATALOG_MAX_LIMIT
+        ):
+            raise ConfigurationError(
+                f"limit must be an integer from 1 to {CATALOG_MAX_LIMIT}"
+            )
+        if query is not None and (not isinstance(query, str) or len(query) > 120):
+            raise ConfigurationError("query must be a string of at most 120 characters")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
+            raise ConfigurationError("cursor must be a non-empty string")
+        origin = str(gateway_url).rstrip("/")
+        path = WELL_KNOWN_X402_PATH if well_known else CATALOG_PATH
+        collected: list[Any] = []
+        next_cursor = cursor
+        pages = 0
+        last_page: CatalogPage | None = None
+        while True:
+            pages += 1
+            if pages > CATALOG_MAX_PAGES:
+                raise ProtocolMismatchError(
+                    f"catalog pagination exceeded {CATALOG_MAX_PAGES} pages"
+                )
+            params: dict[str, Any] = {"limit": limit}
+            if query:
+                params["q"] = query
+            if next_cursor:
+                params["cursor"] = next_cursor
+            try:
+                response = await self._http.get(
+                    origin + path, params=params, timeout=CATALOG_TIMEOUT_SECONDS
+                )
+            except httpx.HTTPError as exc:
+                raise ProtocolMismatchError(
+                    f"catalog request failed: {type(exc).__name__}"
+                ) from exc
+            if response.status_code != 200:
+                raise ProtocolMismatchError(
+                    f"catalog answered {response.status_code}"
+                )
+            try:
+                last_page = CatalogPage.model_validate(response.json())
+            except (ValueError, TypeError) as exc:
+                raise ProtocolMismatchError("catalog returned an invalid body") from exc
+            collected.extend(last_page.items)
+            if not follow_pages or last_page.next_cursor is None:
+                break
+            next_cursor = last_page.next_cursor
+        assert last_page is not None
+        if follow_pages:
+            page = last_page.model_copy(
+                update={"items": collected, "next_cursor": None, "limit": limit}
+            )
+        else:
+            page = last_page
+        return DiscoverResult(catalog=page, max_price_sompi=self.max_price_sompi)
 
     # ------------------------------------------------------------------ internals
 

@@ -1,5 +1,6 @@
 """kasgate_client: pay KasGate HTTP 402 challenges in KAS from any httpx call."""
 
+from .catalog import CatalogEndpoint, CatalogPage, DiscoverResult
 from .client import RECEIPT_EXTENSION, KasGateClient, PaymentReceipt, receipt_of
 from .constants import (
     DEFAULT_MAX_NETWORK_FEE_SOMPI,
@@ -58,7 +59,10 @@ __all__ = [
     "RECEIPT_EXTENSION",
     "SOMPI_PER_KAS",
     "ChallengeExpiredError",
+    "CatalogEndpoint",
+    "CatalogPage",
     "ConfigurationError",
+    "DiscoverResult",
     "DustChangeError",
     "FeeSplitMismatchError",
     "InsufficientFundsError",

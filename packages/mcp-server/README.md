@@ -5,8 +5,12 @@ Stdio MCP server for KasGate. Tools:
 | tool | purpose |
 | --- | --- |
 | `list_directory` | `GET /v1/directory`: the public catalog of paid endpoints. |
+| `search_catalog(query, limit, cursor)` | `GET /v1/catalog`: search listed endpoints by slug, name, or description. |
+| `inspect_endpoint(slug)` | `GET /v1/catalog/{slug}`: one listed endpoint (price, methods, paid URL, input schema). |
 | `quote_endpoint(slug)` | `GET /v1/quote/{slug}`: price and fee split, nothing is paid. |
-| `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. |
+| `get_budget` | session cap, per-call maximum, spent, reserved, and remaining, in sompi. |
+| `call_with_budget(slug, method, path, body, max_price_kas)` | pays a 402 under the session spend cap: the catalog price is reserved before signing, released on failure, and never exceeds the per-call max or the remaining cap. |
+| `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. Does not draw down the session cap. |
 
 ## Environment
 
@@ -19,6 +23,7 @@ Stdio MCP server for KasGate. Tools:
 | `KASGATE_NETWORK` | `kaspa:testnet-10` (default) or `kaspa:mainnet`. |
 | `KASGATE_RPC_URL` | Optional wRPC URL for UTXO lookups (default: the public resolver). |
 | `KASGATE_MAX_PRICE_KAS` | Hard ceiling per call, default `20`; the `max_price_kas` tool argument can only lower it. |
+| `KASGATE_SESSION_BUDGET_KAS` | Session spend cap for `call_with_budget`, default `20`. Concurrent calls reserve the quoted price atomically and cannot together exceed this cap. |
 | `KASGATE_REQUEST_TIMEOUT` | Seconds the server waits for a gateway response (including the payment settlement), default `60`. Must be a positive number or the server exits at startup. |
 
 The key's contents are never logged, never part of an error message and not shown in `repr(Config)`. A missing, malformed

@@ -32,3 +32,19 @@ async with KasGateClient(PRIVATE_KEY_HEX, network="kaspa:testnet-10", max_price_
 - **Known limitation.** Two equal UTXOs that each almost cover the payment (for example `[60.3M, 60.3M]` at the minimum
   price) raise `TransactionBuildError`: `kaspa.Generator` cannot be made to spend both without a non-zero priority fee.
   The SDK fails closed rather than donate to the miner; any extra UTXO resolves it.
+
+
+## Catalog discovery
+
+`KasGateClient.discover(gateway_url)` (and the same method on `KasGateSyncClient`) fetches the public catalog
+(`GET /v1/catalog`, or `GET /.well-known/x402` when `well_known=True`). It never pays or signs. Pagination is
+followed by default; pass `follow_pages=False` and `cursor` to walk pages yourself. Endpoints priced above the
+client's `max_price_sompi` circuit breaker stay in `items` and are listed separately on `exceeding_max_price`;
+`payable` is the subset the client would be willing to sign for.
+
+```python
+async with KasGateClient(PRIVATE_KEY_HEX, max_price_sompi=100_000_000) as client:
+    found = await client.discover("http://localhost:8000", query="weather")
+    for item in found.payable:
+        print(item.slug, item.price_sompi, item.paid_url)
+```

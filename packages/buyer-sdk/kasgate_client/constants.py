@@ -36,7 +36,13 @@ GATEWAY_MAX_HEADER_BYTES = 40_960
 GATEWAY_MAX_RAW_TX_CHARS = 24_000
 PAYMENT_PAYLOAD_PREFIX = "kasgate:v1:"
 DIRECTORY_PATH = "/v1/directory"
+CATALOG_PATH = "/v1/catalog"
+WELL_KNOWN_X402_PATH = "/.well-known/x402"
 MANIFEST_TIMEOUT_SECONDS = 5.0
+CATALOG_TIMEOUT_SECONDS = 10.0
+CATALOG_DEFAULT_LIMIT = 50
+CATALOG_MAX_LIMIT = 200
+CATALOG_MAX_PAGES = 100
 # A challenge that expires sooner than this cannot be paid, mined and presented in time.
 MIN_CHALLENGE_TTL_SECONDS = 3.0
 # Real-world servers (uvicorn/h11 defaults to 16 KiB per header block, nginx to 8 KiB per line) are stricter than

@@ -1,0 +1,67 @@
+# KasGate
+
+KasGate is an x402 v2 pay-per-call gateway on Kaspa. An agent calls a paid URL; without payment the
+gateway answers HTTP 402 and a PAYMENT-REQUIRED header. The agent builds and signs one Kaspa transaction
+and retries with PAYMENT-SIGNATURE. A successful call returns the upstream response plus PAYMENT-RESPONSE.
+
+The public beta runs on Kaspa testnet-10 (network kaspa:testnet-10, address prefix kaspatest:). Mainnet
+is not launched. Do not send mainnet funds.
+
+The merchant dashboard and this website are on the web host. Payment, quotes, and the machine-readable
+catalog are on the gateway (API) host configured as PUBLIC_BASE_URL, typically api.<the-same-domain>.
+
+## x402 v2 headers
+
+All three headers are Base64(JSON) using the standard alphabet, padded.
+
+- PAYMENT-REQUIRED: {x402Version: 2, scheme: "kaspa-exact-v1", network, asset: "KAS",
+  amount (decimal sompi string), payTo, platformFee {feeTo, feeAmount}, nonce, expiresAt}.
+- PAYMENT-SIGNATURE: {txId, rawTx, payerAddress, nonce, payerProof}. The signed transaction payload
+  must be kasgate:v1:<nonce>. payerProof is a Schnorr signature over kasgate:v1:<nonce>:<txId>.
+- PAYMENT-RESPONSE: {txId, settled: true, network, usdValueAtSettlement}.
+
+Scheme accepted: kaspa-exact-v1. Paid path prefix on the gateway: /p/{slug} and /p/{slug}/{path}.
+
+## Fee split and price floor
+
+Every payment is a single non-custodial Kaspa transaction:
+
+- output 0 is the merchant (payTo): the price minus the platform fee (98.5% once the fee is the 1.5% rate).
+- output 1 is the platform treasury (feeTo): max(1.5% of the price, 0.2 KAS).
+- outputs 2+ may only be change back to the buyer.
+
+The minimum endpoint price is 0.6 KAS (60,000,000 sompi). At that price the merchant receives 0.4 KAS and
+the treasury receives the 0.2 KAS floor. Funds never pass through KasGate custody.
+
+## Catalog
+
+A public machine-readable catalog of endpoints the merchant marked listed (active merchants only), on the
+gateway host:
+
+- GET /.well-known/x402
+- GET /v1/catalog
+
+Query parameters: limit (1-200, default 50), cursor (opaque, from next_cursor), q (optional substring
+filter on slug, name, or description). Responses include Cache-Control and ETag; send If-None-Match for 304.
+Each item has slug, name, description, methods, price_sompi, network, schemes, paid_url, and input_schema
+(null when the merchant has not published a schema). The catalog never includes API keys, emails, upstream
+URLs, or other merchant-private fields.
+
+Inspect one listed endpoint: GET /v1/catalog/{slug}.
+Quote without paying (mints a one-time nonce): GET /v1/quote/{slug}.
+
+This file is also served as GET /llms.txt on the gateway host.
+
+## Buyer SDK and MCP
+
+Python SDK (kasgate-client): KasGateClient.discover(gateway_url) and KasGateSyncClient.discover fetch the
+catalog (read-only, follows pagination). Payments go through KasGateClient / KasGateSyncClient, which honour
+the max_price_sompi circuit breaker and never sign a challenge above that cap. Catalog entries priced above
+the cap are still listed and can be filtered with DiscoverResult.payable.
+
+MCP server (kasgate-mcp, stdio): search_catalog, inspect_endpoint, get_budget, call_with_budget, plus the
+original list_directory, quote_endpoint, and call_paid_endpoint tools. call_with_budget reserves the quoted
+price before signing, enforces a per-call maximum and a session spend cap (sompi), releases the reservation
+on failure, and never logs buyer keys. get_budget reports spent, reserved, and remaining sompi.
+
+Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kfryster420-afk/kasgate).

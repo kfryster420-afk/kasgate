@@ -10,7 +10,7 @@ import stat
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import httpx
 from kasgate_client import (
@@ -22,6 +22,8 @@ from kasgate_client import (
     receipt_of,
     sompi_to_kas,
 )
+
+from kasgate_mcp.budget import BudgetError, SpendBudget
 
 try:  # mcp 2.x
     from mcp.server.mcpserver import MCPServer as _Server
@@ -83,6 +85,7 @@ class Config:
     network: str = "kaspa:testnet-10"
     rpc_url: str | None = None
     max_price_sompi: int = DEFAULT_MAX_PRICE_SOMPI
+    session_budget_sompi: int = DEFAULT_MAX_PRICE_SOMPI
     timeout_seconds: float = 60.0
 
     @classmethod
@@ -92,6 +95,10 @@ class Config:
             max_price = kas_to_sompi(env.get("KASGATE_MAX_PRICE_KAS", "20"))
         except ValueError as exc:
             raise SystemExit(f"KASGATE_MAX_PRICE_KAS is invalid: {exc}") from exc
+        try:
+            session_budget = kas_to_sompi(env.get("KASGATE_SESSION_BUDGET_KAS", "20"))
+        except ValueError as exc:
+            raise SystemExit(f"KASGATE_SESSION_BUDGET_KAS is invalid: {exc}") from exc
         key_file = (env.get("KASGATE_BUYER_PRIVATE_KEY_FILE") or "").strip()
         inline_key = (env.get("KASGATE_BUYER_PRIVATE_KEY") or "").strip() or None
         if key_file:
@@ -114,6 +121,7 @@ class Config:
             network=env.get("KASGATE_NETWORK", "kaspa:testnet-10"),
             rpc_url=(env.get("KASGATE_RPC_URL") or "").strip() or None,
             max_price_sompi=max_price,
+            session_budget_sompi=session_budget,
             timeout_seconds=timeout,
         )
 
@@ -181,11 +189,14 @@ def build_server(
     server = _Server(
         "kasgate",
         instructions=(
-            "Browse paid APIs with list_directory, check a price with quote_endpoint, then call_paid_endpoint. "
-            "Every paid call is capped: pass max_price_kas to set a tighter limit than the configured ceiling."
+            "Browse paid APIs with search_catalog or list_directory, inspect_endpoint for one slug, and "
+            "quote_endpoint for a live price. Pay with call_with_budget (session spend cap + per-call max) "
+            "or call_paid_endpoint. Check remaining funds with get_budget. A tighter max_price_kas can only "
+            "lower the configured ceiling, never raise it. Keys are never logged."
         ),
     )
     state: dict[str, Any] = {"http": http_client, "buyer": buyer}
+    budget = SpendBudget(per_call_max_sompi=cfg.max_price_sompi, session_cap_sompi=cfg.session_budget_sompi)
 
     def public_http() -> httpx.AsyncClient:
         if state["http"] is None:
@@ -224,10 +235,91 @@ def build_server(
         except ValueError as exc:
             raise ToolError("gateway returned a non-JSON body") from exc
 
+    def _parse_optional_max_price_kas(max_price_kas: float | str | None) -> int | None:
+        if max_price_kas is None:
+            return None
+        if isinstance(max_price_kas, bool):
+            raise ToolError("max_price_kas must be a positive number")
+        try:
+            return kas_to_sompi(Decimal(str(max_price_kas)))
+        except (ValueError, ArithmeticError) as exc:
+            raise ToolError(f"max_price_kas is invalid: {exc}") from exc
+
+    def _request_kwargs(method: str, body: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if body is not None:
+            if method == "GET":
+                raise ToolError("a GET request cannot carry a body")
+            kwargs["content"] = body if isinstance(body, str) else json.dumps(body)
+            if not isinstance(body, str):
+                kwargs["headers"] = {"Content-Type": "application/json"}
+        return kwargs
+
+    def _paid_url(slug: str, path: str) -> tuple[str, str, str]:
+        slug = validate_slug(slug)
+        suffix = validate_path(path)
+        url = f"{cfg.gateway_url}/p/{slug}" + (f"/{suffix}" if suffix else "")
+        return slug, suffix, url
+
+    async def _execute_paid_call(
+        slug: str,
+        method: str,
+        path: str,
+        body: Any,
+        max_price_kas: float | str | None,
+    ) -> dict[str, Any]:
+        slug, _, url = _paid_url(slug, path)
+        method = (method or "GET").upper()
+        if method not in ALLOWED_METHODS:
+            raise ToolError(f"method must be one of {sorted(ALLOWED_METHODS)}")
+        _parse_optional_max_price_kas(max_price_kas)
+        kwargs = _request_kwargs(method, body)
+        client = paying_client()
+        try:
+            response = await client.request(method, url, max_price_kas=max_price_kas, **kwargs)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        result = _describe_response(response)
+        receipt = receipt_of(response)
+        result["payment"] = _describe_receipt(receipt) if receipt else None
+        return result
+
     @server.tool()
     async def list_directory() -> dict[str, Any]:
         """List every public paid endpoint (slug, description, price in KAS, allowed methods, proxy URL)."""
         return await get_json("/v1/directory")
+
+    @server.tool()
+    async def search_catalog(query: str = "", limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        """Search the public catalog of listed endpoints (GET /v1/catalog).
+
+        `query` is matched as a case-insensitive substring of slug, name, or description. `limit` is 1-200
+        (default 50). Pass `cursor` from a previous `next_cursor` to fetch the next page.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise ToolError("limit must be an integer from 1 to 200")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
+            raise ToolError("cursor must be a non-empty string")
+        if not isinstance(query, str) or len(query) > 120:
+            raise ToolError("query must be a string of at most 120 characters")
+        params: list[str] = [f"limit={limit}"]
+        if query.strip():
+            params.append(f"q={quote(query.strip(), safe='')}")
+        if cursor:
+            params.append(f"cursor={quote(cursor, safe='')}")
+        return await get_json("/v1/catalog?" + "&".join(params))
+
+    @server.tool()
+    async def inspect_endpoint(slug: str) -> dict[str, Any]:
+        """Return the public catalog record for one listed endpoint (price, methods, paid URL, input schema)."""
+        return await get_json(f"/v1/catalog/{validate_slug(slug)}")
+
+    @server.tool()
+    async def get_budget() -> dict[str, Any]:
+        """Show the session spend cap, per-call maximum, spent, reserved, and remaining budget, in sompi."""
+        return budget.snapshot()
 
     @server.tool()
     async def quote_endpoint(slug: str) -> dict[str, Any]:
@@ -257,40 +349,53 @@ def build_server(
 
         Refuses before signing anything if the quoted total exceeds max_price_kas (or the server's ceiling,
         whichever is lower). `path` is appended to the endpoint (e.g. "v1/items?limit=3"); `body` is sent as JSON.
+        This tool does not draw down the session spend cap; use call_with_budget for session-capped spending.
+        """
+        return await _execute_paid_call(slug, method, path, body, max_price_kas)
+
+    @server.tool()
+    async def call_with_budget(
+        slug: str,
+        method: str = "GET",
+        path: str = "",
+        body: Any = None,
+        max_price_kas: float | str | None = None,
+    ) -> dict[str, Any]:
+        """Call a paid endpoint under the session spend cap and a per-call maximum, both in sompi.
+
+        The catalog (quoted list price) is reserved atomically before any key use or signing. If the live
+        402 amount exceeds the reservation, the reservation is released and nothing is signed. The
+        reservation is released on any failure and committed on success. Concurrent calls cannot together
+        exceed the session cap. max_price_kas can only tighten the per-call maximum.
         """
         slug = validate_slug(slug)
-        method = (method or "GET").upper()
-        if method not in ALLOWED_METHODS:
-            raise ToolError(f"method must be one of {sorted(ALLOWED_METHODS)}")
-        suffix = validate_path(path)
-        url = f"{cfg.gateway_url}/p/{slug}" + (f"/{suffix}" if suffix else "")
-        if max_price_kas is not None:
-            if isinstance(max_price_kas, bool):
-                raise ToolError("max_price_kas must be a positive number")
-            try:
-                kas_to_sompi(Decimal(str(max_price_kas)))
-            except (ValueError, ArithmeticError) as exc:
-                raise ToolError(f"max_price_kas is invalid: {exc}") from exc
-        kwargs: dict[str, Any] = {}
-        if body is not None:
-            if method == "GET":
-                raise ToolError("a GET request cannot carry a body")
-            kwargs["content"] = body if isinstance(body, str) else json.dumps(body)
-            if not isinstance(body, str):
-                kwargs["headers"] = {"Content-Type": "application/json"}
-        client = paying_client()
+        per_call = _parse_optional_max_price_kas(max_price_kas)
         try:
-            response = await client.request(method, url, max_price_kas=max_price_kas, **kwargs)
-        except KasGateError as exc:
-            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
-        except httpx.HTTPError as exc:
-            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
-        result = _describe_response(response)
-        receipt = receipt_of(response)
-        result["payment"] = _describe_receipt(receipt) if receipt else None
+            item = await get_json(f"/v1/catalog/{slug}")
+            quoted = int(item["price_sompi"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError("catalog returned a malformed endpoint") from exc
+        try:
+            reserved = await budget.reserve(quoted, per_call_max_sompi=per_call)
+        except BudgetError as exc:
+            raise ToolError(str(exc)) from exc
+        tightened = sompi_to_kas(reserved)
+        try:
+            result = await _execute_paid_call(slug, method, path, body, tightened)
+        except Exception:
+            await budget.release(reserved)
+            raise
+        receipt = result.get("payment")
+        # Commit the reserved quoted price (the live 402 was capped at that amount). If no receipt is
+        # present the call did not actually pay; release the reservation.
+        if receipt is None:
+            await budget.release(reserved)
+        else:
+            await budget.commit(reserved)
+            result["budget"] = budget.snapshot()
         return result
 
-    server.kasgate_config = cfg  # type: ignore[attr-defined]
+        server.kasgate_config = cfg  # type: ignore[attr-defined]
     return server
 
 

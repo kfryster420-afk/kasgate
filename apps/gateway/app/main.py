@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api_routes import router as api_router
+from app.api_routes import well_known_router
 from app.config import get_settings
 from app.db import engine as db_engine
 from app.deps import get_sessionmaker
@@ -68,6 +69,7 @@ def create_app() -> FastAPI:
         max_age=600,
     )
     app.include_router(api_router)
+    app.include_router(well_known_router)
     app.include_router(proxy_router)
 
     @app.get("/healthz", response_model=HealthStatus, tags=["system"])

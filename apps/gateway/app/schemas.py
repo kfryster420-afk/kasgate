@@ -628,3 +628,36 @@ class HealthStatus(BaseModel):
     database: bool
     redis: bool
     kaspa_rpc: bool
+
+
+# ---------------------------------------------------------------- public agent catalog (additive to /v1/directory)
+
+
+class CatalogEndpoint(StrictModel):
+    """Public, machine-readable listing of one merchant-listed endpoint.
+
+    `input_schema` is reserved for a future merchant-supplied JSON Schema. The endpoint row has no such
+    column today, so this field is always null. It is never populated from upstream headers or other secrets.
+    """
+
+    slug: str
+    name: str
+    description: str | None
+    methods: list[str]
+    price_sompi: Sompi
+    network: KaspaNetwork
+    schemes: list[str]
+    paid_url: str
+    input_schema: dict[str, object] | None = None
+
+
+class CatalogPage(StrictModel):
+    catalog_version: Literal[1] = 1
+    x402_version: Literal[2] = 2
+    scheme: Literal["kaspa-exact-v1"] = "kaspa-exact-v1"
+    asset: Literal["KAS"] = "KAS"
+    network: KaspaNetwork
+    gateway_base_url: str
+    items: list[CatalogEndpoint]
+    next_cursor: str | None = None
+    limit: int

@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 
 import httpx
 
+from .catalog import DiscoverResult
 from .client import KasGateClient
 
 T = TypeVar("T")
@@ -72,6 +73,10 @@ class KasGateSyncClient:
 
     def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
+
+
+    def discover(self, gateway_url: str | httpx.URL, **kwargs: Any) -> DiscoverResult:
+        return self._call(self._client.discover(gateway_url, **kwargs))
 
     def close(self) -> None:
         if self._closed:

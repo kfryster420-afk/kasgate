@@ -230,6 +230,9 @@ async def test_directory_is_not_limited(
 ) -> None:
     override_settings(rl_unpaid_proxy_per_minute=1, rl_merchant_create_per_hour=1, rl_auth_challenge_per_minute=1)
     assert [(await client.get("/v1/directory")).status_code for _ in range(15)] == [200] * 15
+    assert [(await client.get("/v1/catalog")).status_code for _ in range(15)] == [200] * 15
+    assert [(await client.get("/.well-known/x402")).status_code for _ in range(15)] == [200] * 15
+    assert [(await client.get("/llms.txt")).status_code for _ in range(15)] == [200] * 15
 
 
 # ---------------------------------------------------------------- disabled

@@ -31,11 +31,52 @@ DIRECTORY = {
     "endpoints": [{"slug": "demo-abc123", "price_sompi": PRICE, "price_kas": "15"}],
 }
 
+CATALOG_ITEM = {
+    "slug": "demo-abc123",
+    "name": "Demo API",
+    "description": "a paid demo",
+    "methods": ["GET", "POST"],
+    "price_sompi": PRICE,
+    "network": "kaspa:testnet-10",
+    "schemes": ["kaspa-exact-v1"],
+    "paid_url": "http://gateway.test/p/demo-abc123",
+    "input_schema": None,
+}
+CHEAP_ITEM = {**CATALOG_ITEM, "slug": "cheap-api", "name": "Cheap", "description": "low price", "price_sompi": MIN_PRICE, "paid_url": "http://gateway.test/p/cheap-api"}
+CATALOG = {
+    "catalog_version": 1,
+    "x402_version": 2,
+    "scheme": "kaspa-exact-v1",
+    "asset": "KAS",
+    "network": "kaspa:testnet-10",
+    "gateway_base_url": "http://gateway.test",
+    "items": [CATALOG_ITEM, CHEAP_ITEM],
+    "next_cursor": None,
+    "limit": 50,
+}
+
 
 def gateway_with_catalog(fake: FakeGateway):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/directory":
             return httpx.Response(200, json=DIRECTORY)
+        if request.url.path == "/v1/catalog":
+            query = (request.url.params.get("q") or "").casefold()
+            items = list(CATALOG["items"])
+            if query:
+                items = [
+                    item
+                    for item in items
+                    if query in item["slug"] or query in item["name"].casefold() or query in (item["description"] or "").casefold()
+                ]
+            payload = {**CATALOG, "items": items, "limit": int(request.url.params.get("limit", 50))}
+            return httpx.Response(200, json=payload)
+        if request.url.path.startswith("/v1/catalog/"):
+            slug = request.url.path.rsplit("/", 1)[1]
+            match = next((item for item in CATALOG["items"] if item["slug"] == slug), None)
+            if match is None:
+                return httpx.Response(404, json={"error": "endpoint_not_found", "message": "no"})
+            return httpx.Response(200, json=match)
         if request.url.path.startswith("/v1/quote/"):
             slug = request.url.path.rsplit("/", 1)[1]
             if slug == "missing-slug":
@@ -46,7 +87,14 @@ def gateway_with_catalog(fake: FakeGateway):
     return handler
 
 
-def make_server(fake: FakeGateway, *, max_price_sompi: int = 20 * KAS, key: str | None = PAYER_KEY, utxos=None):
+def make_server(
+    fake: FakeGateway,
+    *,
+    max_price_sompi: int = 20 * KAS,
+    session_budget_sompi: int | None = None,
+    key: str | None = PAYER_KEY,
+    utxos=None,
+):
     http = httpx.AsyncClient(transport=httpx.MockTransport(gateway_with_catalog(fake)))
     buyer = None
     if key:
@@ -56,7 +104,12 @@ def make_server(fake: FakeGateway, *, max_price_sompi: int = 20 * KAS, key: str 
             utxo_provider=static_utxos(utxos if utxos is not None else [make_utxo(0, 500 * KAS)]),
             http_client=http,
         )
-    cfg = Config(gateway_url="http://gateway.test", buyer_private_key=key, max_price_sompi=max_price_sompi)
+    cfg = Config(
+        gateway_url="http://gateway.test",
+        buyer_private_key=key,
+        max_price_sompi=max_price_sompi,
+        session_budget_sompi=session_budget_sompi if session_budget_sompi is not None else max_price_sompi,
+    )
     return build_server(cfg, http_client=http, buyer=buyer), buyer
 
 
@@ -66,13 +119,28 @@ def structured(result: Any) -> dict[str, Any]:
     return json.loads(result.content[0].text)
 
 
-async def test_server_exposes_exactly_the_three_tools() -> None:
+EXPECTED_TOOLS = {
+    "list_directory",
+    "quote_endpoint",
+    "call_paid_endpoint",
+    "search_catalog",
+    "inspect_endpoint",
+    "call_with_budget",
+    "get_budget",
+}
+
+
+async def test_server_exposes_the_directory_and_catalog_tools() -> None:
     server, _ = make_server(FakeGateway())
     async with Client(server) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-    assert set(tools) == {"list_directory", "quote_endpoint", "call_paid_endpoint"}
+    assert set(tools) == EXPECTED_TOOLS
     assert set(tools["call_paid_endpoint"].input_schema["properties"]) == {"slug", "method", "path", "body", "max_price_kas"}
     assert tools["call_paid_endpoint"].input_schema["required"] == ["slug"]
+    assert set(tools["call_with_budget"].input_schema["properties"]) == {"slug", "method", "path", "body", "max_price_kas"}
+    assert tools["search_catalog"].input_schema["properties"].keys() >= {"query", "limit", "cursor"}
+    assert tools["inspect_endpoint"].input_schema["required"] == ["slug"]
+    assert tools["get_budget"].input_schema.get("required") in (None, [])
 
 
 async def test_list_directory_and_quote() -> None:
@@ -388,3 +456,110 @@ def test_a_fifo_key_file_is_refused_without_blocking(tmp_path) -> None:
     os.mkfifo(fifo, 0o600)
     with pytest.raises(SystemExit, match="not a regular file"):
         Config.from_env({"KASGATE_BUYER_PRIVATE_KEY_FILE": str(fifo)})
+
+
+async def test_search_catalog_and_inspect_endpoint() -> None:
+    server, _ = make_server(FakeGateway())
+    async with Client(server) as client:
+        all_items = structured(await client.call_tool("search_catalog", {}))
+        found = structured(await client.call_tool("search_catalog", {"query": "market"}))
+        # "market" is not in the demo catalog; cheap matches "low price" / Cheap
+        cheap = structured(await client.call_tool("search_catalog", {"query": "cheap"}))
+        inspected = structured(await client.call_tool("inspect_endpoint", {"slug": "demo-abc123"}))
+        missing = await client.call_tool("inspect_endpoint", {"slug": "missing-slug"})
+    assert {item["slug"] for item in all_items["items"]} == {"demo-abc123", "cheap-api"}
+    assert found["items"] == []
+    assert [item["slug"] for item in cheap["items"]] == ["cheap-api"]
+    assert inspected["slug"] == "demo-abc123"
+    assert inspected["price_sompi"] == PRICE
+    assert inspected["input_schema"] is None
+    assert inspected["paid_url"].endswith("/p/demo-abc123")
+    assert missing.is_error
+
+
+async def test_get_budget_and_budgeted_call_commits_spend() -> None:
+    fake = FakeGateway()
+    server, _ = make_server(fake, session_budget_sompi=50 * KAS)
+    async with Client(server) as client:
+        before = structured(await client.call_tool("get_budget", {}))
+        assert before["spent_sompi"] == 0 and before["reserved_sompi"] == 0
+        assert before["session_cap_sompi"] == 50 * KAS
+        assert before["remaining_sompi"] == 50 * KAS
+        result = await client.call_tool("call_with_budget", {"slug": "demo-abc123", "max_price_kas": 20})
+        assert not result.is_error, result.content[0].text
+        data = structured(result)
+        assert data["status_code"] == 200
+        assert data["payment"]["paid_kas"] == "15"
+        after = structured(await client.call_tool("get_budget", {}))
+    assert after["spent_sompi"] == PRICE
+    assert after["reserved_sompi"] == 0
+    assert after["remaining_sompi"] == 50 * KAS - PRICE
+    assert fake.signatures
+
+
+async def test_budgeted_call_refuses_before_signing_when_over_the_session_cap() -> None:
+    fake = FakeGateway()
+    server, buyer = make_server(fake, session_budget_sompi=PRICE - 1)
+    async with Client(server) as client:
+        result = await client.call_tool("call_with_budget", {"slug": "demo-abc123"})
+        budget = structured(await client.call_tool("get_budget", {}))
+    assert result.is_error
+    assert "session budget" in result.content[0].text
+    assert fake.signatures == []
+    assert buyer._utxo_provider.calls == []  # type: ignore[union-attr]
+    assert budget["spent_sompi"] == 0 and budget["reserved_sompi"] == 0
+    assert PAYER_KEY not in result.content[0].text
+
+
+async def test_budgeted_call_releases_the_reservation_on_payment_failure() -> None:
+    fake = FakeGateway(challenge(network="kaspa:mainnet"))
+    server, _ = make_server(fake, session_budget_sompi=50 * KAS)
+    async with Client(server) as client:
+        result = await client.call_tool("call_with_budget", {"slug": "demo-abc123"})
+        budget = structured(await client.call_tool("get_budget", {}))
+    assert result.is_error
+    assert budget["spent_sompi"] == 0 and budget["reserved_sompi"] == 0
+    assert budget["remaining_sompi"] == 50 * KAS
+    assert fake.signatures == []
+    assert PAYER_KEY not in result.content[0].text
+
+
+async def test_concurrent_budgeted_calls_cannot_exceed_the_session_cap() -> None:
+    import asyncio
+
+    fake = FakeGateway()
+    # Cap fits exactly one PRICE payment, not two.
+    server, _ = make_server(fake, session_budget_sompi=PRICE)
+    async with Client(server) as client:
+        first, second = await asyncio.gather(
+            client.call_tool("call_with_budget", {"slug": "demo-abc123"}),
+            client.call_tool("call_with_budget", {"slug": "demo-abc123"}),
+        )
+        budget = structured(await client.call_tool("get_budget", {}))
+    outcomes = [first.is_error, second.is_error]
+    assert outcomes.count(False) == 1
+    assert outcomes.count(True) == 1
+    assert budget["spent_sompi"] == PRICE
+    assert budget["reserved_sompi"] == 0
+    assert budget["remaining_sompi"] == 0
+    assert len(fake.signatures) == 1
+
+
+async def test_budgeted_per_call_max_tightens_but_cannot_raise_the_ceiling() -> None:
+    fake = FakeGateway()
+    server, _ = make_server(fake, max_price_sompi=10 * KAS, session_budget_sompi=100 * KAS)
+    async with Client(server) as client:
+        too_low = await client.call_tool("call_with_budget", {"slug": "demo-abc123", "max_price_kas": 1})
+        too_high_arg = await client.call_tool("call_with_budget", {"slug": "demo-abc123", "max_price_kas": 1_000_000})
+    assert too_low.is_error
+    assert too_high_arg.is_error  # PRICE is 15 KAS, server ceiling is 10 KAS
+    assert fake.signatures == []
+
+
+def test_session_budget_env_and_invalid_values() -> None:
+    cfg = Config.from_env({"KASGATE_SESSION_BUDGET_KAS": "40"})
+    assert cfg.session_budget_sompi == 40 * KAS
+    assert Config.from_env({}).session_budget_sompi == 20 * KAS
+    with pytest.raises(SystemExit, match="KASGATE_SESSION_BUDGET_KAS"):
+        Config.from_env({"KASGATE_SESSION_BUDGET_KAS": "-1"})
+
