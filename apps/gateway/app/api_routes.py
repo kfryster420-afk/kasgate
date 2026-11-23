@@ -1,5 +1,6 @@
 """Merchant-facing REST API (`/v1/*`) and the public directory/quote routes."""
 
+import asyncio
 import base64
 import binascii
 import csv
@@ -11,24 +12,44 @@ import re
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import Date, cast, desc, func, select
+from sqlalchemy import Date, cast, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import X402_SCHEME, get_settings
-from app.deps import RateProvider, get_db_session, get_oracle, get_redis, get_sessionmaker
+from app.deps import RateProvider, get_db_session, get_http_client, get_oracle, get_redis, get_sessionmaker
 from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
+from app.openapi_import import (
+    SLUG_MAX_LENGTH,
+    OpenApiImportError,
+    ParsedOperation,
+    allocate_slug,
+    document_info,
+    document_servers,
+    endpoint_name,
+    fetch_document,
+    load_document,
+    parse_operations,
+    proxy_suffix,
+    slug_base,
+    upstream_url_for,
+)
 from app.oracle import OracleUnavailableError
 from app.proxy import issue_payment_challenge
 from app.schemas import (
+    OPENAPI_MAX_DOCUMENT_BYTES,
     PROXY_PATH_PREFIX,
     TAX_CSV_COLUMNS,
     AuthChallenge,
@@ -47,11 +68,16 @@ from app.schemas import (
     MerchantCreate,
     MerchantCreated,
     MerchantRead,
+    OpenApiImportCreated,
+    OpenApiImportPreview,
+    OpenApiImportRequest,
+    OpenApiOperationPreview,
     PaymentRequired,
     SessionIssued,
     SettlementRead,
     TaxReportRow,
     X402ErrorBody,
+    min_price_sompi,
     sompi_to_kas,
     usd_micros_to_usd,
 )
@@ -88,6 +114,7 @@ DEFAULT_ANALYTICS_WINDOW_DAYS = 30
 MAX_SLUG_ATTEMPTS = 8
 SLUG_BASE_MAX_LENGTH = 55
 CSV_CHUNK_ROWS = 500
+OPENAPI_IMPORT_MAX_REQUEST_BYTES = 2 * OPENAPI_MAX_DOCUMENT_BYTES + 256 * 1024
 
 _NON_SLUG_CHARS = re.compile(r"[^a-z0-9]+")
 
@@ -456,6 +483,230 @@ async def delete_endpoint(endpoint_id: uuid.UUID, merchant: CurrentMerchant, ses
     endpoint.is_active = False
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------- OpenAPI import
+
+
+@dataclass(frozen=True)
+class _ImportPlan:
+    operation: ParsedOperation
+    candidate: EndpointCreate | None
+    skip_reason: str | None
+    slug: str | None
+
+
+async def _read_import_body(request: Request) -> bytes:
+    too_large = HTTPException(
+        status_code=413,
+        detail=f"request body exceeds {OPENAPI_IMPORT_MAX_REQUEST_BYTES} bytes "
+        f"(the OpenAPI document itself may be at most {OPENAPI_MAX_DOCUMENT_BYTES} bytes)",
+    )
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > OPENAPI_IMPORT_MAX_REQUEST_BYTES:
+        raise too_large
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > OPENAPI_IMPORT_MAX_REQUEST_BYTES:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _import_request_or_422(raw: bytes) -> OpenApiImportRequest:
+    try:
+        return OpenApiImportRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        errors = [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)]
+        raise RequestValidationError(errors) from exc
+
+
+def _row_error(index: int, message: str) -> dict[str, Any]:
+    return {"type": "value_error", "loc": ["body", "selections", index], "msg": message, "input": None}
+
+
+async def _taken_slugs(session: AsyncSession, bases: set[str]) -> set[str]:
+    if not bases:
+        return set()
+    prefixes = sorted({base[: SLUG_MAX_LENGTH - 8].rstrip("-") for base in bases})
+    rows = await session.execute(
+        select(Endpoint.slug).where(or_(*[Endpoint.slug.startswith(prefix, autoescape=True) for prefix in prefixes]))
+    )
+    return set(rows.scalars())
+
+
+async def _plan_import(
+    session: AsyncSession, payload: OpenApiImportRequest, operations: list[ParsedOperation]
+) -> list[_ImportPlan]:
+    """Validate every operation as a hand-made EndpointCreate would be, then allocate deterministic slugs."""
+    staged: list[tuple[ParsedOperation, EndpointCreate | None, str | None]] = []
+    for operation in operations:
+        if operation.skip_reason is not None:
+            staged.append((operation, None, operation.skip_reason))
+            continue
+        try:
+            validated = EndpointCreate(
+                name=endpoint_name(operation),
+                description=operation.description or operation.summary,
+                category=payload.category or operation.tag,
+                upstream_url=upstream_url_for(str(payload.upstream_base_url), operation.path),
+                price_sompi=payload.default_price_sompi,
+                allowed_methods=[operation.method],
+                is_public_listed=payload.is_public_listed,
+            )
+        except ValidationError as exc:
+            staged.append((operation, None, f"cannot be imported: {exc.errors()[0]['msg']}"))
+            continue
+        staged.append((operation, validated, None))
+    bases = {slug_base(operation) for operation, candidate, _ in staged if candidate is not None}
+    taken = await _taken_slugs(session, bases)
+    plans: list[_ImportPlan] = []
+    for operation, candidate, reason in staged:
+        slug = None
+        if candidate is not None:
+            slug = allocate_slug(slug_base(operation), taken)
+            taken.add(slug)
+        plans.append(_ImportPlan(operation=operation, candidate=candidate, skip_reason=reason, slug=slug))
+    return plans
+
+
+def _preview_row(plan: _ImportPlan, price_sompi: int) -> OpenApiOperationPreview:
+    operation = plan.operation
+    base_url = get_settings().public_base_url
+    proxy_url = f"{base_url}{PROXY_PATH_PREFIX}/{plan.slug}" if plan.slug else None
+    return OpenApiOperationPreview(
+        key=operation.key,
+        method=operation.method,
+        path=operation.path,
+        operation_id=operation.operation_id,
+        summary=operation.summary,
+        path_params=list(operation.path_params),
+        importable=plan.candidate is not None,
+        skip_reason=plan.skip_reason,
+        slug=plan.slug,
+        upstream_url=str(plan.candidate.upstream_url) if plan.candidate is not None else None,
+        proxy_path=f"{PROXY_PATH_PREFIX}/{plan.slug}{proxy_suffix(operation.path)}" if plan.slug else None,
+        proxy_url=proxy_url,
+        price_sompi=price_sompi,
+    )
+
+
+IMPORT_DOC = """Import paid endpoints from an OpenAPI 3.0/3.1 document (JSON or YAML).
+
+`mode: "preview"` parses the document (`spec_text`, or `spec_url` fetched through the SSRF guard) and lists every
+operation with its proposed slug, upstream URL and buyer route; nothing is written. `mode: "create"` re-parses the
+same document and creates one endpoint per entry in `selections` (method + path, optional `price_sompi` override)
+in ONE transaction: either every selected endpoint is created or none is.
+
+Path parameters map onto the proxy's suffix routing: `GET /pets/{petId}` becomes an endpoint whose upstream URL is
+`<base>/pets` and which buyers call as `/p/<slug>/<petId>`. Limits: document <= 2 MiB, <= 500 operations, only local
+`#/...` references, nesting depth <= 100, YAML aliases <= 1000.
+"""
+
+
+@router.post(
+    "/endpoints/import",
+    tags=["endpoints"],
+    summary="Preview or create endpoints from an OpenAPI document",
+    description=IMPORT_DOC,
+    response_model=None,
+    responses={
+        200: {"model": OpenApiImportPreview, "description": "mode=preview"},
+        201: {"model": OpenApiImportCreated, "description": "mode=create"},
+        409: {"description": "a slug was taken concurrently; nothing was created"},
+        413: {"description": "request body or OpenAPI document too large"},
+        422: {"description": "invalid request, unsupported or malformed document, or a per-row selection error"},
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": OpenApiImportRequest.model_json_schema()}},
+        }
+    },
+)
+async def import_openapi(
+    request: Request,
+    merchant: CurrentMerchant,
+    session: DbSession,
+    http_client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> JSONResponse:
+    payload = _import_request_or_422(await _read_import_body(request))
+    encrypted = _headers_or_422(payload.upstream_headers)
+    try:
+        if payload.spec_text is not None:
+            text = payload.spec_text
+        else:
+            text = await fetch_document(http_client, str(payload.spec_url))
+        document = await asyncio.to_thread(load_document, text)
+        operations = parse_operations(document)
+    except OpenApiImportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    plans = await _plan_import(session, payload, operations)
+
+    if payload.mode == "preview":
+        title, api_version = document_info(document)
+        preview = OpenApiImportPreview(
+            openapi_version=str(document["openapi"]),
+            title=title,
+            api_version=api_version,
+            servers=document_servers(document),
+            operation_count=len(plans),
+            importable_count=sum(1 for plan in plans if plan.candidate is not None),
+            default_price_sompi=payload.default_price_sompi,
+            min_price_sompi=min_price_sompi(),
+            operations=[_preview_row(plan, payload.default_price_sompi) for plan in plans],
+        )
+        return JSONResponse(content=preview.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
+
+    by_key = {(plan.operation.method, plan.operation.path): plan for plan in plans}
+    errors: list[dict[str, Any]] = []
+    chosen: list[tuple[_ImportPlan, int]] = []
+    for index, selection in enumerate(payload.selections or []):
+        plan = by_key.get((selection.method, selection.path))
+        if plan is None:
+            errors.append(_row_error(index, f"{selection.method} {selection.path} is not an operation in the document"))
+        elif plan.candidate is None or plan.slug is None:
+            errors.append(_row_error(index, f"{plan.operation.key} cannot be imported: {plan.skip_reason}"))
+        else:
+            chosen.append((plan, selection.price_sompi or payload.default_price_sompi))
+    if errors:
+        raise RequestValidationError(errors)
+
+    endpoints: list[Endpoint] = []
+    for plan, price in chosen:
+        candidate = plan.candidate
+        assert candidate is not None and plan.slug is not None  # noqa: S101 - guaranteed by the loop above
+        endpoints.append(
+            Endpoint(
+                merchant_id=merchant.id,
+                slug=plan.slug,
+                name=candidate.name,
+                description=candidate.description,
+                category=candidate.category,
+                upstream_url=str(candidate.upstream_url),
+                upstream_headers_encrypted=encrypted,
+                price_sompi=price,
+                allowed_methods=list(candidate.allowed_methods),
+                is_public_listed=candidate.is_public_listed,
+            )
+        )
+    session.add_all(endpoints)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="a proposed slug was taken while importing; nothing was created - preview again",
+        ) from exc
+    for endpoint in endpoints:
+        await session.refresh(endpoint)
+    created = OpenApiImportCreated(
+        created_count=len(endpoints), created=[EndpointRead.model_validate(endpoint) for endpoint in endpoints]
+    )
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content=created.model_dump(mode="json"))
 
 
 # ---------------------------------------------------------------- settlements & analytics

@@ -586,6 +586,116 @@ class EndpointRead(ReadModel):
         return f"{get_settings().public_base_url}{PROXY_PATH_PREFIX}/{self.slug}"
 
 
+# ---------------------------------------------------------------- OpenAPI import
+
+OPENAPI_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
+OPENAPI_MAX_OPERATIONS = 500
+OPENAPI_MAX_PATH_LENGTH = 512
+OPENAPI_PREVIEW_TEXT_LENGTH = 200
+
+
+class OpenApiImportSelection(StrictModel):
+    """One operation to create, addressed by its stable key (method + path exactly as in the document)."""
+
+    method: HttpMethod
+    path: str = Field(min_length=1, max_length=OPENAPI_MAX_PATH_LENGTH)
+    price_sompi: Sompi | None = Field(default=None, description="Per-operation override of default_price_sompi.")
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def _upper(cls, v: object) -> object:
+        return v.strip().upper() if isinstance(v, str) else v
+
+    @field_validator("price_sompi")
+    @classmethod
+    def _price(cls, v: int | None) -> int | None:
+        if v is not None:
+            compute_fee_split(v)
+        return v
+
+
+class OpenApiImportRequest(StrictModel):
+    """POST /v1/endpoints/import body. Exactly one of spec_text / spec_url.
+
+    mode="preview" lists the operations and creates nothing; mode="create" creates one endpoint per selection
+    in a single transaction (all-or-nothing).
+    """
+
+    mode: Literal["preview", "create"]
+    spec_text: str | None = Field(default=None, min_length=1, description="OpenAPI 3.0/3.1 document, JSON or YAML.")
+    spec_url: HttpUrl | None = Field(
+        default=None, description="Public http(s) URL the gateway fetches the document from."
+    )
+    upstream_base_url: HttpUrl
+    default_price_sompi: Sompi
+    upstream_headers: dict[str, str] = Field(default_factory=dict, max_length=20)
+    category: str | None = Field(default=None, max_length=60)
+    is_public_listed: bool = True
+    selections: list[OpenApiImportSelection] | None = Field(
+        default=None, min_length=1, max_length=OPENAPI_MAX_OPERATIONS
+    )
+
+    @field_validator("spec_url", "upstream_base_url")
+    @classmethod
+    def _url(cls, v: HttpUrl | None) -> HttpUrl | None:
+        return None if v is None else _reject_private_host(v)
+
+    @field_validator("default_price_sompi")
+    @classmethod
+    def _price(cls, v: int) -> int:
+        compute_fee_split(v)
+        return v
+
+    @model_validator(mode="after")
+    def _shape(self) -> Self:
+        if (self.spec_text is None) == (self.spec_url is None):
+            raise ValueError("provide exactly one of spec_text or spec_url")
+        if self.mode == "create" and not self.selections:
+            raise ValueError("mode 'create' needs at least one selection")
+        if self.mode == "preview" and self.selections is not None:
+            raise ValueError("selections are only accepted with mode 'create'")
+        if self.selections is not None:
+            keys = [(item.method, item.path) for item in self.selections]
+            if len(set(keys)) != len(keys):
+                raise ValueError("each operation may be selected only once")
+        return self
+
+
+class OpenApiOperationPreview(BaseModel):
+    key: str = Field(description="Stable operation key: '<METHOD> <path>'.")
+    method: str
+    path: str
+    operation_id: str | None
+    summary: str | None
+    path_params: list[str]
+    importable: bool
+    skip_reason: str | None
+    slug: str | None = Field(description="Slug the endpoint would get if created now (deterministic).")
+    upstream_url: str | None = Field(description="Upstream URL: base URL + the path up to the first {param} segment.")
+    proxy_path: str | None = Field(description="Buyer route, e.g. /p/{slug}/{petId}; path params are the suffix.")
+    proxy_url: str | None
+    price_sompi: int
+
+
+class OpenApiImportPreview(BaseModel):
+    mode: Literal["preview"] = "preview"
+    openapi_version: str
+    title: str | None
+    api_version: str | None
+    servers: list[str]
+    operation_count: int
+    importable_count: int
+    default_price_sompi: int
+    min_price_sompi: int
+    operations: list[OpenApiOperationPreview]
+
+
+class OpenApiImportCreated(BaseModel):
+    mode: Literal["create"] = "create"
+    created_count: int
+    created: list[EndpointRead]
+
+
 # ---------------------------------------------------------------- analytics & tax
 
 
