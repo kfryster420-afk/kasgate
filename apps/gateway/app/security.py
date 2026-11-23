@@ -32,6 +32,7 @@ from app.deps import get_db_session, get_redis
 from app.models import Merchant
 from app.schemas import (
     AUTH_PURPOSE,
+    HEADER_K402_PAYMENT,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
@@ -68,6 +69,7 @@ PAYMENT_HEADERS: frozenset[str] = frozenset(
         HEADER_PAYMENT_REQUIRED.lower(),
         HEADER_PAYMENT_SIGNATURE.lower(),
         HEADER_PAYMENT_RESPONSE.lower(),
+        HEADER_K402_PAYMENT.lower(),
     }
 )
 FORBIDDEN_UPSTREAM_HEADER_NAMES: frozenset[str] = (

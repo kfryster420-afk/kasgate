@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import SessionLocal
-from app.schemas import PaymentRequired, PaymentSignature
+from app.schemas import K402UtxoOffer, PaymentRequired, PaymentSignature
 
 
 class VerifiedPaymentLike(Protocol):
@@ -18,7 +18,7 @@ class VerifiedPaymentLike(Protocol):
     def tx_id(self) -> str: ...
 
     @property
-    def payer_address(self) -> str: ...
+    def payer_address(self) -> str | None: ...
 
     @property
     def total_sompi(self) -> int: ...
@@ -42,6 +42,8 @@ class PaymentVerifier(Protocol):
     async def resolve_inputs(self, signature: PaymentSignature, tx: Any) -> object: ...
 
     async def settle(self, tx: Any, verified: Any, required: PaymentRequired) -> VerifiedPaymentLike: ...
+
+    async def verify_k402(self, tx_id: str, offer: K402UtxoOffer) -> VerifiedPaymentLike: ...
 
 
 class RateProvider(Protocol):

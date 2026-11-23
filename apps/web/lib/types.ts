@@ -28,6 +28,7 @@ export const X402_ERROR_CODES = [
   "invalid_payment_header",
   "payment_replayed",
   "payment_expired",
+  "payment_not_found",
   "underpaid",
   "invalid_fee_split",
   "wrong_network",
@@ -77,10 +78,24 @@ export interface PaymentResponse {
   usdValueAtSettlement: DecimalString;
 }
 
+/** k402 `kaspa-utxo` offer (CONTRACT v2.9): `amount_sompi` is the merchant output, `facilitator_fee` the treasury. */
+export interface K402UtxoOffer {
+  scheme: "kaspa-utxo";
+  network: "testnet-10" | "mainnet";
+  amount_sompi: Sompi;
+  pay_to: string;
+  payment_id: string;
+  expires: number;
+  description: string;
+  facilitator_fee: { sompi: Sompi; to: string; by: "kasgate" };
+}
+
+/** On a 402, `k402` is "0.2" and `accepts` lists the v1 terms (also in PAYMENT-REQUIRED) then the k402 offer. */
 export interface X402ErrorBody {
   error: X402ErrorCode;
   message: string;
-  accepts: PaymentRequired | null;
+  k402: "0.2" | null;
+  accepts: Array<PaymentRequired | K402UtxoOffer> | null;
 }
 
 /* ------------------------------------------------------------------ fee split */
@@ -287,7 +302,9 @@ export interface SettlementRead {
   endpoint_id: Uuid;
   merchant_id: Uuid;
   network: string;
-  payer_address: string;
+  /** "k402-kaspa-utxo" payments carry the same treasury output but prove no payer, so payer_address is null. */
+  payment_scheme: "kaspa-exact-v1" | "k402-kaspa-utxo";
+  payer_address: string | null;
   merchant_address: string;
   treasury_address: string;
   amount_sompi: Sompi;
@@ -354,7 +371,7 @@ export interface TaxReportRow {
   tx_id: string;
   network: string;
   endpoint_slug: string;
-  payer_address: string;
+  payer_address: string | null;
   gross_kas: string;
   merchant_kas: string;
   platform_fee_kas: string;

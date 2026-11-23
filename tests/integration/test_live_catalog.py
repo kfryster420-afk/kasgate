@@ -33,7 +33,12 @@ def test_unpaid_call_gets_402_with_a_decodable_challenge(proxy_url, endpoint, ne
     assert required.payTo == merchant_address
     body = response.json()
     assert body["error"] == "payment_required"
-    assert body["accepts"]["amount"] == str(min_price)
+    assert body["accepts"][0]["amount"] == str(min_price)
+    assert body["k402"] == "0.2"
+    k402_offer = body["accepts"][1]
+    assert k402_offer["scheme"] == "kaspa-utxo" and k402_offer["network"] == network.removeprefix("kaspa:")
+    assert k402_offer["pay_to"] == merchant_address
+    assert int(k402_offer["amount_sompi"]) + int(k402_offer["facilitator_fee"]["sompi"]) >= min_price
 
 
 def test_quote_endpoint_matches_the_402_challenge(gateway_url, proxy_url, endpoint) -> None:

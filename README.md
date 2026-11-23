@@ -19,6 +19,14 @@ Listed endpoints are also published as a public, machine-readable catalog at `GE
 
 Merchants can import a paid endpoint per operation from an OpenAPI 3.0 or 3.1 document (JSON or YAML) in the dashboard, via `POST /v1/endpoints/import`. Preview writes nothing; create is all-or-nothing. The contract is in [docs/CONTRACTS.md](docs/CONTRACTS.md) (v2.8) and [docs/OPENAPI_IMPORT.md](docs/OPENAPI_IMPORT.md).
 
+### k402 wallets and agents work too
+
+Every 402 is also a [k402](https://github.com/kaspa-402/k402) offer body (`{"k402": "0.2", "accepts": [...]}` with a `kaspa-utxo` offer), so an unmodified k402 client (`k402.Client` with a `kaspa-utxo` payer such as `HotWallet`) can pay a KasGate endpoint with no KasGate SDK. It pays the offer itself and retries with `X-K402-Payment: kaspa-utxo <txid> <payment_id>`.
+
+**The platform fee still applies on this path.** The offer quotes the merchant share as `amount_sompi` and the KasGate fee as `facilitator_fee`, which the official wallet pays as output 1. The gateway looks the transaction up on its own node and serves the call only if output 0 pays the merchant exactly and output 1 pays the treasury exactly (checked by index and by address). A missing, short, swapped or redirected fee output is refused. **Anti-front-running amount tag:** each k402 offer adds a random tag of under 0.01 KAS (1,000,000 sompi) to the merchant share. k402 transactions carry no nonce or payer proof, so the exact amounts are what tie a transaction to one offer; the tag makes another caller's offer for the same endpoint very unlikely to match your transaction. For USD-priced endpoints the offer uses the same locked KAS quote as the `PAYMENT-REQUIRED` challenge, and if the KAS/USD price is unavailable the gateway answers `503 price_unavailable` with no offer at all. Details are in CONTRACT v2.9 of [docs/CONTRACTS.md](docs/CONTRACTS.md). Only `kaspa-utxo` is supported; `kaspa-session` and `kaspa-channel` are not.
+
+Known upstream issue: with `kaspa==2.1.0`, `k402.wallet.HotWallet(..., network="testnet-10")` fails in its constructor ("Invalid network type"). Its `pay()` and `k402.Client` work, and mainnet is unaffected. Testnet-10 testers need a payer that builds the same transaction (see the k402 scenario in [docs/beta/TEST_PLAN.md](docs/beta/TEST_PLAN.md)).
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:
@@ -26,7 +34,7 @@ Funds never pass through KasGate. Every payment is a single on-chain transaction
 | Output | Receives | Amount |
 | --- | --- | --- |
 | 0 | The merchant's own wallet | The price minus the platform fee |
-| 1 | The platform treasury | `max(1.5%, 0.2 KAS)` of the price |
+| 1 | The platform treasury | `max(1.5%, 0.2 KAS)` of the price (also on k402 payments) |
 | 2+ | Change back to the buyer | Only change is allowed here |
 
 The fee is `max(ceil(price x 150 / 10,000), 0.2 KAS)`. The minimum endpoint price is 0.6 KAS, so that both outputs stay above Kaspa's storage-mass limit. At the minimum price a payment is 0.4 KAS to the merchant and 0.2 KAS to the treasury. KasGate holds no private keys.
@@ -93,7 +101,7 @@ Example transactions on the testnet-10 explorer:
 - Funded-run happy path: [`e710f434…be0673`](https://explorer-tn10.kaspa.org/txs/e710f43443383858728eab5331d10691c4e087754e880efd6b350a1b65be0673)
 - Full-stack run through the website: [`143037df…d94696`](https://explorer-tn10.kaspa.org/txs/143037df56473da6be7dbf1ce3299cfb1eadf4a873e12ae61725abec55d94696)
 
-Offline suites (no network, no funds): gateway 430 tests, buyer SDK 210, MCP server 83, integration offline tier 210. They run in CI on every push and pull request.
+Offline suites (no network, no funds): gateway 614 tests (the k402 end-to-end test needs the k402 checkout, see `K402_SRC`), buyer SDK 217, MCP server 90, integration offline tier 210. They run in CI on every push and pull request.
 
 ## Contributing
 

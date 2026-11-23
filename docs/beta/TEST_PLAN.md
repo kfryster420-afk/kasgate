@@ -32,7 +32,7 @@ Write these down as you go. If something fails, file a [bug report](https://gith
 
 ## Fee split (applies to every paid call)
 
-Every valid payment is a single Kaspa transaction with this output order:
+Every valid payment, through the KasGate SDK or a k402 client (scenario 8), is a single Kaspa transaction with this output order:
 
 | Output | Recipient | Amount |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ Every valid payment is a single Kaspa transaction with this output order:
 | 1 | Treasury (`platformFee.feeTo`) | the platform fee, exact |
 | 2+ | Change back to the buyer, if any | either omitted (zero change) or at least 0.3 KAS (30,000,000 sompi) |
 
-The fee is `max(ceil(price × 150 / 10,000), 0.2 KAS)`. The minimum endpoint price is **0.6 KAS** (60,000,000 sompi). At that price the split is **0.4 KAS to the merchant and 0.2 KAS to the treasury**. Amounts in the challenge headers are sompi strings (1 KAS = 100,000,000 sompi). The transaction payload must be the bytes `kasgate:v1:` plus the challenge `nonce`.
+The fee is `max(ceil(price × 150 / 10,000), 0.2 KAS)`. The minimum endpoint price is **0.6 KAS** (60,000,000 sompi). At that price the split is **0.4 KAS to the merchant and 0.2 KAS to the treasury**. Amounts in the challenge headers are sompi strings (1 KAS = 100,000,000 sompi). For `PAYMENT-SIGNATURE` payments the transaction payload must be the bytes `kasgate:v1:` plus the challenge `nonce`; k402 payments have an empty payload.
 
 ## Scenarios
 
@@ -95,6 +95,24 @@ Then create (or use) an endpoint priced at exactly 0.6 KAS and complete a valid 
 Using the successful 0.6 KAS payment from scenario 6 (or another successful payment if you already have one), open `https://explorer-tn10.kaspa.org/txs/<txid>` and check the outputs against the challenge that was paid.
 
 - Expected: output 0 is the merchant `payTo` address for the exact merchant amount; output 1 is the treasury `feeTo` address for the exact fee; any further output is change to the buyer and is either absent or at least 0.3 KAS. The dashboard settlement, if you are the merchant, shows the same `txId` and amounts.
+
+### 8. k402 client (`kaspa-utxo`), fee still enforced
+
+For testers who use the [k402](https://github.com/kaspa-402/k402) Python library instead of the KasGate SDK. KasGate does not support `kaspa-session` or `kaspa-channel`.
+
+Call a paid endpoint with no payment header and read the JSON body.
+
+- Expected: HTTP **402** with `"k402": "0.2"` and an `accepts` list. `accepts[0]` is the KasGate `kaspa-exact-v1` terms (the same as `PAYMENT-REQUIRED`). `accepts[1]` has `scheme: "kaspa-utxo"`, `network: "testnet-10"` (not `kaspa:testnet-10`), `pay_to` = the merchant, `amount_sompi` = the merchant share, `facilitator_fee.to` = the treasury and `facilitator_fee.sompi` = the fee, a `payment_id` (`p_` + 16 hex) and `expires`. `amount_sompi + facilitator_fee.sompi` is the endpoint price plus a random tag under 0.01 KAS (1,000,000 sompi), and the fee is `max(ceil(total × 1.5 %), 0.2 KAS)` of that total. Record the whole `accepts[1]` object (it contains no secrets).
+
+Pay with `k402.Client(payer=...)` and an unmodified `kaspa-utxo` payer. **Known upstream issue:** with `kaspa==2.1.0`, `k402.wallet.HotWallet(key, network="testnet-10")` fails in its constructor with `Invalid network type: testnet-10`. Report it if you see it, then use a payer that does what `HotWallet.pay` does: `create_transactions(network_id="testnet-10", outputs=[PaymentOutput(pay_to, amount_sompi), PaymentOutput(facilitator_fee.to, facilitator_fee.sompi)], change_address=<your address>)`, sign, submit, and return the txid. Never paste the key into a report.
+
+- Expected: the client retries with `X-K402-Payment: kaspa-utxo <txid> <payment_id>` and gets the upstream response with a `PAYMENT-RESPONSE` header. It may get one or two `402 payment_not_found` first while the node sees the transaction; the client retries those on its own. On the explorer, output 0 pays the merchant exactly `amount_sompi`, output 1 pays the treasury exactly `facilitator_fee.sompi`, and the payload is empty. The merchant dashboard shows the settlement "via k402" with no payer address.
+
+Then try to get the call without paying the fee. Each needs a fresh offer and is a separate small payment:
+
+- Pay only output 0 (no treasury output), or the fee 1 sompi short, or the fee to another address, or the two outputs in swapped order. Expected: **402** `invalid_fee_split` every time and no upstream response, even though the merchant output is correct.
+- Replay a settled header, the same `txid` with a new `payment_id`, or that `txid` in a KasGate `PAYMENT-SIGNATURE`. Expected: **409** `payment_replayed`.
+- Send `X-K402-Payment` empty, with two or four tokens, or with `kaspa-session`. Expected: **402** `invalid_payment_header`.
 
 ## When you are done
 

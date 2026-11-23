@@ -133,7 +133,12 @@ class Settlement(Base):
         UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
     )
     network: Mapped[str] = mapped_column(String(20), nullable=False)
-    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    # "kaspa-exact-v1" (PAYMENT-SIGNATURE) or "k402-kaspa-utxo" (X-K402-Payment). Both carry the treasury output.
+    payment_scheme: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="kaspa-exact-v1", server_default="kaspa-exact-v1"
+    )
+    # NULL only for k402: an unmodified k402 client proves no payer address (no payerProof).
+    payer_address: Mapped[str | None] = mapped_column(String(100), nullable=True)
     merchant_address: Mapped[str] = mapped_column(String(100), nullable=False)
     treasury_address: Mapped[str] = mapped_column(String(100), nullable=False)
     amount_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -156,6 +161,7 @@ class Settlement(Base):
     request_path: Mapped[str] = mapped_column(Text, nullable=False)
     upstream_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payment_nonce: Mapped[str] = mapped_column(String(32), nullable=False)
+    k402_payment_id: Mapped[str | None] = mapped_column(String(18), nullable=True)
     delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -169,10 +175,19 @@ class Settlement(Base):
         Index("ix_settlements_merchant_created", "merchant_id", "created_at"),
         Index("ix_settlements_endpoint_created", "endpoint_id", "created_at"),
         Index("ix_settlements_payer_address", "payer_address"),
+        Index("ix_settlements_k402_payment_id", "k402_payment_id", unique=True),
         CheckConstraint("amount_sompi > 0", name="amount_positive"),
         CheckConstraint("merchant_amount_sompi > 0 AND fee_amount_sompi > 0", name="outputs_positive"),
         CheckConstraint("merchant_amount_sompi + fee_amount_sompi = amount_sompi", name="split_sums_to_total"),
         CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
         CheckConstraint("payment_nonce ~ '^[0-9a-f]{32}$'", name="payment_nonce_hex32"),
         CheckConstraint("delivery_attempts >= 1", name="delivery_attempts_positive"),
+        CheckConstraint("payment_scheme IN ('kaspa-exact-v1', 'k402-kaspa-utxo')", name="payment_scheme_known"),
+        CheckConstraint(
+            "(payment_scheme = 'k402-kaspa-utxo') = (k402_payment_id IS NOT NULL)", name="k402_payment_id_iff_k402"
+        ),
+        CheckConstraint("k402_payment_id ~ '^p_[0-9a-f]{16}$'", name="k402_payment_id_format"),
+        CheckConstraint(
+            "payment_scheme = 'k402-kaspa-utxo' OR payer_address IS NOT NULL", name="payer_required_for_v1"
+        ),
     )

@@ -8,6 +8,9 @@ Pipeline used by the proxy, see ``KaspaEngine`` for signatures:
 
 ``verify_and_submit(signature, required)`` runs all three in order.
 
+k402 ``kaspa-utxo`` (CONTRACT v2.9): ``await verify_k402(tx_id, offer)`` looks up a transaction the payer already
+submitted and applies the same exact two-output rule (see ``check_k402_outputs``), without the payload or payerProof.
+
 Verification contract (see docs/CONTRACTS.md):
 
 * ``signature.nonce == required.nonce`` and ``tx.payload == schemas.payment_payload(nonce)``
@@ -77,7 +80,14 @@ from app.config import (
     Settings,
     get_settings,
 )
-from app.schemas import PaymentRequired, PaymentSignature, payer_proof_message, payment_payload
+from app.schemas import (
+    K402UtxoOffer,
+    PaymentRequired,
+    PaymentSignature,
+    k402_network_label,
+    payer_proof_message,
+    payment_payload,
+)
 
 logger = logging.getLogger("kasgate.kaspa_engine")
 
@@ -155,7 +165,7 @@ class RpcUnavailableError(PaymentVerificationError):
 @dataclass(frozen=True)
 class VerifiedPayment:
     tx_id: str
-    payer_address: str
+    payer_address: str | None  # None only for k402 kaspa-utxo, which proves no payer
     total_sompi: int
     merchant_sompi: int
     fee_sompi: int
@@ -253,6 +263,71 @@ def minimum_fee_sompi(total_sompi: int, min_output_sompi: int) -> int:
     """CONTRACT v2.1 floor for Output 1: ``max(ceil(total * 150 / 10_000), MIN_OUTPUT_SOMPI)``."""
     percentage = -(-total_sompi * PLATFORM_FEE_BPS // BPS_DENOMINATOR)
     return max(percentage, min_output_sompi)
+
+
+OutputMap = dict[int, tuple[int, ScriptKey]]
+
+
+def check_k402_outputs(tx_id: str, outputs: OutputMap, offer: K402UtxoOffer, min_output_sompi: int) -> VerifiedPayment:
+    """CONTRACT v2.9 (k402 ``kaspa-utxo``): output 0 pays the merchant EXACTLY, output 1 pays the treasury EXACTLY.
+
+    ``outputs`` maps output index -> ``(value, script)`` for every output of ``tx_id`` that is known: the whole
+    transaction (mempool) or only the still-unspent outputs paying the merchant or the treasury (UTXO index). The
+    check is by index AND by locking script: an output paying the treasury or the merchant at any other index (a
+    reordered ``create_transactions`` result, a swap) is ``invalid_fee_split``. There is no payload or payerProof
+    check here; unmodified k402 clients send an empty payload.
+    """
+    merchant_script = _script_key(offer.pay_to, what="pay_to", code="invalid_fee_split")
+    fee_script = _script_key(offer.facilitator_fee.to, what="facilitator_fee.to", code="invalid_fee_split")
+    if merchant_script == fee_script:
+        raise PaymentVerificationError("invalid_fee_split", "the merchant and treasury outputs must be different")
+    expected_merchant, expected_fee = offer.merchant_sompi, offer.fee_sompi
+
+    def indices(script: ScriptKey) -> list[int]:
+        return sorted(index for index, (_, out_script) in outputs.items() if out_script == script)
+
+    merchant_at, fee_at = indices(merchant_script), indices(fee_script)
+    fee_out = outputs.get(1)
+    if fee_out is None or fee_out[1] != fee_script:
+        if fee_at:
+            raise PaymentVerificationError(
+                "invalid_fee_split", f"the treasury output must be output 1, found at output {fee_at[0]}"
+            )
+        raise PaymentVerificationError("invalid_fee_split", "output 1 must pay the KasGate treasury address")
+    merchant_out = outputs.get(0)
+    if merchant_out is None or merchant_out[1] != merchant_script:
+        if merchant_at:
+            raise PaymentVerificationError(
+                "invalid_fee_split", f"the merchant output must be output 0, found at output {merchant_at[0]}"
+            )
+        raise PaymentVerificationError("invalid_fee_split", "output 0 must pay the merchant address")
+    fee_value, merchant_value = fee_out[0], merchant_out[0]
+    if fee_value != expected_fee:
+        raise PaymentVerificationError(
+            "invalid_fee_split", f"treasury output must be exactly {expected_fee} sompi, got {fee_value}"
+        )
+    if merchant_value < expected_merchant:
+        raise PaymentVerificationError(
+            "underpaid", f"merchant output is {expected_merchant - merchant_value} sompi short of {expected_merchant}"
+        )
+    if merchant_value != expected_merchant:
+        raise PaymentVerificationError(
+            "invalid_fee_split", f"merchant output must be exactly {expected_merchant} sompi, got {merchant_value}"
+        )
+    total = merchant_value + fee_value
+    minimum_fee = minimum_fee_sompi(total, min_output_sompi)
+    if fee_value < minimum_fee:
+        raise PaymentVerificationError(
+            "invalid_fee_split",
+            f"treasury output {fee_value} is below max(ceil(1.5%), MIN_OUTPUT_SOMPI) of the total ({minimum_fee})",
+        )
+    if merchant_value < 2 * min_output_sompi:
+        raise PaymentVerificationError(
+            "underpaid", f"merchant output {merchant_value} is below 2*MIN_OUTPUT_SOMPI ({2 * min_output_sompi})"
+        )
+    return VerifiedPayment(
+        tx_id=tx_id, payer_address=None, total_sompi=total, merchant_sompi=merchant_value, fee_sompi=fee_value
+    )
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -487,6 +562,118 @@ class KaspaEngine:
         if accepted_mode and not already_accepted:
             await self._wait_for_acceptance(verified.tx_id, start_hash)
         return verified
+
+    # ------------------------------------------------------------------ k402 kaspa-utxo (CONTRACT v2.9)
+
+    async def verify_k402(self, tx_id: str, offer: K402UtxoOffer) -> VerifiedPayment:
+        """Find the k402 payer's own transaction ``tx_id`` on the node and check its outputs against ``offer``.
+
+        The payer has already submitted the transaction, so nothing is submitted here. Lookup order:
+
+        1. ``accepted`` mode: read the sink hash FIRST (the acceptance poll starts there).
+        2. Mempool entries received by the merchant or treasury address: the full transaction, so every output is
+           checked by index and script. In ``accepted`` mode the virtual chain is then polled until it accepts
+           ``tx_id``; if that times out, the UTXO index is consulted once (it may have been accepted at the sink).
+        3. Otherwise the UTXO index (``get_utxos_by_addresses`` for the merchant and treasury addresses), which
+           holds only outputs of accepted transactions.
+
+        Raises ``payment_not_found`` (the payer should retry the same header shortly) when the transaction is not
+        visible yet, or a split error from ``check_k402_outputs``. A spent merchant or treasury output that is no
+        longer in the mempool or UTXO index cannot be checked and is refused, never assumed.
+        """
+        self._check_k402_network(offer)
+        floor = self._settings.min_output_sompi
+        accepted_mode = self._settings.settlement_mode == "accepted"
+        addresses = sorted({offer.pay_to.lower(), offer.facilitator_fee.to.lower()})
+        start_hash = await self._sink_hash() if accepted_mode else ""
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        in_mempool = self._k402_mempool_outputs(mempool_response, tx_id)
+        if in_mempool is not None:
+            verified = check_k402_outputs(tx_id, in_mempool, offer, floor)
+            if accepted_mode:
+                try:
+                    await self._wait_for_acceptance(tx_id, start_hash)
+                except RpcUnavailableError as exc:
+                    if not await self._k402_utxo_outputs(addresses, tx_id):
+                        raise PaymentVerificationError(
+                            "payment_not_found", f"transaction {tx_id} is not accepted yet; retry shortly"
+                        ) from exc
+            return verified
+        accepted_outputs = await self._k402_utxo_outputs(addresses, tx_id)
+        if not accepted_outputs:
+            raise PaymentVerificationError(
+                "payment_not_found",
+                f"transaction {tx_id} pays neither the merchant nor the treasury on this node yet; retry shortly",
+            )
+        return check_k402_outputs(tx_id, accepted_outputs, offer, floor)
+
+    def _check_k402_network(self, offer: K402UtxoOffer) -> None:
+        settings = self._settings
+        expected = k402_network_label(settings.kaspa_network)
+        if offer.network != expected:
+            raise PaymentVerificationError(
+                "wrong_network", f"k402 offer network {offer.network} does not match gateway network {expected}"
+            )
+        prefix = NETWORK_ADDRESS_PREFIX[settings.kaspa_network]
+        for label, address in (("pay_to", offer.pay_to), ("facilitator_fee.to", offer.facilitator_fee.to)):
+            if not _has_prefix(address, prefix):
+                raise PaymentVerificationError(
+                    "wrong_network", f"{label} must use the '{prefix}:' prefix on {settings.kaspa_network}"
+                )
+
+    @staticmethod
+    def _k402_mempool_outputs(response: object, tx_id: str) -> OutputMap | None:
+        """Every output of ``tx_id`` from a ``get_mempool_entries_by_addresses`` reply, or None when it is absent."""
+        for by_address in _as_list(_as_dict(response).get("entries")):
+            for mempool_entry in _as_list(_as_dict(by_address).get("receiving")):
+                transaction = _as_dict(_as_dict(mempool_entry).get("transaction"))
+                entry_id = _as_dict(transaction.get("verboseData")).get("transactionId")
+                if not isinstance(entry_id, str) or entry_id.lower() != tx_id:
+                    continue
+                outputs: OutputMap = {}
+                for index, output in enumerate(_as_list(transaction.get("outputs"))):
+                    output_dict = _as_dict(output)
+                    value = output_dict.get("value")
+                    script = parse_script_key(output_dict.get("scriptPublicKey"))
+                    if isinstance(value, bool) or not isinstance(value, int) or script is None:
+                        raise PaymentVerificationError(
+                            "invalid_payment_header", f"output {index} of {tx_id} is malformed in the node's reply"
+                        )
+                    outputs[index] = (value, script)
+                return outputs
+        return None
+
+    async def _k402_utxo_outputs(self, addresses: list[str], tx_id: str) -> OutputMap:
+        """Unspent outputs of ``tx_id`` that pay one of ``addresses``, from the node's UTXO index (accepted only)."""
+        response = await self._rpc(
+            "get_utxos_by_addresses", lambda client: client.get_utxos_by_addresses({"addresses": addresses})
+        )
+        outputs: OutputMap = {}
+        for entry in _as_list(_as_dict(response).get("entries")):
+            entry_dict = _as_dict(entry)
+            outpoint = _as_dict(entry_dict.get("outpoint"))
+            utxo = _as_dict(entry_dict.get("utxoEntry"))
+            entry_tx, index, amount = outpoint.get("transactionId"), outpoint.get("index"), utxo.get("amount")
+            if not isinstance(entry_tx, str) or entry_tx.lower() != tx_id:
+                continue
+            script = parse_script_key(utxo.get("scriptPublicKey"))
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or isinstance(amount, bool)
+                or not isinstance(amount, int)
+                or script is None
+            ):
+                raise PaymentVerificationError(
+                    "invalid_payment_header", f"a UTXO of {tx_id} is malformed in the node's reply"
+                )
+            outputs[index] = (amount, script)
+        return outputs
 
     # ------------------------------------------------------------------ pure checks
 

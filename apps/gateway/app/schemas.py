@@ -33,6 +33,7 @@ from app.models import PriceCurrency, SettlementStatus
 HEADER_PAYMENT_REQUIRED = "PAYMENT-REQUIRED"
 HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
 HEADER_PAYMENT_RESPONSE = "PAYMENT-RESPONSE"
+HEADER_K402_PAYMENT = "X-K402-Payment"
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -44,6 +45,16 @@ REGISTER_PURPOSE = "Register this address as a KasGate merchant. This does not a
 
 KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
 TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+K402_VERSION = "0.2"
+K402_PAYMENT_ID_RE = r"^p_[0-9a-f]{16}$"
+MAX_K402_HEADER_CHARS = 256
+# Uniqueness tag added to the merchant output of every k402 offer: 0 .. K402_TAG_SPACE - 1 sompi (< 0.01 KAS).
+# k402 transactions carry no payload nonce or payerProof, so the exact amounts are the only thing that ties a txid to
+# one offer; the tag makes a bystander's own offer for the same endpoint very unlikely to match someone else's tx.
+K402_TAG_SPACE = 1_000_000
+K402_NETWORK_BY_CONFIG: dict[str, str] = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}
+PaymentScheme = Literal["kaspa-exact-v1", "k402-kaspa-utxo"]
+K402Network = Literal["testnet-10", "mainnet"]
 SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
 SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
@@ -355,12 +366,160 @@ class PaymentResponse(X402Header):
         return validate_tx_id(v)
 
 
+# ---------------------------------------------------------------- k402 (kaspa-402/k402 PROTOCOL.md, scheme kaspa-utxo)
+
+
+def k402_network_label(network: str) -> str:
+    """k402 wire network name for a KasGate network (``kaspa:testnet-10`` -> ``testnet-10``), never the CAIP form."""
+    try:
+        return K402_NETWORK_BY_CONFIG[network]
+    except KeyError as exc:
+        raise ValueError(f"unsupported Kaspa network: {network}") from exc
+
+
+def new_k402_payment_id() -> str:
+    return "p_" + secrets.token_hex(8)
+
+
+def new_k402_tag() -> int:
+    return secrets.randbelow(K402_TAG_SPACE)
+
+
+class K402FacilitatorFee(StrictModel):
+    """``facilitator_fee`` of a k402 offer: the KasGate treasury output, paid as output 1 by ``HotWallet.pay``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sompi: SompiStr
+    to: str
+    by: Literal["kasgate"] = "kasgate"
+
+    @field_validator("to")
+    @classmethod
+    def _to(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class K402UtxoOffer(StrictModel):
+    """One ``kaspa-utxo`` entry of a k402 402 body.
+
+    ``amount_sompi`` is the merchant output only; ``facilitator_fee.sompi`` is the exact KasGate fee for the offer total
+    ``amount_sompi + facilitator_fee.sompi`` (``max(ceil(total * 1.5 %), MIN_OUTPUT_SOMPI)``), and the total is at least
+    ``3 * MIN_OUTPUT_SOMPI`` (0.6 KAS).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scheme: Literal["kaspa-utxo"] = "kaspa-utxo"
+    network: K402Network
+    amount_sompi: SompiStr
+    pay_to: str
+    payment_id: Annotated[str, Field(pattern=K402_PAYMENT_ID_RE)]
+    expires: Annotated[int, Field(gt=0)]
+    description: Annotated[str, Field(max_length=200)] = ""
+    facilitator_fee: K402FacilitatorFee
+
+    @model_validator(mode="after")
+    def _check_split(self) -> Self:
+        settings = get_settings()
+        expected_network = k402_network_label(settings.kaspa_network)
+        if self.network != expected_network:
+            raise ValueError(f"k402 network must be '{expected_network}' on this gateway")
+        for address in (self.pay_to, self.facilitator_fee.to):
+            validate_kaspa_address(address, settings.kaspa_network)
+        split = compute_fee_split(self.total_sompi)
+        if int(self.facilitator_fee.sompi) != split.fee_sompi:
+            raise ValueError(f"facilitator_fee.sompi must be {split.fee_sompi} for a {self.total_sompi} sompi total")
+        if self.total_sompi < min_price_sompi():
+            raise ValueError(f"offer total must be at least {min_price_sompi()} sompi")
+        return self
+
+    @field_validator("pay_to")
+    @classmethod
+    def _pay_to(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @property
+    def merchant_sompi(self) -> int:
+        return int(self.amount_sompi)
+
+    @property
+    def fee_sompi(self) -> int:
+        return int(self.facilitator_fee.sompi)
+
+    @property
+    def total_sompi(self) -> int:
+        return int(self.amount_sompi) + int(self.facilitator_fee.sompi)
+
+    @classmethod
+    def for_endpoint(
+        cls,
+        price_sompi: int,
+        pay_to: str,
+        payment_id: str,
+        expires_at: datetime,
+        *,
+        tag_sompi: int,
+        description: str = "",
+    ) -> Self:
+        """Offer for ``price_sompi + tag_sompi`` split exactly like a v1 challenge of that total."""
+        if not 0 <= tag_sompi < K402_TAG_SPACE:
+            raise ValueError("tag_sompi is outside the k402 tag space")
+        settings = get_settings()
+        split = compute_fee_split(price_sompi + tag_sompi)
+        return cls(
+            network=k402_network_label(settings.kaspa_network),
+            amount_sompi=str(split.merchant_sompi),
+            pay_to=pay_to,
+            payment_id=payment_id,
+            expires=int(expires_at.timestamp()),
+            description=description[:200],
+            facilitator_fee=K402FacilitatorFee(to=settings.kasgate_treasury_address, sompi=str(split.fee_sompi)),
+        )
+
+
+class K402PaymentHeader(BaseModel):
+    """``X-K402-Payment: kaspa-utxo <txid> <payment_id>``. Only the ``kaspa-utxo`` scheme is accepted."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scheme: Literal["kaspa-utxo"]
+    tx_id: str
+    payment_id: Annotated[str, Field(pattern=K402_PAYMENT_ID_RE)]
+
+    @field_validator("tx_id")
+    @classmethod
+    def _tx(cls, v: str) -> str:
+        return validate_tx_id(v)
+
+    @classmethod
+    def from_header(cls, value: str) -> Self:
+        """Raises ValueError (pydantic ``ValidationError`` included) for anything but exactly three valid tokens."""
+        if not value or len(value) > MAX_K402_HEADER_CHARS:
+            raise ValueError(f"{HEADER_K402_PAYMENT} header missing or too large")
+        parts = value.strip().split()
+        if len(parts) != 3:
+            raise ValueError(f"{HEADER_K402_PAYMENT} must be '<scheme> <txid> <payment_id>'")
+        return cls.model_validate({"scheme": parts[0], "tx_id": parts[1], "payment_id": parts[2]})
+
+    def to_header(self) -> str:
+        return f"{self.scheme} {self.tx_id} {self.payment_id}"
+
+
+PaymentOffer = Annotated[PaymentRequired | K402UtxoOffer, Field(discriminator="scheme")]
+
+
 class X402ErrorBody(StrictModel):
+    """Error body. On a 402 it is also a k402 offer body: ``k402`` is set and ``accepts`` lists every way to pay
+    (the KasGate ``kaspa-exact-v1`` terms, identical to the ``PAYMENT-REQUIRED`` header, then the k402 ``kaspa-utxo``
+    offer). k402 clients skip the entry whose scheme they do not know."""
+
     error: Literal[
         "payment_required",
         "invalid_payment_header",
         "payment_replayed",
         "payment_expired",
+        "payment_not_found",
         "underpaid",
         "invalid_fee_split",
         "wrong_network",
@@ -374,7 +533,8 @@ class X402ErrorBody(StrictModel):
         "upstream_error",
     ]
     message: str
-    accepts: PaymentRequired | None = None
+    k402: Literal["0.2"] | None = None
+    accepts: list[PaymentOffer] | None = None
 
 
 # ---------------------------------------------------------------- merchants
@@ -705,7 +865,8 @@ class SettlementRead(ReadModel):
     endpoint_id: uuid.UUID
     merchant_id: uuid.UUID
     network: str
-    payer_address: str
+    payment_scheme: PaymentScheme
+    payer_address: str | None
     merchant_address: str
     treasury_address: str
     amount_sompi: int
@@ -775,7 +936,7 @@ class TaxReportRow(BaseModel):
     tx_id: str
     network: str
     endpoint_slug: str
-    payer_address: str
+    payer_address: str | None
     gross_kas: str
     merchant_kas: str
     platform_fee_kas: str

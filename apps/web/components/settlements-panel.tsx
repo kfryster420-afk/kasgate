@@ -88,8 +88,8 @@ export function SettlementsPanel({ endpoints, reloadKey }: { endpoints: Endpoint
                     <span title={row.tx_id}>{shortHash(row.tx_id)}</span>
                     <CopyButton value={row.tx_id} label="" className="!px-1.5 !py-1" />
                   </div>
-                  <div className="font-mono text-[11px] text-zinc-600" title={row.payer_address}>
-                    from {shortAddress(row.payer_address)}
+                  <div className="font-mono text-[11px] text-zinc-600" title={row.payer_address ?? "k402 payment"}>
+                    {row.payer_address ? `from ${shortAddress(row.payer_address)}` : "via k402"}
                   </div>
                 </td>
                 <td className="td">

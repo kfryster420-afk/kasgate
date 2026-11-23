@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0003_usd_pricing"
+HEAD_REVISION = "0004_k402_utxo"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -372,3 +372,62 @@ async def test_0003_refuses_to_downgrade_usd_rows(pg_server: PgServer) -> None:
     with pytest.raises(Exception, match="priced in USD"):
         await asyncio.to_thread(command.downgrade, config, "0002_payment_nonce")
     assert await _scalar(url, "SELECT price_currency::text FROM endpoints") == "USD"
+
+
+def _k402_insert(tx_hex: str, nonce: str, payment_id: str | None, payer: str | None = None) -> str:
+    scheme = "'k402-kaspa-utxo'" if payment_id is not None or payer is None else "'kaspa-exact-v1'"
+    pid = "NULL" if payment_id is None else f"'{payment_id}'"
+    payer_sql = "NULL" if payer is None else f"'{payer}'"
+    return (
+        "INSERT INTO settlements (id, tx_id, endpoint_id, merchant_id, network, payment_scheme, payer_address, "  # noqa: S608
+        "merchant_address, treasury_address, amount_sompi, merchant_amount_sompi, fee_amount_sompi, status, "
+        "request_method, request_path, payment_nonce, k402_payment_id) "
+        f"SELECT gen_random_uuid(), '{tx_hex}', e.id, e.merchant_id, 'kaspa:testnet-10', {scheme}, {payer_sql}, "
+        f"'m', 't', 100, 90, 10, 'settled', 'GET', '/p/x', '{nonce}', {pid} FROM endpoints e LIMIT 1"
+    )
+
+
+async def test_0004_k402_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_k402")
+    pg_server.create_database("kasgate_k402")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "head")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100, '{GET}' FROM merchants LIMIT 1",
+        _settlement_insert("a" * 64, "1" * 32),
+    )
+    assert await _scalar(url, "SELECT payment_scheme FROM settlements") == "kaspa-exact-v1"  # server default
+    await _execute(url, _k402_insert("b" * 64, "2" * 32, "p_0123456789abcdef"))
+    assert await _scalar(url, "SELECT payer_address IS NULL FROM settlements WHERE tx_id = '" + "b" * 64 + "'")
+    for bad in (
+        _k402_insert("c" * 64, "3" * 32, "p_0123456789abcdef"),  # unique ix_settlements_k402_payment_id
+        _k402_insert("c" * 64, "3" * 32, "p_0123"),  # ck_settlements_k402_payment_id_format
+        _k402_insert("c" * 64, "3" * 32, None),  # ck_settlements_k402_payment_id_iff_k402
+        _k402_insert("c" * 64, "3" * 32, None, payer="p").replace("'kaspa-exact-v1', 'p'", "'kaspa-exact-v1', NULL"),
+        "UPDATE settlements SET payment_scheme = 'other' WHERE tx_id = '" + "a" * 64 + "'",
+        "UPDATE settlements SET k402_payment_id = 'p_1111111111111111' WHERE tx_id = '" + "a" * 64 + "'",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+
+    # a downgrade would have to invent payer addresses, so it refuses while k402 rows exist
+    with pytest.raises(DBAPIError, match="k402 settlements exist"):
+        await asyncio.to_thread(command.downgrade, config, "0003_usd_pricing")
+    await _execute(url, "DELETE FROM settlements WHERE payment_scheme = 'k402-kaspa-utxo'")
+    await asyncio.to_thread(command.downgrade, config, "0003_usd_pricing")
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'settlements' "
+            "AND column_name IN ('payment_scheme', 'k402_payment_id')",
+        )
+        == 0
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION

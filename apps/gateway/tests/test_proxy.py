@@ -126,7 +126,8 @@ async def test_missing_signature_returns_402_with_nonce_bound_challenge(
     assert before + timedelta(seconds=115) <= required.expiresAt <= before + timedelta(seconds=125)
     body = response.json()
     assert body["error"] == "payment_required"
-    assert body["accepts"]["nonce"] == required.nonce
+    assert body["accepts"][0]["nonce"] == required.nonce
+    assert body["k402"] == "0.2" and body["accepts"][1]["scheme"] == "kaspa-utxo"
     assert stub_engine.calls == [] and stub_engine.verify_calls == []
     assert upstream.requests == []
 

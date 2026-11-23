@@ -17,6 +17,18 @@ Request lifecycle (CONTRACT v2)
    and `payment_nonce`; an IntegrityError is 409), then consume the nonce (GETDEL), then forward upstream.
 9. Return the upstream response with `PAYMENT-RESPONSE` (or 502 `upstream_error`, still with `PAYMENT-RESPONSE`).
 
+k402 ``kaspa-utxo`` (CONTRACT v2.9)
+---------------------------------
+Every 402 is also a k402 offer body: ``{"k402": "0.2", "accepts": [<kaspa-exact-v1 terms>, <kaspa-utxo offer>]}``. The
+offer is stored as `kasgate:k402:{payment_id}` (slug, the offer, and an internal 32-hex settlement nonce). An unmodified
+k402 client pays it itself and retries with `X-K402-Payment: kaspa-utxo <txid> <payment_id>`; the gateway then
+1. loads the offer (unknown/expired -> 402 `payment_expired`; another slug -> 402 `invalid_payment_header`),
+2. takes `SET kasgate:k402lock:{payment_id} NX` and the SHARED `SET kasgate:tx:{txId} NX`, so one txId can never be
+   claimed through both bindings,
+3. runs `engine.verify_k402` (node lookup; output 0 = merchant exact, output 1 = treasury exact, by index and script;
+   no payload or payerProof). `payment_not_found` is a 402 so k402 clients retry the same header,
+4. stores the settlement (unique `tx_id`, `payment_nonce` and `k402_payment_id`) and consumes the offer.
+
 Redelivery: the same txId + nonce + slug (and the same payer, method and path) whose settlement has no upstream
 status or a 5xx one, inside `redelivery_window_seconds` and below `redelivery_max_attempts` deliveries, is
 forwarded again and counted in `Settlement.delivery_attempts`. Anything else for a settled txId is 409.
@@ -25,6 +37,7 @@ forwarded again and counted in `Settlement.delivery_attempts`. Anything else for
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass
@@ -58,15 +71,23 @@ from app.kaspa_engine import PaymentVerificationError, RpcUnavailableError
 from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
 from app.oracle import OracleUnavailableError, usd_value
 from app.schemas import (
+    HEADER_K402_PAYMENT,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
+    K402_VERSION,
+    NONCE_RE,
     PROXY_PATH_PREFIX,
+    K402PaymentHeader,
+    K402UtxoOffer,
     PaymentRequired,
     PaymentRequiredExtra,
     PaymentResponse,
+    PaymentScheme,
     PaymentSignature,
     X402ErrorBody,
+    new_k402_payment_id,
+    new_k402_tag,
     new_payment_nonce,
     usd_micros_to_sompi,
 )
@@ -85,6 +106,10 @@ REPLAY_LOCK_PREFIX: Final = "kasgate:tx:"
 REPLAY_LOCK_TTL_SECONDS: Final = 600
 NONCE_KEY_PREFIX: Final = "kasgate:nonce:"
 NONCE_LOCK_PREFIX: Final = "kasgate:noncelock:"
+K402_OFFER_PREFIX: Final = "kasgate:k402:"
+K402_LOCK_PREFIX: Final = "kasgate:k402lock:"
+SCHEME_V1: Final[PaymentScheme] = "kaspa-exact-v1"
+SCHEME_K402: Final[PaymentScheme] = "k402-kaspa-utxo"
 DELIVERY_LOCK_PREFIX: Final = "kasgate:delivery:"
 DELIVERY_LOCK_TTL_SECONDS: Final = 60
 DEAD_LETTER_KEY: Final = "kasgate:deadletter:settlements"
@@ -124,6 +149,7 @@ _DROPPED_RESPONSE_HEADERS: Final[frozenset[str]] = (
 _VERIFICATION_CODES: Final[frozenset[str]] = frozenset(
     {"invalid_payment_header", "underpaid", "invalid_fee_split", "wrong_network", "tx_rejected"}
 )
+_K402_VERIFICATION_CODES: Final[frozenset[str]] = _VERIFICATION_CODES | {"payment_not_found"}
 
 router = APIRouter(tags=["proxy"])
 
@@ -140,6 +166,14 @@ def nonce_lock_key(nonce: str) -> str:
     return f"{NONCE_LOCK_PREFIX}{nonce}"
 
 
+def k402_offer_key(payment_id: str) -> str:
+    return f"{K402_OFFER_PREFIX}{payment_id}"
+
+
+def k402_lock_key(payment_id: str) -> str:
+    return f"{K402_LOCK_PREFIX}{payment_id}"
+
+
 def delivery_lock_key(tx_id: str) -> str:
     return f"{DELIVERY_LOCK_PREFIX}{tx_id}"
 
@@ -153,23 +187,31 @@ def _error(
     message: str,
     *,
     required: PaymentRequired | None = None,
+    offer: K402UtxoOffer | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """x402 error response. `error` outside the X402ErrorBody vocabulary yields a plain `{error, message}` body.
 
-    Every 503 carries `Retry-After`; 429 callers pass the limiter's own `Retry-After`.
+    With `required`, `accepts` lists the v1 terms (also sent as `PAYMENT-REQUIRED`); with `offer` too, the body is a
+    k402 offer body (`k402` set, the `kaspa-utxo` offer appended). Every 503 carries `Retry-After`; 429 callers pass
+    the limiter's own `Retry-After`.
     """
     out_headers = dict(headers or {})
     if status_code == 503:
         out_headers.setdefault("Retry-After", SERVICE_UNAVAILABLE_RETRY_SECONDS)
+    accepts: list[dict[str, object]] | None = None
     if required is not None:
         out_headers[HEADER_PAYMENT_REQUIRED] = required.to_header()
+        accepts = [required.model_dump(mode="json", exclude_none=True)]
+        if offer is not None:
+            accepts.append(offer.model_dump(mode="json"))
     try:
         content = X402ErrorBody.model_validate(
             {
                 "error": error,
                 "message": message,
-                "accepts": required.model_dump(mode="json", exclude_none=True) if required else None,
+                "k402": K402_VERSION if accepts is not None and offer is not None else None,
+                "accepts": accepts,
             }
         ).model_dump(mode="json")
     except ValueError:
@@ -366,6 +408,8 @@ def _settlement_payload(settlement: Settlement, endpoint_slug: str) -> str:
         {
             "txId": settlement.tx_id,
             "paymentNonce": settlement.payment_nonce,
+            "paymentScheme": settlement.payment_scheme,
+            "k402PaymentId": settlement.k402_payment_id,
             "endpointId": str(settlement.endpoint_id),
             "endpointSlug": endpoint_slug,
             "merchantId": str(settlement.merchant_id),
@@ -410,10 +454,21 @@ def _locked_quote_rate(required: PaymentRequired) -> Decimal | None:
     return rate if rate.is_finite() and rate > 0 else None
 
 
-async def _lookup_rate(oracle: RateProvider, required: PaymentRequired) -> Decimal | None:
-    locked = _locked_quote_rate(required)
-    if locked is not None:
-        return locked
+def _parse_locked_rate(value: object) -> Decimal | None:
+    """A stored KAS/USD rate string as a positive finite Decimal, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        rate = Decimal(value)
+    except Exception:
+        return None
+    return rate if rate.is_finite() and rate > 0 else None
+
+
+async def _lookup_rate(oracle: RateProvider, terms: "SettlementTerms") -> Decimal | None:
+    """The rate locked into the paid quote (USD-priced endpoints), else the live oracle rate, else None."""
+    if terms.locked_rate is not None:
+        return terms.locked_rate
     try:
         return await oracle.get_rate()
     except Exception:
@@ -421,10 +476,47 @@ async def _lookup_rate(oracle: RateProvider, required: PaymentRequired) -> Decim
         return None
 
 
+@dataclass(frozen=True)
+class SettlementTerms:
+    """What a settlement row needs from the paid offer, whichever binding (v1 or k402) it came through."""
+
+    scheme: PaymentScheme
+    network: str
+    treasury_address: str
+    nonce: str
+    k402_payment_id: str | None
+    consume_key: str  # Redis key of the offer, consumed after the settlement is stored
+    locked_rate: Decimal | None  # KAS/USD rate locked into a USD-priced quote, used for the settlement's USD value
+
+    @classmethod
+    def for_v1(cls, required: PaymentRequired) -> "SettlementTerms":
+        return cls(
+            scheme=SCHEME_V1,
+            network=required.network,
+            treasury_address=required.platformFee.feeTo,
+            nonce=required.nonce,
+            k402_payment_id=None,
+            consume_key=nonce_key(required.nonce),
+            locked_rate=_locked_quote_rate(required),
+        )
+
+    @classmethod
+    def for_k402(cls, stored: "StoredK402Offer") -> "SettlementTerms":
+        return cls(
+            scheme=SCHEME_K402,
+            network=get_settings().kaspa_network,
+            treasury_address=stored.offer.facilitator_fee.to,
+            nonce=stored.nonce,
+            k402_payment_id=stored.offer.payment_id,
+            consume_key=k402_offer_key(stored.offer.payment_id),
+            locked_rate=stored.locked_rate,
+        )
+
+
 def _new_settlement(
     endpoint: Endpoint,
     merchant_address: str,
-    required: PaymentRequired,
+    terms: SettlementTerms,
     verified: VerifiedPaymentLike,
     rate: Decimal | None,
     request: Request,
@@ -435,10 +527,11 @@ def _new_settlement(
         tx_id=verified.tx_id,
         endpoint_id=endpoint.id,
         merchant_id=endpoint.merchant_id,
-        network=required.network,
+        network=terms.network,
+        payment_scheme=terms.scheme,
         payer_address=verified.payer_address,
         merchant_address=merchant_address,
-        treasury_address=required.platformFee.feeTo,
+        treasury_address=terms.treasury_address,
         amount_sompi=verified.total_sompi,
         merchant_amount_sompi=verified.merchant_sompi,
         fee_amount_sompi=verified.fee_sompi,
@@ -447,7 +540,8 @@ def _new_settlement(
         status=SettlementStatus.SETTLED,
         request_method=request.method,
         request_path=request.url.path,
-        payment_nonce=required.nonce,
+        payment_nonce=terms.nonce,
+        k402_payment_id=terms.k402_payment_id,
         delivery_attempts=1,
         created_at=now,
         settled_at=now,
@@ -504,6 +598,76 @@ async def issue_payment_challenge(
     return required
 
 
+@dataclass(frozen=True)
+class StoredK402Offer:
+    slug: str
+    nonce: str  # internal settlement nonce, never sent to the client
+    offer: K402UtxoOffer
+    locked_rate: Decimal | None
+
+
+async def issue_payment_offers(
+    redis: Redis, endpoint: Endpoint, pay_to: str, oracle: RateProvider
+) -> tuple[PaymentRequired, K402UtxoOffer]:
+    """The v1 challenge plus a k402 `kaspa-utxo` offer for the same endpoint, both valid for `payment_max_age_seconds`.
+
+    The offer is built from the v1 challenge's LOCKED total (`required.amount`: for a USD-priced endpoint the same
+    single oracle quote, ceil conversion and 0.6 KAS floor) plus the k402 amount tag, and stores the same locked rate.
+    It is stored as `kasgate:k402:{payment_id}` with its own internal settlement nonce, so paying the v1 challenge
+    and the k402 offer are independent payments. Raises like `issue_payment_challenge` (OracleUnavailableError before
+    anything is stored, so a failed USD quote yields no offer at all).
+    """
+    settings = get_settings()
+    required = await issue_payment_challenge(redis, endpoint, pay_to, oracle)
+    offer = K402UtxoOffer.for_endpoint(
+        int(required.amount),
+        pay_to,
+        new_k402_payment_id(),
+        required.expiresAt,
+        tag_sompi=new_k402_tag(),
+        description=endpoint.name,
+    )
+    record = json.dumps(
+        {
+            "slug": endpoint.slug,
+            "nonce": new_payment_nonce(),
+            "offer": offer.model_dump(mode="json"),
+            "kasUsdRate": required.extra.kasUsdRate if required.extra is not None else None,
+        },
+        sort_keys=True,
+    )
+    await redis.set(k402_offer_key(offer.payment_id), record, ex=settings.payment_max_age_seconds)
+    return required, offer
+
+
+async def _load_k402_offer(redis: Redis, payment_id: str) -> StoredK402Offer | None:
+    """The offer stored for `payment_id`, or None when it is missing, expired or unreadable."""
+    raw = await redis.get(k402_offer_key(payment_id))
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        slug, nonce = data["slug"], data["nonce"]
+        offer = K402UtxoOffer.model_validate(data["offer"])
+        raw_rate = data.get("kasUsdRate")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        logger.error("stored k402 offer %s is unreadable", payment_id, exc_info=True)
+        return None
+    if (
+        not isinstance(slug, str)
+        or not isinstance(nonce, str)
+        or re.fullmatch(NONCE_RE, nonce) is None
+        or offer.payment_id != payment_id
+        or offer.expires <= int(datetime.now(UTC).timestamp())
+    ):
+        return None
+    locked_rate = _parse_locked_rate(raw_rate)
+    if raw_rate is not None and locked_rate is None:
+        logger.error("stored k402 offer %s has an unreadable locked rate", payment_id)
+        return None
+    return StoredK402Offer(slug=slug, nonce=nonce, offer=offer, locked_rate=locked_rate)
+
+
 async def _load_challenge(redis: Redis, nonce: str) -> tuple[str, PaymentRequired] | None:
     """The (slug, challenge) stored for `nonce`, or None when it is missing, expired or unreadable."""
     raw = await redis.get(nonce_key(nonce))
@@ -541,14 +705,17 @@ async def _challenge_error(
     *,
     limited: bool = True,
 ) -> JSONResponse:
-    """A 402 carrying a FRESH `PAYMENT-REQUIRED` (new nonce). Every new challenge costs one unpaid-rate-limit hit."""
+    """A 402 carrying a FRESH `PAYMENT-REQUIRED` (new nonce) and a fresh k402 offer in the body.
+
+    Every new challenge costs one unpaid-rate-limit hit.
+    """
     if limited:
         try:
             await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
         except HTTPException as exc:
             return _limit_error(exc)
     try:
-        required = await issue_payment_challenge(redis, endpoint, merchant_address, oracle)
+        required, offer = await issue_payment_offers(redis, endpoint, merchant_address, oracle)
     except OracleUnavailableError as exc:
         logger.warning("USD price unavailable for %s: %s", endpoint.slug, exc)
         return _error(503, "price_unavailable", "KAS/USD price is temporarily unavailable")
@@ -558,7 +725,7 @@ async def _challenge_error(
     except RedisError:
         logger.exception("payment challenge store unavailable")
         return _error(503, "service_unavailable", "payment challenges are temporarily unavailable")
-    return _error(402, error, message, required=required)
+    return _error(402, error, message, required=required, offer=offer)
 
 
 def _verification_failure(exc: PaymentVerificationError, required: PaymentRequired) -> JSONResponse:
@@ -609,14 +776,36 @@ def _redelivery_allowed(
     The payer, method and path must also match the original paid call: a txId and its nonce are public on-chain, so
     these checks stop a bystander from replaying someone else's payment against a different resource.
     """
+    return (
+        settlement.payment_scheme == SCHEME_V1
+        and settlement.tx_id == signature.txId
+        and settlement.payment_nonce == signature.nonce
+        and settlement.payer_address == signature.payerAddress
+        and _redelivery_window_open(settings, settlement, endpoint, request)
+    )
+
+
+def _k402_redelivery_allowed(
+    settings: Settings, settlement: Settlement, payment: K402PaymentHeader, endpoint: Endpoint, request: Request
+) -> bool:
+    """k402: same txId + payment_id + slug + method + path, under the same window and attempt cap as v1.
+
+    k402 proves no payer, so the `payment_id` (sent only to the client that asked for the offer) stands in for it.
+    """
+    return (
+        settlement.payment_scheme == SCHEME_K402
+        and settlement.tx_id == payment.tx_id
+        and settlement.k402_payment_id == payment.payment_id
+        and _redelivery_window_open(settings, settlement, endpoint, request)
+    )
+
+
+def _redelivery_window_open(settings: Settings, settlement: Settlement, endpoint: Endpoint, request: Request) -> bool:
     if settlement.status != SettlementStatus.SETTLED or settlement.settled_at is None:
         return False
     age = datetime.now(UTC) - settlement.settled_at
     return (
-        settlement.tx_id == signature.txId
-        and settlement.payment_nonce == signature.nonce
-        and settlement.endpoint_id == endpoint.id
-        and settlement.payer_address == signature.payerAddress
+        settlement.endpoint_id == endpoint.id
         and settlement.request_method == request.method
         and settlement.request_path == request.url.path
         and (settlement.upstream_status_code is None or settlement.upstream_status_code >= 500)
@@ -694,6 +883,23 @@ async def _find_settlement(session: AsyncSession, tx_id: str, nonce: str) -> Set
     return rows[0] if rows else None
 
 
+async def _find_k402_settlement(session: AsyncSession, tx_id: str, payment_id: str) -> Settlement | None:
+    """The settlement that already uses this txId (through either binding) or this k402 payment_id."""
+    rows = (
+        (
+            await session.execute(
+                select(Settlement).where(or_(Settlement.tx_id == tx_id, Settlement.k402_payment_id == payment_id))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if row.tx_id == tx_id:
+            return row
+    return rows[0] if rows else None
+
+
 async def _settle_and_deliver(
     request: Request,
     session: AsyncSession,
@@ -702,14 +908,14 @@ async def _settle_and_deliver(
     oracle: RateProvider,
     endpoint: Endpoint,
     merchant_address: str,
-    required: PaymentRequired,
+    terms: SettlementTerms,
     verified: VerifiedPaymentLike,
     method: str,
     prepared: PreparedUpstream,
 ) -> Response:
     tx_id = verified.tx_id
-    rate = await _lookup_rate(oracle, required)
-    settlement = _new_settlement(endpoint, merchant_address, required, verified, rate, request)
+    rate = await _lookup_rate(oracle, terms)
+    settlement = _new_settlement(endpoint, merchant_address, terms, verified, rate, request)
     settlement_id = settlement.id
     unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
     session.add(settlement)
@@ -717,7 +923,7 @@ async def _settle_and_deliver(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        logger.error("tx %s (nonce %s) conflicts with an existing settlement", tx_id, required.nonce, exc_info=True)
+        logger.error("tx %s (nonce %s) conflicts with an existing settlement", tx_id, terms.nonce, exc_info=True)
         return _error(409, "payment_replayed", "this transaction or payment nonce was already used")
     except SQLAlchemyError:
         await session.rollback()
@@ -726,9 +932,9 @@ async def _settle_and_deliver(
         return _error(503, "service_unavailable", "payment was accepted but could not be recorded; contact support")
 
     try:
-        await redis.getdel(nonce_key(required.nonce))
+        await redis.getdel(terms.consume_key)
     except RedisError:
-        logger.warning("could not consume nonce %s; the settlement's unique nonce still blocks reuse", required.nonce)
+        logger.warning("could not consume %s; the settlement's unique keys still block reuse", terms.consume_key)
 
     usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
     return await _forward_and_record(
@@ -753,7 +959,8 @@ async def paywalled_proxy(
 ) -> Response:
     settings = get_settings()
     signature_header = request.headers.get(HEADER_PAYMENT_SIGNATURE)
-    if not signature_header:
+    k402_header = request.headers.get(HEADER_K402_PAYMENT)
+    if not signature_header and k402_header is None:
         try:
             await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
         except HTTPException as exc:
@@ -775,6 +982,21 @@ async def paywalled_proxy(
             "method_not_allowed",
             f"{method} is not allowed on this endpoint",
             headers={"Allow": ", ".join(sorted(endpoint.allowed_methods))},
+        )
+
+    if k402_header is not None:
+        if signature_header:
+            return await _challenge_error(
+                request,
+                redis,
+                endpoint,
+                merchant_address,
+                oracle,
+                "invalid_payment_header",
+                f"send either {HEADER_PAYMENT_SIGNATURE} or {HEADER_K402_PAYMENT}, not both",
+            )
+        return await _pay_with_k402(
+            request, session, redis, client, engine, oracle, endpoint, merchant_address, method, path, k402_header
         )
 
     if not signature_header:
@@ -889,7 +1111,142 @@ async def paywalled_proxy(
     await _hold_delivery_lock(redis, tx_id)
     try:
         return await _settle_and_deliver(
-            request, session, redis, client, oracle, endpoint, merchant_address, required, verified, method, prepared
+            request,
+            session,
+            redis,
+            client,
+            oracle,
+            endpoint,
+            merchant_address,
+            SettlementTerms.for_v1(required),
+            verified,
+            method,
+            prepared,
         )
     finally:
         await _drop_delivery_lock(redis, tx_id)
+
+
+async def _pay_with_k402(
+    request: Request,
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    engine: PaymentVerifier,
+    oracle: RateProvider,
+    endpoint: Endpoint,
+    merchant_address: str,
+    method: str,
+    path: str,
+    header_value: str,
+) -> Response:
+    """CONTRACT v2.9: a paid call carrying `X-K402-Payment: kaspa-utxo <txid> <payment_id>`."""
+    settings = get_settings()
+    try:
+        payment = K402PaymentHeader.from_header(header_value)
+    except ValueError:
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            oracle,
+            "invalid_payment_header",
+            f"{HEADER_K402_PAYMENT} must be 'kaspa-utxo <64-hex txid> <payment_id>'",
+        )
+    try:
+        prepared = await _prepare_upstream(request, endpoint, path)
+    except RequestRejectedError as exc:
+        return _error(exc.status_code, exc.error, exc.message)
+
+    tx_id, payment_id = payment.tx_id, payment.payment_id
+    try:
+        stored = await _load_k402_offer(redis, payment_id)
+    except RedisError:
+        logger.exception("k402 offer store unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    try:
+        existing = await _find_k402_settlement(session, tx_id, payment_id)
+    except SQLAlchemyError:
+        logger.exception("settlement lookup failed")
+        return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
+    if existing is not None:
+        if _k402_redelivery_allowed(settings, existing, payment, endpoint, request):
+            return await _redeliver(session, redis, client, existing, method, prepared)
+        return _error(409, "payment_replayed", "this transaction or payment_id was already used")
+
+    if stored is None:
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            oracle,
+            "payment_expired",
+            "the k402 offer is unknown or has expired; pay the fresh offer",
+        )
+    offer = stored.offer
+    if stored.slug != endpoint.slug:
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            oracle,
+            "invalid_payment_header",
+            "the payment_id was issued for a different endpoint",
+        )
+
+    # payment_id claim first, then the SHARED txId lock, so a txId cannot be claimed through both bindings at once and
+    # a refused txId lock never releases a lock owned by another request.
+    tx_locked = False
+    try:
+        if await redis.set(k402_lock_key(payment_id), tx_id, nx=True, ex=REPLAY_LOCK_TTL_SECONDS):
+            tx_locked = bool(await redis.set(lock_key(tx_id), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
+            if not tx_locked:
+                await redis.delete(k402_lock_key(payment_id))
+    except RedisError:
+        logger.exception("replay lock unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    if not tx_locked:
+        return _error(409, "payment_replayed", "this transaction or payment_id is already being processed")
+
+    try:
+        verified = await engine.verify_k402(tx_id, offer)
+    except PaymentVerificationError as exc:
+        await _release_k402_locks(redis, tx_id, payment_id)
+        if isinstance(exc, RpcUnavailableError):
+            logger.warning("k402 payment not verified, node unavailable: %s", exc.message)
+            return _error(503, "rpc_unavailable", exc.message, headers={"Retry-After": "5"})
+        code = exc.code if exc.code in _K402_VERIFICATION_CODES else "tx_rejected"
+        return await _challenge_error(request, redis, endpoint, merchant_address, oracle, code, exc.message)
+    except Exception:
+        await _release_k402_locks(redis, tx_id, payment_id)
+        logger.exception("unexpected failure while verifying k402 tx %s", tx_id)
+        return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
+
+    await _hold_delivery_lock(redis, tx_id)
+    try:
+        return await _settle_and_deliver(
+            request,
+            session,
+            redis,
+            client,
+            oracle,
+            endpoint,
+            merchant_address,
+            SettlementTerms.for_k402(stored),
+            verified,
+            method,
+            prepared,
+        )
+    finally:
+        await _drop_delivery_lock(redis, tx_id)
+
+
+async def _release_k402_locks(redis: Redis, tx_id: str, payment_id: str) -> None:
+    """Drop the shared txId lock and the payment_id claim after a FAILED k402 verification so the payer can retry."""
+    try:
+        await redis.delete(lock_key(tx_id), k402_lock_key(payment_id))
+    except RedisError:
+        logger.error("could not release replay lock for %s; it will expire in %ss", tx_id, REPLAY_LOCK_TTL_SECONDS)
