@@ -1267,3 +1267,103 @@ async def test_database_check_constraints_back_the_nonce_binding(
     async with sessionmaker() as session:
         count = await session.scalar(text("SELECT count(*) FROM settlements WHERE payment_nonce ~ '^[0-9a-f]{32}$'"))
         assert count == 1
+
+
+# ---------------------------------------------------------------- USD-priced challenges
+
+
+USD_MICROS = 1_000_000
+USD_RATE = Decimal("0.12500000")
+
+
+async def test_usd_challenge_locks_converted_sompi_even_if_the_rate_then_changes(
+    client: httpx.AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_oracle: StubOracle,
+    stub_engine: StubEngine,
+    redis: Any,
+) -> None:
+    from app.models import PriceCurrency
+    from app.schemas import usd_micros_to_sompi
+
+    await seed_endpoint(
+        sessionmaker,
+        slug="usd-weather",
+        address=OTHER_ADDRESS,
+        price_currency=PriceCurrency.USD,
+        price_usd_micros=USD_MICROS,
+        price_sompi=None,
+    )
+    locked = usd_micros_to_sompi(USD_MICROS, USD_RATE)
+    response = await client.get("/p/usd-weather")
+    assert response.status_code == 402
+    required = PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])
+    assert required.amount == str(locked)
+    assert required.extra is not None
+    assert required.extra.kasUsdRate == "0.12500000"
+    assert required.extra.quotedAt.tzinfo is not None
+    # changing the live rate must not change the stored challenge
+    stub_oracle.rate = Decimal("0.25000000")
+    headers = {HEADER_PAYMENT_SIGNATURE: make_signature_header(TX, required.nonce)}
+    paid = await client.get("/p/usd-weather", headers=headers)
+    assert paid.status_code == 200, paid.text
+    row = (await settlements(sessionmaker))[0]
+    assert row.amount_sompi == locked
+    assert row.kas_usd_rate == Decimal("0.12500000")
+    assert row.usd_value_at_settlement == Decimal("1.00000000")  # 8 KAS * 0.125
+    assert stub_engine.calls == [TX]
+    # a fresh challenge now uses the new rate (4 KAS)
+    fresh = await client.get("/p/usd-weather")
+    assert fresh.status_code == 402
+    again = PaymentRequired.from_header(fresh.headers[HEADER_PAYMENT_REQUIRED])
+    assert again.amount == str(usd_micros_to_sompi(USD_MICROS, Decimal("0.25000000")))
+    assert again.nonce != required.nonce
+
+
+async def test_usd_challenge_fails_closed_when_the_oracle_is_down(
+    client: httpx.AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_oracle: StubOracle,
+    stub_engine: StubEngine,
+    redis: Any,
+) -> None:
+    from app.models import PriceCurrency
+
+    await seed_endpoint(
+        sessionmaker,
+        slug="usd-down",
+        address=OTHER_ADDRESS,
+        price_currency=PriceCurrency.USD,
+        price_usd_micros=USD_MICROS,
+        price_sompi=None,
+    )
+    stub_oracle.rate = None
+    response = await client.get("/p/usd-down")
+    assert response.status_code == 503
+    assert response.json()["error"] == "price_unavailable"
+    assert "retry-after" in {k.lower() for k in response.headers}
+    assert HEADER_PAYMENT_REQUIRED not in response.headers
+    assert stub_engine.verify_calls == [] and stub_engine.calls == []
+    assert await redis.keys("kasgate:tx:*") == []
+    assert await redis.keys("kasgate:noncelock:*") == []
+    assert await redis.keys("kasgate:nonce:*") == []
+    assert await settlements(sessionmaker) == []
+    # a paid-looking retry also fails closed (it needs a fresh challenge first, which also needs the oracle)
+    from tests.conftest import make_signature_header as _sig
+
+    paid = await client.get("/p/usd-down", headers={HEADER_PAYMENT_SIGNATURE: _sig(TX, "a" * 32)})
+    assert paid.status_code == 503
+    assert paid.json()["error"] == "price_unavailable"
+    assert await redis.keys("kasgate:tx:*") == []
+
+
+async def test_kas_priced_challenge_omits_extra_and_does_not_need_the_oracle(
+    client: httpx.AsyncClient, seeded: Seed, stub_oracle: StubOracle
+) -> None:
+    stub_oracle.rate = None
+    response = await client.get("/p/weather")
+    assert response.status_code == 402
+    required = PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])
+    assert required.amount == str(PRICE_SOMPI)
+    assert required.extra is None
+    assert "extra" not in required.model_dump(mode="json", exclude_none=True)

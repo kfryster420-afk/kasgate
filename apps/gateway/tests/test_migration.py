@@ -1,4 +1,4 @@
-"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002 must carry existing rows over."""
+"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002/0003 must carry existing rows over."""
 
 import asyncio
 from typing import Any
@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0002_payment_nonce"
+HEAD_REVISION = "0003_usd_pricing"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -242,3 +242,133 @@ async def test_0002_constraints_and_server_defaults(database_url: str) -> None:
             await _execute(database_url, "UPDATE settlements SET delivery_attempts = 0")
     finally:
         await _execute(database_url, "TRUNCATE settlements, endpoints, merchants CASCADE")
+
+
+async def test_0003_backfills_kas_defaults_and_roundtrips(pg_server: PgServer) -> None:
+    url = pg_server.make_url("kasgate_usd_upgrade")
+    pg_server.create_database("kasgate_usd_upgrade")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0002_payment_nonce")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100, '{GET}' FROM merchants LIMIT 1",
+    )
+
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT price_currency::text FROM endpoints") == "KAS"
+    assert await _scalar(url, "SELECT price_sompi FROM endpoints") == 100
+    assert await _scalar(url, "SELECT price_usd_micros FROM endpoints") is None
+    labels = await _scalar(
+        url,
+        "SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e "
+        "JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'price_currency'",
+    )
+    assert labels == "KAS,USD"
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
+
+    await asyncio.to_thread(command.downgrade, config, "0002_payment_nonce")
+    assert await _scalar(url, "SELECT price_sompi FROM endpoints") == 100
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'endpoints' "
+            "AND column_name IN ('price_currency', 'price_usd_micros')",
+        )
+        == 0
+    )
+    assert await _scalar(url, "SELECT count(*) FROM pg_type WHERE typname = 'price_currency'") == 0
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'ck_endpoints_price_positive'",
+        )
+        == 1
+    )
+
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT price_currency::text FROM endpoints") == "KAS"
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    assert await _scalar(url, "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_endpoints_slug'") == 1
+    assert await _scalar(url, "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_settlements_tx_id'") == 1
+
+
+async def test_0003_price_matches_currency_constraints(database_url: str) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    await _execute(
+        database_url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+    )
+    try:
+        # USD with a sompi price and no micros
+        with pytest.raises(IntegrityError):
+            await _execute(
+                database_url,
+                "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_currency, "
+                "price_sompi, allowed_methods) "
+                "SELECT gen_random_uuid(), id, 'bad-usd', 'w', 'https://x.test', 'USD', 100, '{GET}' "
+                "FROM merchants LIMIT 1",
+            )
+        # KAS with micros
+        with pytest.raises(IntegrityError):
+            await _execute(
+                database_url,
+                "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_currency, "
+                "price_sompi, price_usd_micros, allowed_methods) "
+                "SELECT gen_random_uuid(), id, 'bad-kas', 'w', 'https://x.test', 'KAS', 100, 1, '{GET}' "
+                "FROM merchants LIMIT 1",
+            )
+        # USD with zero micros
+        with pytest.raises(IntegrityError):
+            await _execute(
+                database_url,
+                "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_currency, "
+                "price_usd_micros, allowed_methods) "
+                "SELECT gen_random_uuid(), id, 'zero', 'w', 'https://x.test', 'USD', 0, '{GET}' "
+                "FROM merchants LIMIT 1",
+            )
+        # a valid USD row
+        await _execute(
+            database_url,
+            "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_currency, "
+            "price_usd_micros, allowed_methods) "
+            "SELECT gen_random_uuid(), id, 'usd-ok', 'w', 'https://x.test', 'USD', 1000000, '{GET}' "
+            "FROM merchants LIMIT 1",
+        )
+        assert await _scalar(database_url, "SELECT price_sompi FROM endpoints WHERE slug = 'usd-ok'") is None
+        # default currency is KAS when omitted
+        await _execute(
+            database_url,
+            "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+            "SELECT gen_random_uuid(), id, 'kas-ok', 'w', 'https://x.test', 100, '{GET}' FROM merchants LIMIT 1",
+        )
+        assert await _scalar(database_url, "SELECT price_currency::text FROM endpoints WHERE slug = 'kas-ok'") == "KAS"
+    finally:
+        await _execute(database_url, "TRUNCATE settlements, endpoints, merchants CASCADE")
+
+
+async def test_0003_refuses_to_downgrade_usd_rows(pg_server: PgServer) -> None:
+    url = pg_server.make_url("kasgate_usd_downgrade")
+    pg_server.create_database("kasgate_usd_downgrade")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "head")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_currency, "
+        "price_usd_micros, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'usd', 'w', 'https://x.test', 'USD', 1000000, '{GET}' FROM merchants LIMIT 1",
+    )
+    with pytest.raises(Exception, match="priced in USD"):
+        await asyncio.to_thread(command.downgrade, config, "0002_payment_nonce")
+    assert await _scalar(url, "SELECT price_currency::text FROM endpoints") == "USD"

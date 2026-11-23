@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.models import Endpoint, Settlement, SettlementStatus
+from app.models import Endpoint, PriceCurrency, Settlement, SettlementStatus
 from app.proxy import nonce_key
 from app.schemas import (
     HEADER_PAYMENT_SIGNATURE,
@@ -25,6 +25,7 @@ from app.schemas import (
     SettlementRead,
     compute_fee_split,
     min_price_sompi,
+    usd_micros_to_sompi,
 )
 from app.security import decrypt_headers
 from tests.conftest import (
@@ -62,6 +63,8 @@ def endpoint_payload(**overrides: Any) -> dict[str, Any]:
         "allowed_methods": ["GET"],
     }
     payload.update(overrides)
+    if payload.get("price_currency") == "USD":
+        payload.pop("price_sompi", None)
     return payload
 
 
@@ -482,3 +485,154 @@ async def test_cors_exposes_payment_headers(client: httpx.AsyncClient, seeded: S
     assert "payment-signature" in preflight.headers["access-control-allow-headers"].lower() or (
         preflight.headers["access-control-allow-headers"] == "payment-signature"
     )
+
+
+# ---------------------------------------------------------------- USD-priced endpoints
+
+
+USD_MICROS = 1_000_000  # $1.00
+USD_RATE = Decimal("0.12500000")
+USD_SOMPI = usd_micros_to_sompi(USD_MICROS, USD_RATE)  # 800_000_000
+
+
+async def test_create_and_read_a_usd_priced_endpoint(client: httpx.AsyncClient, seeded: Seed) -> None:
+    response = await client.post(
+        "/v1/endpoints",
+        json=endpoint_payload(slug="usd-feed", price_currency=PriceCurrency.USD, price_usd_micros=USD_MICROS),
+        headers=bearer(seeded),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["price_currency"] == "USD"
+    assert body["price_usd_micros"] == USD_MICROS
+    assert body["price_usd"] == "1"
+    assert body["price_sompi"] is None
+    assert body["price_kas"] is None
+    read = await client.get(f"/v1/endpoints/{body['id']}", headers=bearer(seeded))
+    assert read.status_code == 200
+    assert read.json()["price_currency"] == "USD"
+    assert read.json()["price_usd_micros"] == USD_MICROS
+
+
+async def test_usd_create_rejects_a_kas_price_and_missing_micros(client: httpx.AsyncClient, seeded: Seed) -> None:
+    missing = endpoint_payload(price_currency="USD")
+    missing.pop("price_sompi", None)
+    assert (await client.post("/v1/endpoints", json=missing, headers=bearer(seeded))).status_code == 422
+    both = {
+        "name": "Price Feed",
+        "upstream_url": "https://feeds.example.com/prices",
+        "price_currency": "USD",
+        "price_usd_micros": USD_MICROS,
+        "price_sompi": PRICE_SOMPI,
+    }
+    assert (await client.post("/v1/endpoints", json=both, headers=bearer(seeded))).status_code == 422
+    kas_and_micros = endpoint_payload(price_usd_micros=USD_MICROS)
+    assert (await client.post("/v1/endpoints", json=kas_and_micros, headers=bearer(seeded))).status_code == 422
+
+
+async def test_update_switches_between_kas_and_usd(client: httpx.AsyncClient, seeded: Seed) -> None:
+    created = await client.post(
+        "/v1/endpoints",
+        json=endpoint_payload(slug="switchable", price_sompi=PRICE_SOMPI),
+        headers=bearer(seeded),
+    )
+    endpoint_id = created.json()["id"]
+    to_usd = await client.patch(
+        f"/v1/endpoints/{endpoint_id}",
+        json={"price_currency": "USD", "price_usd_micros": 2_500_000},
+        headers=bearer(seeded),
+    )
+    assert to_usd.status_code == 200, to_usd.text
+    assert to_usd.json()["price_currency"] == "USD"
+    assert to_usd.json()["price_usd_micros"] == 2_500_000
+    assert to_usd.json()["price_usd"] == "2.5"
+    assert to_usd.json()["price_sompi"] is None
+    to_kas = await client.patch(
+        f"/v1/endpoints/{endpoint_id}",
+        json={"price_currency": "KAS", "price_sompi": 3_000_000_000},
+        headers=bearer(seeded),
+    )
+    assert to_kas.status_code == 200, to_kas.text
+    assert to_kas.json()["price_currency"] == "KAS"
+    assert to_kas.json()["price_sompi"] == 3_000_000_000
+    assert to_kas.json()["price_usd_micros"] is None
+    # currency switch without the matching price is 422
+    assert (
+        await client.patch(f"/v1/endpoints/{endpoint_id}", json={"price_currency": "USD"}, headers=bearer(seeded))
+    ).status_code == 422
+
+
+async def test_directory_lists_usd_and_kas_prices(client: httpx.AsyncClient, seeded: Seed, redis: Any) -> None:
+    await redis.delete("kasgate:directory:v1")
+    await client.post(
+        "/v1/endpoints",
+        json=endpoint_payload(
+            slug="usd-listed", price_currency=PriceCurrency.USD, price_usd_micros=USD_MICROS, name="USD Feed"
+        ),
+        headers=bearer(seeded),
+    )
+    manifest = (await client.get("/v1/directory")).json()
+    by_slug = {entry["slug"]: entry for entry in manifest["endpoints"]}
+    kas = by_slug["weather"]
+    assert kas["price_currency"] == "KAS"
+    assert kas["price_sompi"] == PRICE_SOMPI
+    assert kas["price_usd_micros"] is None
+    usd = by_slug["usd-listed"]
+    assert usd["price_currency"] == "USD"
+    assert usd["price_usd_micros"] == USD_MICROS
+    assert usd["price_usd"] == "1"
+    assert usd["price_sompi"] is None
+    assert usd["price_kas"] is None
+
+
+async def test_quote_of_a_usd_endpoint_locks_the_converted_sompi(
+    client: httpx.AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_oracle: Any,
+    redis: Any,
+) -> None:
+    seed = await seed_endpoint(
+        sessionmaker,
+        slug="usd-quote",
+        address=NEW_ADDRESS,
+        price_currency=PriceCurrency.USD,
+        price_usd_micros=USD_MICROS,
+        price_sompi=None,
+    )
+    response = await client.get("/v1/quote/usd-quote")
+    assert response.status_code == 200, response.text
+    required = PaymentRequired.model_validate(response.json())
+    assert required.amount == str(USD_SOMPI)
+    assert required.extra is not None
+    assert required.extra.kasUsdRate == "0.12500000"
+    assert required.extra.quotedAt.tzinfo is not None
+    stub_oracle.rate = Decimal("0.25000000")  # a later quote would convert to half as many sompi
+    later = PaymentRequired.model_validate((await client.get("/v1/quote/usd-quote")).json())
+    assert later.amount == str(usd_micros_to_sompi(USD_MICROS, Decimal("0.25000000")))
+    # the first nonce still settles at the locked 800_000_000, not the new rate
+    headers = {HEADER_PAYMENT_SIGNATURE: make_signature_header("ab" * 32, required.nonce)}
+    paid = await client.get("/p/usd-quote", headers=headers)
+    assert paid.status_code == 200, paid.text
+    async with sessionmaker() as session:
+        row = (await session.execute(select(Settlement).where(Settlement.payment_nonce == required.nonce))).scalar_one()
+    assert row.amount_sompi == USD_SOMPI
+    assert row.kas_usd_rate == Decimal("0.12500000")
+    assert seed.slug == "usd-quote"
+
+
+async def test_quote_of_a_usd_endpoint_fails_closed_when_the_oracle_is_down(
+    client: httpx.AsyncClient, sessionmaker: async_sessionmaker[AsyncSession], stub_oracle: Any
+) -> None:
+    await seed_endpoint(
+        sessionmaker,
+        slug="usd-down",
+        address=NEW_ADDRESS,
+        price_currency=PriceCurrency.USD,
+        price_usd_micros=USD_MICROS,
+        price_sompi=None,
+    )
+    stub_oracle.rate = None
+    response = await client.get("/v1/quote/usd-down")
+    assert response.status_code == 503
+    assert response.json()["error"] == "price_unavailable"
+    assert response.headers["retry-after"]

@@ -55,18 +55,20 @@ from app.deps import (
     get_redis,
 )
 from app.kaspa_engine import PaymentVerificationError, RpcUnavailableError
-from app.models import Endpoint, Merchant, Settlement, SettlementStatus
-from app.oracle import usd_value
+from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
+from app.oracle import OracleUnavailableError, usd_value
 from app.schemas import (
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
     PROXY_PATH_PREFIX,
     PaymentRequired,
+    PaymentRequiredExtra,
     PaymentResponse,
     PaymentSignature,
     X402ErrorBody,
     new_payment_nonce,
+    usd_micros_to_sompi,
 )
 from app.security import (
     HOP_BY_HOP_HEADERS,
@@ -164,7 +166,11 @@ def _error(
         out_headers[HEADER_PAYMENT_REQUIRED] = required.to_header()
     try:
         content = X402ErrorBody.model_validate(
-            {"error": error, "message": message, "accepts": required.model_dump(mode="json") if required else None}
+            {
+                "error": error,
+                "message": message,
+                "accepts": required.model_dump(mode="json", exclude_none=True) if required else None,
+            }
         ).model_dump(mode="json")
     except ValueError:
         content = {"error": error, "message": message}
@@ -393,7 +399,21 @@ async def _dead_letter_settlement(redis: Redis, payload: str) -> None:
     logger.error("unrecorded settlement pushed to %s: %s", DEAD_LETTER_KEY, payload)
 
 
-async def _lookup_rate(oracle: RateProvider) -> Decimal | None:
+def _locked_quote_rate(required: PaymentRequired) -> Decimal | None:
+    """The KAS/USD rate locked into a USD-priced challenge, if any."""
+    if required.extra is None:
+        return None
+    try:
+        rate = Decimal(required.extra.kasUsdRate)
+    except Exception:
+        return None
+    return rate if rate.is_finite() and rate > 0 else None
+
+
+async def _lookup_rate(oracle: RateProvider, required: PaymentRequired) -> Decimal | None:
+    locked = _locked_quote_rate(required)
+    if locked is not None:
+        return locked
     try:
         return await oracle.get_rate()
     except Exception:
@@ -437,15 +457,49 @@ def _new_settlement(
 # ---------------------------------------------------------------- payment challenges (nonces)
 
 
-async def issue_payment_challenge(redis: Redis, slug: str, price_sompi: int, pay_to: str) -> PaymentRequired:
+async def quote_endpoint_price(endpoint: Endpoint, oracle: RateProvider) -> tuple[int, PaymentRequiredExtra | None]:
+    """The sompi amount to lock into a challenge, plus USD quote metadata when the endpoint is priced in USD.
+
+    Raises OracleUnavailableError when a USD price cannot be converted because the oracle is down or stale.
+    Raises ValueError when the converted (or fixed) amount cannot be split into valid outputs.
+    """
+    if endpoint.price_currency is PriceCurrency.KAS:
+        if endpoint.price_sompi is None:
+            raise ValueError("KAS-priced endpoint is missing price_sompi")
+        return endpoint.price_sompi, None
+    if endpoint.price_usd_micros is None:
+        raise ValueError("USD-priced endpoint is missing price_usd_micros")
+    try:
+        rate = await oracle.get_rate()
+    except OracleUnavailableError:
+        raise
+    except Exception as exc:
+        raise OracleUnavailableError("KAS/USD rate is unavailable") from exc
+    sompi = usd_micros_to_sompi(endpoint.price_usd_micros, rate)
+    extra = PaymentRequiredExtra(
+        kasUsdRate=format(rate, "f"),
+        quotedAt=datetime.now(UTC).replace(microsecond=0),
+    )
+    return sompi, extra
+
+
+async def issue_payment_challenge(
+    redis: Redis, endpoint: Endpoint, pay_to: str, oracle: RateProvider
+) -> PaymentRequired:
     """Mint a nonce-bound `PaymentRequired` and store it as `kasgate:nonce:{nonce}` for `payment_max_age_seconds`.
 
-    Raises ValueError when the price cannot be split into valid outputs and RedisError when the store is down.
+    The quoted sompi amount (and, for USD, the rate and quotedAt) is locked into the stored challenge and is never
+    re-quoted at payment time. Raises ValueError when the price cannot be split, OracleUnavailableError when a USD
+    price cannot be converted, and RedisError when the store is down.
     """
+    price_sompi, extra = await quote_endpoint_price(endpoint, oracle)
     settings = get_settings()
     expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=settings.payment_max_age_seconds)
-    required = PaymentRequired.for_endpoint(price_sompi, pay_to, new_payment_nonce(), expires_at)
-    record = json.dumps({"slug": slug, "required": required.model_dump(mode="json")}, sort_keys=True)
+    required = PaymentRequired.for_endpoint(price_sompi, pay_to, new_payment_nonce(), expires_at, extra=extra)
+    record = json.dumps(
+        {"slug": endpoint.slug, "required": required.model_dump(mode="json", exclude_none=True)},
+        sort_keys=True,
+    )
     await redis.set(nonce_key(required.nonce), record, ex=settings.payment_max_age_seconds)
     return required
 
@@ -481,6 +535,7 @@ async def _challenge_error(
     redis: Redis,
     endpoint: Endpoint,
     merchant_address: str,
+    oracle: RateProvider,
     error: str,
     message: str,
     *,
@@ -493,7 +548,10 @@ async def _challenge_error(
         except HTTPException as exc:
             return _limit_error(exc)
     try:
-        required = await issue_payment_challenge(redis, endpoint.slug, endpoint.price_sompi, merchant_address)
+        required = await issue_payment_challenge(redis, endpoint, merchant_address, oracle)
+    except OracleUnavailableError as exc:
+        logger.warning("USD price unavailable for %s: %s", endpoint.slug, exc)
+        return _error(503, "price_unavailable", "KAS/USD price is temporarily unavailable")
     except ValueError as exc:
         logger.error("endpoint %s cannot be priced: %s", endpoint.slug, exc)
         return _error(503, "service_unavailable", "endpoint price is not currently payable")
@@ -650,7 +708,7 @@ async def _settle_and_deliver(
     prepared: PreparedUpstream,
 ) -> Response:
     tx_id = verified.tx_id
-    rate = await _lookup_rate(oracle)
+    rate = await _lookup_rate(oracle, required)
     settlement = _new_settlement(endpoint, merchant_address, required, verified, rate, request)
     settlement_id = settlement.id
     unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
@@ -725,6 +783,7 @@ async def paywalled_proxy(
             redis,
             endpoint,
             merchant_address,
+            oracle,
             "payment_required",
             "payment is required to access this resource",
             limited=False,
@@ -735,7 +794,7 @@ async def paywalled_proxy(
         description = str(exc).lower()
         code = "wrong_network" if "prefix" in description or "network" in description else "invalid_payment_header"
         return await _challenge_error(
-            request, redis, endpoint, merchant_address, code, f"{HEADER_PAYMENT_SIGNATURE} header is invalid"
+            request, redis, endpoint, merchant_address, oracle, code, f"{HEADER_PAYMENT_SIGNATURE} header is invalid"
         )
     except ValueError:
         return await _challenge_error(
@@ -743,6 +802,7 @@ async def paywalled_proxy(
             redis,
             endpoint,
             merchant_address,
+            oracle,
             "invalid_payment_header",
             f"{HEADER_PAYMENT_SIGNATURE} header is malformed",
         )
@@ -775,6 +835,7 @@ async def paywalled_proxy(
             redis,
             endpoint,
             merchant_address,
+            oracle,
             "payment_expired",
             "the payment challenge is unknown or has expired; pay the fresh challenge",
         )
@@ -785,6 +846,7 @@ async def paywalled_proxy(
             redis,
             endpoint,
             merchant_address,
+            oracle,
             "invalid_payment_header",
             "the payment nonce was issued for a different endpoint",
         )

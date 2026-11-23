@@ -51,7 +51,8 @@ from app.config import get_settings  # noqa: E402
 from app.deps import get_sessionmaker  # noqa: E402
 from app.kaspa_engine import PaymentVerificationError, VerifiedPayment  # noqa: E402
 from app.main import create_app  # noqa: E402
-from app.models import Endpoint, Merchant  # noqa: E402
+from app.models import Endpoint, Merchant, PriceCurrency  # noqa: E402
+from app.oracle import OracleUnavailableError  # noqa: E402
 from app.schemas import (  # noqa: E402
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_SIGNATURE,
@@ -249,7 +250,7 @@ class StubOracle:
 
     async def get_rate(self) -> Decimal:
         if self.rate is None:
-            raise RuntimeError("oracle down")
+            raise OracleUnavailableError("oracle down")
         return self.rate
 
 
@@ -346,6 +347,9 @@ async def seed_endpoint(
     address: str = MERCHANT_ADDRESS,
     active: bool = True,
     headers: dict[str, str] | None = None,
+    price_sompi: int | None = PRICE_SOMPI,
+    price_currency: PriceCurrency = PriceCurrency.KAS,
+    price_usd_micros: int | None = None,
 ) -> Seed:
     api_key = generate_api_key()
     merchant = Merchant(
@@ -365,7 +369,9 @@ async def seed_endpoint(
             upstream_headers_encrypted=encrypt_headers(
                 headers if headers is not None else {"Authorization": UPSTREAM_SECRET}
             ),
-            price_sompi=PRICE_SOMPI,
+            price_currency=price_currency,
+            price_sompi=price_sompi if price_currency is PriceCurrency.KAS else None,
+            price_usd_micros=price_usd_micros if price_currency is PriceCurrency.USD else None,
             allowed_methods=methods or ["GET", "POST"],
             is_active=active,
         )

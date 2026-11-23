@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     http_client = build_upstream_client()
     app.state.redis = redis
     app.state.http_client = http_client
-    app.state.oracle = KasUsdOracle(settings, redis)
+    app.state.oracle = KasUsdOracle(settings, redis, http_client=http_client)
     app.state.engine = kaspa_engine
     await kaspa_engine.start()
     try:

@@ -42,6 +42,11 @@ class SettlementStatus(enum.StrEnum):
     REJECTED = "rejected"
 
 
+class PriceCurrency(enum.StrEnum):
+    KAS = "KAS"
+    USD = "USD"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -82,7 +87,18 @@ class Endpoint(TimestampMixin, Base):
     category: Mapped[str | None] = mapped_column(String(60), nullable=True)
     upstream_url: Mapped[str] = mapped_column(Text, nullable=False)
     upstream_headers_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    price_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    price_currency: Mapped[PriceCurrency] = mapped_column(
+        Enum(
+            PriceCurrency,
+            name="price_currency",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=PriceCurrency.KAS,
+        server_default=PriceCurrency.KAS.value,
+    )
+    price_sompi: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    price_usd_micros: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     allowed_methods: Mapped[list[str]] = mapped_column(
         ARRAY(String(10)), nullable=False, default=lambda: ["GET"], server_default="{GET}"
     )
@@ -96,7 +112,11 @@ class Endpoint(TimestampMixin, Base):
         Index("ix_endpoints_slug", "slug", unique=True),
         Index("ix_endpoints_merchant_id", "merchant_id"),
         Index("ix_endpoints_directory", "is_public_listed", "is_active"),
-        CheckConstraint("price_sompi > 0", name="price_positive"),
+        CheckConstraint(
+            "(price_currency = 'KAS' AND price_sompi > 0 AND price_usd_micros IS NULL) OR "
+            "(price_currency = 'USD' AND price_usd_micros > 0 AND price_sompi IS NULL)",
+            name="price_matches_currency",
+        ),
         CheckConstraint("cardinality(allowed_methods) > 0", name="methods_not_empty"),
     )
 

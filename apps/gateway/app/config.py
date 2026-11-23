@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -41,6 +42,15 @@ class Settings(BaseSettings):
     redelivery_max_attempts: int = Field(default=3, ge=0, le=10)
     session_ttl_seconds: int = Field(default=604_800, ge=300)
     kas_usd_price_url: str = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd"
+    oracle_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
+    oracle_max_staleness_seconds: int = Field(default=300, ge=1, le=86_400)
+    oracle_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    oracle_min_sources: int = Field(default=2, ge=1, le=8)
+    oracle_outlier_max_deviation: Decimal = Field(default=Decimal("0.5"), gt=0, le=10)
+    oracle_source_coingecko: str = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd"
+    oracle_source_coinpaprika: str = "https://api.coinpaprika.com/v1/tickers/kas-kaspa"
+    oracle_source_kraken: str = "https://api.kraken.com/0/public/Ticker?pair=KASUSD"
+    oracle_source_mexc: str = "https://api.mexc.com/api/v3/ticker/price?symbol=KASUSDT"
     rate_limit_enabled: bool = True
     rate_limit_fail_closed: bool = True
     rl_merchant_create_per_hour: int = Field(default=5, ge=1)
@@ -66,6 +76,9 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_BASE_URL must use https:// on kaspa:mainnet")
         if self.public_base_url.endswith("/"):
             self.public_base_url = self.public_base_url.rstrip("/")
+        default_coingecko = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa&vs_currencies=usd"
+        if self.kas_usd_price_url != default_coingecko and self.oracle_source_coingecko == default_coingecko:
+            self.oracle_source_coingecko = self.kas_usd_price_url
         return self
 
 

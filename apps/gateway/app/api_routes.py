@@ -24,8 +24,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import X402_SCHEME, get_settings
-from app.deps import get_db_session, get_redis, get_sessionmaker
-from app.models import Endpoint, Merchant, Settlement, SettlementStatus
+from app.deps import RateProvider, get_db_session, get_oracle, get_redis, get_sessionmaker
+from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
+from app.oracle import OracleUnavailableError
 from app.proxy import issue_payment_challenge
 from app.schemas import (
     PROXY_PATH_PREFIX,
@@ -52,6 +53,7 @@ from app.schemas import (
     TaxReportRow,
     X402ErrorBody,
     sompi_to_kas,
+    usd_micros_to_usd,
 )
 from app.security import (
     AUTH_CHALLENGE_TTL_SECONDS,
@@ -360,7 +362,9 @@ async def create_endpoint(payload: EndpointCreate, merchant: CurrentMerchant, se
             category=payload.category,
             upstream_url=str(payload.upstream_url),
             upstream_headers_encrypted=encrypted,
-            price_sompi=payload.price_sompi,
+            price_currency=payload.price_currency,
+            price_sompi=payload.price_sompi if payload.price_currency is PriceCurrency.KAS else None,
+            price_usd_micros=payload.price_usd_micros if payload.price_currency is PriceCurrency.USD else None,
             allowed_methods=list(payload.allowed_methods),
             is_public_listed=payload.is_public_listed,
         )
@@ -395,8 +399,32 @@ async def read_endpoint(endpoint_id: uuid.UUID, merchant: CurrentMerchant, sessi
 
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
-    {"name", "upstream_url", "upstream_headers", "price_sompi", "allowed_methods", "is_active", "is_public_listed"}
+    {"name", "upstream_url", "upstream_headers", "allowed_methods", "is_active", "is_public_listed"}
 )
+_PRICE_UPDATE_FIELDS = frozenset({"price_currency", "price_sompi", "price_usd_micros"})
+
+
+def _apply_price_update(endpoint: Endpoint, changes: dict[str, Any]) -> None:
+    """Merge price fields into `endpoint` so the row always satisfies `price_matches_currency`."""
+    if "price_currency" in changes and changes["price_currency"] is None:
+        raise HTTPException(status_code=422, detail="fields cannot be null: price_currency")
+    currency = changes.get("price_currency", endpoint.price_currency)
+    if currency is PriceCurrency.KAS:
+        sompi = changes.get("price_sompi", endpoint.price_sompi)
+        if sompi is None:
+            raise HTTPException(status_code=422, detail="price_sompi is required when price_currency is KAS")
+        endpoint.price_currency = PriceCurrency.KAS
+        endpoint.price_sompi = sompi
+        endpoint.price_usd_micros = None
+    else:
+        micros = changes.get("price_usd_micros", endpoint.price_usd_micros)
+        if micros is None:
+            raise HTTPException(status_code=422, detail="price_usd_micros is required when price_currency is USD")
+        endpoint.price_currency = PriceCurrency.USD
+        endpoint.price_usd_micros = micros
+        endpoint.price_sompi = None
+    for field in _PRICE_UPDATE_FIELDS:
+        changes.pop(field, None)
 
 
 @router.patch("/endpoints/{endpoint_id}", response_model=EndpointRead, tags=["endpoints"])
@@ -408,6 +436,8 @@ async def update_endpoint(
     nulled = sorted(name for name in _NON_NULLABLE_UPDATE_FIELDS if name in changes and changes[name] is None)
     if nulled:
         raise HTTPException(status_code=422, detail=f"fields cannot be null: {', '.join(nulled)}")
+    if changes.keys() & _PRICE_UPDATE_FIELDS:
+        _apply_price_update(endpoint, changes)
     if "upstream_headers" in changes:
         endpoint.upstream_headers_encrypted = _headers_or_422(changes.pop("upstream_headers"))
     if "upstream_url" in changes:
@@ -635,8 +665,11 @@ async def _build_directory(session: AsyncSession) -> DirectoryManifest:
             category=endpoint.category,
             merchant_display_name=display_name,
             pay_to=pay_to,
+            price_currency=endpoint.price_currency,
             price_sompi=endpoint.price_sompi,
-            price_kas=sompi_to_kas(endpoint.price_sompi),
+            price_kas=None if endpoint.price_sompi is None else sompi_to_kas(endpoint.price_sompi),
+            price_usd_micros=endpoint.price_usd_micros,
+            price_usd=None if endpoint.price_usd_micros is None else usd_micros_to_usd(endpoint.price_usd_micros),
             allowed_methods=list(endpoint.allowed_methods),
             proxy_url=f"{settings.public_base_url}{PROXY_PATH_PREFIX}/{endpoint.slug}",
         )
@@ -673,15 +706,20 @@ async def directory(session: DbSession, redis: Annotated[Redis, Depends(get_redi
 @router.get(
     "/quote/{slug}",
     response_model=PaymentRequired,
-    responses={404: {"model": X402ErrorBody}},
+    responses={404: {"model": X402ErrorBody}, 503: {"model": X402ErrorBody}},
     tags=["public"],
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
-async def quote(slug: str, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]) -> Response:
+async def quote(
+    slug: str,
+    session: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
+    oracle: Annotated[RateProvider, Depends(get_oracle)],
+) -> Response:
     """A payable quote: the same nonce-bound challenge `/p/{slug}` answers with, valid for `payment_max_age_seconds`."""
     row = (
         await session.execute(
-            select(Endpoint.price_sompi, Merchant.kaspa_address)
+            select(Endpoint, Merchant.kaspa_address)
             .join(Merchant, Merchant.id == Endpoint.merchant_id)
             .where(Endpoint.slug == slug, Endpoint.is_active.is_(True), Merchant.is_active.is_(True))
         )
@@ -689,8 +727,17 @@ async def quote(slug: str, session: DbSession, redis: Annotated[Redis, Depends(g
     if row is None:
         body = X402ErrorBody(error="endpoint_not_found", message=f"no active endpoint with slug '{slug}'")
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=body.model_dump(mode="json"))
+    endpoint, pay_to = row
     try:
-        required = await issue_payment_challenge(redis, slug, row[0], row[1])
+        required = await issue_payment_challenge(redis, endpoint, pay_to, oracle)
+    except OracleUnavailableError as exc:
+        logger.warning("USD price unavailable for quote %s: %s", slug, exc)
+        body = X402ErrorBody(error="price_unavailable", message="KAS/USD price is temporarily unavailable")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=body.model_dump(mode="json"),
+            headers={"Retry-After": "5"},
+        )
     except ValueError as exc:
         logger.error("endpoint %s has an unquotable price: %s", slug, exc)
         return JSONResponse(
@@ -704,7 +751,9 @@ async def quote(slug: str, session: DbSession, redis: Annotated[Redis, Depends(g
             content={"detail": "quotes are temporarily unavailable"},
             headers={"Retry-After": "5"},
         )
-    return JSONResponse(content=required.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        content=required.model_dump(mode="json", exclude_none=True), headers={"Cache-Control": "no-store"}
+    )
 
 
 # ---------------------------------------------------------------- public agent catalog

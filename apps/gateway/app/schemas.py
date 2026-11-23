@@ -5,7 +5,7 @@ import re
 import secrets
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Annotated, Literal, Self
 
 from kaspa import Address
@@ -28,7 +28,7 @@ from app.config import (
     KaspaNetwork,
     get_settings,
 )
-from app.models import SettlementStatus
+from app.models import PriceCurrency, SettlementStatus
 
 HEADER_PAYMENT_REQUIRED = "PAYMENT-REQUIRED"
 HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
@@ -49,8 +49,11 @@ SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 MAX_SOMPI = 999_999_999_999_999_999  # 18 digits, same cap as SompiStr
+USD_MICROS_PER_DOLLAR = 1_000_000
+MAX_USD_MICROS = 1_000_000_000_000_000  # $1e9
 Sompi = Annotated[int, Field(gt=0, le=MAX_SOMPI)]
 SompiStr = Annotated[str, Field(pattern=SOMPI_STR_RE)]
+UsdMicros = Annotated[int, Field(gt=0, le=MAX_USD_MICROS)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
 
 
@@ -115,6 +118,34 @@ def min_price_sompi(min_output_sompi: int | None = None) -> int:
     """
     floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
     return 3 * floor
+
+
+def usd_micros_to_usd(price_usd_micros: int) -> str:
+    """USD amount as a decimal string with micro-dollar precision."""
+    return format(Decimal(price_usd_micros) / Decimal(USD_MICROS_PER_DOLLAR), "f")
+
+
+def usd_micros_to_sompi(price_usd_micros: int, kas_usd_rate: Decimal, min_sompi: int | None = None) -> int:
+    """Convert a USD micro-dollar price to sompi: ceil(usd / rate * SOMPI_PER_KAS), then the min-price floor.
+
+    Uses Decimal throughout. The result always passes `compute_fee_split` (raises ValueError if it cannot).
+    """
+    if price_usd_micros <= 0:
+        raise ValueError("price_usd_micros must be positive")
+    if isinstance(kas_usd_rate, bool) or not isinstance(kas_usd_rate, Decimal):
+        raise ValueError("kas_usd_rate must be a positive finite Decimal")
+    if not kas_usd_rate.is_finite() or kas_usd_rate <= 0:
+        raise ValueError("kas_usd_rate must be a positive finite Decimal")
+    sompi = (
+        Decimal(price_usd_micros) * Decimal(SOMPI_PER_KAS) / (Decimal(USD_MICROS_PER_DOLLAR) * kas_usd_rate)
+    ).to_integral_value(rounding=ROUND_CEILING)
+    if sompi > MAX_SOMPI:
+        raise ValueError(f"converted price {sompi} sompi exceeds MAX_SOMPI")
+    result = max(int(sompi), min_price_sompi() if min_sompi is None else min_sompi)
+    if result > MAX_SOMPI:
+        raise ValueError(f"converted price {result} sompi exceeds MAX_SOMPI")
+    compute_fee_split(result)
+    return result
 
 
 def _reject_private_host(url: HttpUrl) -> HttpUrl:
@@ -186,7 +217,7 @@ class X402Header(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     def to_header(self) -> str:
-        return base64.b64encode(self.model_dump_json().encode("utf-8")).decode("ascii")
+        return base64.b64encode(self.model_dump_json(exclude_none=True).encode("utf-8")).decode("ascii")
 
     @classmethod
     def from_header(cls, value: str) -> Self:
@@ -211,6 +242,23 @@ class PlatformFee(StrictModel):
         return validate_kaspa_address(v)
 
 
+class PaymentRequiredExtra(StrictModel):
+    """Scheme-specific quote metadata locked into the challenge. Present on USD-priced quotes only."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kasUsdRate: Annotated[str, Field(pattern=r"^[0-9]+(?:\.[0-9]+)?$")]
+    quotedAt: datetime
+
+    @field_validator("kasUsdRate")
+    @classmethod
+    def _rate(cls, v: str) -> str:
+        rate = Decimal(v)
+        if not rate.is_finite() or rate <= 0:
+            raise ValueError("kasUsdRate must be a positive finite decimal string")
+        return format(rate, "f")
+
+
 class PaymentRequired(X402Header):
     """Body of the PAYMENT-REQUIRED header. `amount` is the TOTAL the payer sends across both outputs."""
 
@@ -223,6 +271,7 @@ class PaymentRequired(X402Header):
     platformFee: PlatformFee
     nonce: Annotated[str, Field(pattern=NONCE_RE)]
     expiresAt: datetime
+    extra: PaymentRequiredExtra | None = None
 
     @field_validator("payTo")
     @classmethod
@@ -247,7 +296,14 @@ class PaymentRequired(X402Header):
         return int(self.platformFee.feeAmount)
 
     @classmethod
-    def for_endpoint(cls, price_sompi: int, pay_to: str, nonce: str, expires_at: datetime) -> Self:
+    def for_endpoint(
+        cls,
+        price_sompi: int,
+        pay_to: str,
+        nonce: str,
+        expires_at: datetime,
+        extra: PaymentRequiredExtra | None = None,
+    ) -> Self:
         settings = get_settings()
         split = compute_fee_split(price_sompi)
         return cls(
@@ -257,6 +313,7 @@ class PaymentRequired(X402Header):
             amount=str(split.total_sompi),
             payTo=pay_to,
             platformFee=PlatformFee(feeTo=settings.kasgate_treasury_address, feeAmount=str(split.fee_sompi)),
+            extra=extra,
         )
 
 
@@ -311,6 +368,7 @@ class X402ErrorBody(StrictModel):
         "rpc_unavailable",
         "service_unavailable",
         "rate_limited",
+        "price_unavailable",
         "endpoint_not_found",
         "method_not_allowed",
         "upstream_error",
@@ -426,7 +484,9 @@ class EndpointCreate(StrictModel):
     category: str | None = Field(default=None, max_length=60)
     upstream_url: HttpUrl
     upstream_headers: dict[str, str] = Field(default_factory=dict, max_length=20)
-    price_sompi: Sompi
+    price_currency: PriceCurrency = PriceCurrency.KAS
+    price_sompi: Sompi | None = None
+    price_usd_micros: UsdMicros | None = None
     allowed_methods: list[HttpMethod] = Field(default_factory=_default_methods, min_length=1, max_length=5)
     is_public_listed: bool = True
 
@@ -435,16 +495,25 @@ class EndpointCreate(StrictModel):
     def _url(cls, v: HttpUrl) -> HttpUrl:
         return _reject_private_host(v)
 
-    @field_validator("price_sompi")
-    @classmethod
-    def _price(cls, v: int) -> int:
-        compute_fee_split(v)
-        return v
-
     @field_validator("allowed_methods")
     @classmethod
     def _methods(cls, v: list[str]) -> list[str]:
         return sorted(set(v))
+
+    @model_validator(mode="after")
+    def _price(self) -> Self:
+        if self.price_currency is PriceCurrency.KAS:
+            if self.price_sompi is None:
+                raise ValueError("price_sompi is required when price_currency is KAS")
+            if self.price_usd_micros is not None:
+                raise ValueError("price_usd_micros must be omitted when price_currency is KAS")
+            compute_fee_split(self.price_sompi)
+        else:
+            if self.price_usd_micros is None:
+                raise ValueError("price_usd_micros is required when price_currency is USD")
+            if self.price_sompi is not None:
+                raise ValueError("price_sompi must be omitted when price_currency is USD")
+        return self
 
 
 class EndpointUpdate(StrictModel):
@@ -453,7 +522,9 @@ class EndpointUpdate(StrictModel):
     category: str | None = Field(default=None, max_length=60)
     upstream_url: HttpUrl | None = None
     upstream_headers: dict[str, str] | None = Field(default=None, max_length=20)
+    price_currency: PriceCurrency | None = None
     price_sompi: Sompi | None = None
+    price_usd_micros: UsdMicros | None = None
     allowed_methods: list[HttpMethod] | None = Field(default=None, min_length=1, max_length=5)
     is_active: bool | None = None
     is_public_listed: bool | None = None
@@ -463,17 +534,23 @@ class EndpointUpdate(StrictModel):
     def _url(cls, v: HttpUrl | None) -> HttpUrl | None:
         return None if v is None else _reject_private_host(v)
 
-    @field_validator("price_sompi")
-    @classmethod
-    def _price(cls, v: int | None) -> int | None:
-        if v is not None:
-            compute_fee_split(v)
-        return v
-
     @field_validator("allowed_methods")
     @classmethod
     def _methods(cls, v: list[str] | None) -> list[str] | None:
         return None if v is None else sorted(set(v))
+
+    @model_validator(mode="after")
+    def _price(self) -> Self:
+        if self.price_sompi is not None and self.price_usd_micros is not None:
+            raise ValueError("set only one of price_sompi or price_usd_micros")
+        if self.price_currency is PriceCurrency.KAS:
+            if self.price_usd_micros is not None:
+                raise ValueError("price_usd_micros must be omitted when price_currency is KAS")
+        elif self.price_currency is PriceCurrency.USD and self.price_sompi is not None:
+            raise ValueError("price_sompi must be omitted when price_currency is USD")
+        if self.price_sompi is not None:
+            compute_fee_split(self.price_sompi)
+        return self
 
 
 class EndpointRead(ReadModel):
@@ -484,7 +561,9 @@ class EndpointRead(ReadModel):
     description: str | None
     category: str | None
     upstream_url: str
-    price_sompi: int
+    price_currency: PriceCurrency
+    price_sompi: int | None
+    price_usd_micros: int | None
     allowed_methods: list[str]
     is_active: bool
     is_public_listed: bool
@@ -493,8 +572,13 @@ class EndpointRead(ReadModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def price_kas(self) -> str:
-        return sompi_to_kas(self.price_sompi)
+    def price_kas(self) -> str | None:
+        return None if self.price_sompi is None else sompi_to_kas(self.price_sompi)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def price_usd(self) -> str | None:
+        return None if self.price_usd_micros is None else usd_micros_to_usd(self.price_usd_micros)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -603,8 +687,11 @@ class DirectoryEntry(BaseModel):
     category: str | None
     merchant_display_name: str
     pay_to: str
-    price_sompi: int
-    price_kas: str
+    price_currency: PriceCurrency
+    price_sompi: int | None
+    price_kas: str | None
+    price_usd_micros: int | None
+    price_usd: str | None
     allowed_methods: list[str]
     proxy_url: str
 
