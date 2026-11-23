@@ -1,6 +1,6 @@
 # One-click OpenAPI import (`POST /v1/endpoints/import`)
 
-Proposed CONTRACTS.md section. Source of truth: `apps/gateway/app/schemas.py` (OpenApiImport*), `app/openapi_import.py`, `app/api_routes.py::import_openapi`.
+Normative contract: `docs/CONTRACTS.md` (CONTRACT v2.8). Source of truth: `apps/gateway/app/schemas.py` (OpenApiImport*), `app/openapi_import.py`, `app/api_routes.py::import_openapi`.
 
 ## Route
 ```

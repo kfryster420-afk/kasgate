@@ -687,7 +687,9 @@ async def import_openapi(
                 category=candidate.category,
                 upstream_url=str(candidate.upstream_url),
                 upstream_headers_encrypted=encrypted,
+                price_currency=PriceCurrency.KAS,
                 price_sompi=price,
+                price_usd_micros=None,
                 allowed_methods=list(candidate.allowed_methods),
                 is_public_listed=candidate.is_public_listed,
             )

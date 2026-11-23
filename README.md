@@ -17,6 +17,8 @@ The scheme is `kaspa-exact-v1`. The full wire format, error codes and routes are
 
 Listed endpoints are also published as a public, machine-readable catalog at `GET /.well-known/x402` and `GET /v1/catalog` on the gateway (and as `GET /llms.txt` for agents). The buyer SDK can fetch it with `KasGateClient.discover()`, and the MCP server can search it and pay under a session spend cap. The catalog never includes API keys, emails, upstream URLs, or merchant settlement addresses.
 
+Merchants can import a paid endpoint per operation from an OpenAPI 3.0 or 3.1 document (JSON or YAML) in the dashboard, via `POST /v1/endpoints/import`. Preview writes nothing; create is all-or-nothing. The contract is in [docs/CONTRACTS.md](docs/CONTRACTS.md) (v2.8) and [docs/OPENAPI_IMPORT.md](docs/OPENAPI_IMPORT.md).
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:

@@ -62,6 +62,7 @@ GET  /v1/endpoints                    -> list[EndpointRead]       [Bearer]
 GET  /v1/endpoints/{endpoint_id}      -> EndpointRead             [Bearer]
 PATCH /v1/endpoints/{endpoint_id}     EndpointUpdate -> EndpointRead [Bearer]
 DELETE /v1/endpoints/{endpoint_id}    -> 204 (sets is_active=false) [Bearer]
+POST /v1/endpoints/import              OpenApiImportRequest -> 200 preview | 201 created  [Bearer kg_ or kgs_]
 GET  /v1/settlements?limit=50&offset=0          -> list[SettlementRead] [Bearer]
 GET  /v1/analytics?start=ISO&end=ISO            -> MerchantAnalytics    [Bearer]
 GET  /v1/tax-report.csv?start=ISO&end=ISO       -> text/csv, header row = TAX_CSV_COLUMNS [Bearer]
@@ -196,6 +197,17 @@ Cache-Control: public, max-age=30; Redis kasgate:catalog:v1 holds the snapshot f
 GET /v1/catalog/{slug} returns one listed CatalogEndpoint (same caching) or 404 X402ErrorBody error=endpoint_not_found.
 GET /llms.txt is a public text/plain description of headers, the fee split (98.5% merchant output 0 / 1.5% treasury output 1, 0.2 KAS min fee, 0.6 KAS min price), the catalog URLs, and SDK/MCP usage.
 The existing GET /v1/directory DirectoryManifest is unchanged.
+
+## CONTRACT v2.8 — one-click OpenAPI import (additive)
+POST /v1/endpoints/import [Bearer kg_ or kgs_, same dependency as the other endpoint routes] accepts OpenApiImportRequest (extra="forbid").
+mode: "preview" | "create". Exactly one of spec_text or spec_url. upstream_base_url and default_price_sompi are required; optional upstream_headers, category, is_public_listed (default true).
+selections: list of {method, path, price_sompi?} (1..500, unique method+path) is required for create and rejected for preview. method is GET|POST|PUT|PATCH|DELETE. price_sompi is an optional per-row override; omitted rows use default_price_sompi. Both prices are Sompi integers and must pass compute_fee_split() (>= 0.6 KAS). Imported rows are KAS-priced (EndpointCreate.price_currency defaults to KAS); USD import is not in this version.
+mode=preview -> 200 OpenApiImportPreview (Cache-Control: no-store). Nothing is written. Each OpenApiOperationPreview lists key, method, path, operation_id, summary, path_params, importable/skip_reason, slug, upstream_url, proxy_path, proxy_url, price_sompi.
+mode=create -> 201 OpenApiImportCreated{created_count, created:[EndpointRead]}. The route is stateless: create re-reads or re-fetches the document and matches selections by method + path. All selected endpoints are created in one transaction or none are.
+Errors: 401 missing or bad auth; 409 slug race (everything rolled back); 413 document over 2 MiB or body over 4.25 MiB; 422 per-row error locations or a readable message for a bad document. Bad input never returns 500.
+Mapping: one endpoint per operation, allowed_methods=[METHOD]. Path parameters use the existing suffix routing: GET /pets/{petId} has upstream <base>/pets and is called as /p/<slug>/<petId>. The proxy does not check the suffix against the template, the same as every endpoint today. Slugs are deterministic from operationId or method+path, with -2/-3 on collision against the global slug index. Each row is validated by constructing an EndpointCreate. HEAD, OPTIONS and TRACE, plus unsafe paths, are skipped with a reason.
+spec_url is fetched through the existing guarded upstream client (DNS pinned to a public IP). Redirects are followed by hand, at most 3, each re-checked, with a 10 s timeout; the 2 MiB cap is enforced while reading. Remote $ref and $dynamicRef are refused anywhere in the document; nothing is ever fetched for a reference. YAML uses safe_load with a nesting depth cap of 100, an alias cap of 1000, and a 2M-node expanded-size cap. Only OpenAPI 3.0.x and 3.1.x are accepted; Swagger 2.0 and OpenAPI 3.2 are rejected. There is no per-merchant endpoint limit in this version.
+Source of truth: apps/gateway/app/schemas.py (OpenApiImport*), app/openapi_import.py, app/api_routes.py::import_openapi. Narrative detail: docs/OPENAPI_IMPORT.md.
 
 ## Notes from the funded testnet-10 run
 - Node RPC UTXO entries return scriptPublicKey as a hex string "<u16 BE version><script>" (e.g. "0000"+"20<xonly>ac"), not only the dict form; parsers MUST accept both.
