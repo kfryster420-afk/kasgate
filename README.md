@@ -27,6 +27,14 @@ Every 402 is also a [k402](https://github.com/kaspa-402/k402) offer body (`{"k40
 
 Known upstream issue: with `kaspa==2.1.0`, `k402.wallet.HotWallet(..., network="testnet-10")` fails in its constructor ("Invalid network type"). Its `pay()` and `k402.Client` work, and mainnet is unaffected. Testnet-10 testers need a payer that builds the same transaction (see the k402 scenario in [docs/beta/TEST_PLAN.md](docs/beta/TEST_PLAN.md)).
 
+### Works with kaspa-x402 wallets and agents
+
+Every 402 also offers the community [kaspa-x402](https://github.com/elldeeone/kaspa-x402) `exact` payment (binding `kaspa-exact-v2`, profile `standard-native`). The `PAYMENT-REQUIRED` header is a standard x402 v2 envelope: the `exact` entry first, then KasGate's own `kaspa-exact-v1` terms. So an unmodified `@kaspa-x402/client` (1.0.1) can pay a KasGate endpoint with no KasGate SDK. It signs one transaction that pays the merchant, binds it to the exact request (method, URL, body) with a signed authorization, and retries with `PAYMENT-SIGNATURE`. The gateway verifies the payment the same way the official verifier does, waits until the network accepts it, and returns the standard `SettlementResponse` in `PAYMENT-RESPONSE`.
+
+**No platform fee on kaspa-x402 payments during the beta.** On this path the merchant receives the full price and there is no treasury output. KasGate and k402 payments are unchanged and still carry the platform fee. USD-priced endpoints offer the same locked KAS amount on every path, and if the KAS/USD price is unavailable the gateway answers `503 price_unavailable` with no offer at all. Repeating a payment with the same payment identifier is idempotent. Two KasGate policies apply on this path: the merchant output must be at least 0.2 KAS, and signatures must use SIGHASH_ALL. Details are in CONTRACT v2.10 of [docs/CONTRACTS.md](docs/CONTRACTS.md). Batch settlement and the additive and hash-chain exact profiles are not supported.
+
+The KasGate buyer SDK reads the new envelope. Copies of the SDK from before CONTRACT v2.10 reject the envelope header and need to be updated.
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:

@@ -17,7 +17,7 @@ Mirrors the official verifier of elldeeone/kaspa-x402 v1.0.1 (`#verifyStandardNa
   payment identifier, and is signed by the key of the P2PK input at `authorization.inputIndex`;
 * `expiresAt` is in the future and no later than now + `maxTimeoutSeconds`.
 
-KasGate policy on top of the binding (documented in CONTRACTS.md v2.7): signatures must use SIGHASH_ALL (`0x01`), the
+KasGate policy on top of the binding (documented in CONTRACTS.md v2.10): signatures must use SIGHASH_ALL (`0x01`), the
 same as the official client, so no third party can re-shape a signed payment; the transaction mass must be standard.
 
 Node lookups (embedded UTXO entries must match the chain) happen afterwards in `KaspaEngine.resolve_exact_v2_inputs`.

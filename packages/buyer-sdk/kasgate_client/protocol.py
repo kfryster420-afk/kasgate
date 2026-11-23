@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -135,7 +136,7 @@ def sompi_to_kas(sompi: int) -> str:
 
 
 def encode_header(model: BaseModel) -> str:
-    return base64.b64encode(model.model_dump_json().encode("utf-8")).decode("ascii")
+    return base64.b64encode(model.model_dump_json(exclude_none=True).encode("utf-8")).decode("ascii")
 
 
 def decode_header_bytes(value: str) -> bytes:
@@ -170,8 +171,22 @@ class PlatformFee(BaseModel):
         return normalize_address(v)
 
 
+class PaymentRequiredExtra(BaseModel):
+    """USD quote metadata locked into a challenge (USD-priced endpoints only)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kasUsdRate: Annotated[str, Field(pattern=r"^[0-9]+(?:\.[0-9]+)?$")]
+    quotedAt: datetime
+
+
 class PaymentRequired(X402Header):
-    """Decoded PAYMENT-REQUIRED header. `amount` is the TOTAL the payer sends across both outputs."""
+    """Decoded PAYMENT-REQUIRED terms (kaspa-exact-v1). `amount` is the TOTAL the payer sends across both outputs.
+
+    Since CONTRACT v2.10 the header is an x402 v2 envelope whose `accepts` list also offers the community kaspa-x402
+    `exact` binding; `from_header` selects the `kaspa-exact-v1` entry (the only binding this SDK pays) and still
+    accepts the flat pre-v2.10 header.
+    """
 
     x402Version: int
     scheme: str
@@ -182,11 +197,23 @@ class PaymentRequired(X402Header):
     platformFee: PlatformFee
     nonce: Annotated[str, Field(pattern=NONCE_RE)]
     expiresAt: datetime
+    extra: PaymentRequiredExtra | None = None
 
     @field_validator("payTo")
     @classmethod
     def _pay_to(cls, v: str) -> str:
         return normalize_address(v)
+
+    @classmethod
+    def from_header(cls, value: str):
+        raw = decode_header_bytes(value)
+        try:
+            data = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("header is not valid JSON") from exc
+        if isinstance(data, dict) and "accepts" in data:
+            return cls.model_validate(kasgate_v1_entry(data))
+        return cls.model_validate(data)
 
     @property
     def total_sompi(self) -> int:
@@ -199,6 +226,26 @@ class PaymentRequired(X402Header):
     @property
     def merchant_sompi(self) -> int:
         return int(self.amount) - int(self.platformFee.feeAmount)
+
+
+def kasgate_v1_entry(envelope: dict[str, object]) -> dict[str, object]:
+    """The `kaspa-exact-v1` terms of a CONTRACT v2.10 x402 v2 envelope, with the envelope's `x402Version`.
+
+    Other entries (kaspa-x402 `exact`, future schemes) are skipped, as x402 v2 clients do. Raises ValueError unless
+    there is exactly one `kaspa-exact-v1` entry and it matches the top-level mirror of the v1 terms.
+    """
+    accepts = envelope.get("accepts")
+    if not isinstance(accepts, list):
+        raise ValueError("PAYMENT-REQUIRED accepts must be a list")  # noqa: TRY004
+    entries = [e for e in accepts if isinstance(e, dict) and e.get("scheme") == "kaspa-exact-v1"]
+    if len(entries) != 1:
+        raise ValueError("PAYMENT-REQUIRED must offer exactly one kaspa-exact-v1 entry")
+    entry = dict(entries[0])
+    for key, item in entry.items():
+        if key in envelope and envelope[key] != item:
+            raise ValueError(f"PAYMENT-REQUIRED top-level {key} does not match its kaspa-exact-v1 entry")
+    entry["x402Version"] = envelope.get("x402Version")
+    return entry
 
 
 class PaymentSignature(X402Header):

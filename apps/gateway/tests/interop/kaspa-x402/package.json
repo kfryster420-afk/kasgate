@@ -1,0 +1,12 @@
+{
+  "name": "kasgate-kaspa-x402-interop",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Drives the official @kaspa-x402/client against the KasGate gateway in tests/test_interop_kaspa_x402.py",
+  "type": "module",
+  "license": "MIT",
+  "dependencies": {
+    "@kaspa-x402/client": "1.0.1",
+    "@kaspa-x402/core": "1.0.1"
+  }
+}

@@ -371,3 +371,62 @@ def test_proof_encodings_normalise_like_the_gateway() -> None:
             == gw.PaymentSignature(payerProof=form, **fields).payerProof
             == raw.hex()
         )
+
+
+# ---------------------------------------------------------------- CONTRACT v2.10 envelope
+
+
+def _exact_entry(price: int) -> gw.ExactV2Requirements:
+    return gw.ExactV2Requirements.for_merchant(
+        network="kaspa:testnet-10", amount_sompi=price, pay_to=MERCHANT, max_timeout_seconds=120
+    )
+
+
+@pytest.mark.parametrize("with_exact", [True, False])
+def test_sdk_selects_the_kaspa_exact_v1_entry_of_the_v2_10_envelope(with_exact: bool) -> None:
+    required = gw.PaymentRequired.for_endpoint(PRICE, MERCHANT, NONCE, future())
+    envelope = gw.PaymentRequiredEnvelope.build(
+        required,
+        _exact_entry(PRICE) if with_exact else None,
+        resource_url="https://gw.test/p/weather",
+        error="payment_required",
+    )
+    decoded = sdk.PaymentRequired.from_header(envelope.to_header())
+    assert decoded.x402Version == 2 and decoded.scheme == "kaspa-exact-v1"
+    assert decoded.total_sompi == PRICE and decoded.nonce == NONCE
+    assert decoded.merchant_sompi == required.merchant_amount_sompi
+    # the selected terms re-encode to exactly the flat gateway header
+    assert decoded.to_header() == required.to_header()
+
+
+def test_sdk_reads_usd_quote_metadata_from_the_envelope() -> None:
+    from datetime import UTC, datetime
+
+    extra = gw.PaymentRequiredExtra(kasUsdRate="0.125", quotedAt=datetime(2026, 11, 23, tzinfo=UTC))
+    required = gw.PaymentRequired.for_endpoint(PRICE, MERCHANT, NONCE, future(), extra=extra)
+    envelope = gw.PaymentRequiredEnvelope.build(required, _exact_entry(PRICE), resource_url="https://gw.test/p/x")
+    decoded = sdk.PaymentRequired.from_header(envelope.to_header())
+    assert decoded.extra is not None and decoded.extra.kasUsdRate == "0.125"
+    assert sdk.PaymentRequired.from_header(required.to_header()).extra == decoded.extra
+
+
+def test_envelope_without_a_single_consistent_v1_entry_is_rejected() -> None:
+    import base64
+
+    required = gw.PaymentRequired.for_endpoint(PRICE, MERCHANT, NONCE, future())
+    good = json.loads(
+        base64.b64decode(
+            gw.PaymentRequiredEnvelope.build(required, _exact_entry(PRICE), resource_url="https://gw.test/p").to_header()
+        )
+    )
+
+    def encode(data: dict[str, object]) -> str:
+        return base64.b64encode(json.dumps(data).encode()).decode()
+
+    only_exact = dict(good, accepts=[good["accepts"][0]])
+    twice = dict(good, accepts=[good["accepts"][1], good["accepts"][1]])
+    mismatched = dict(good, amount=str(PRICE + 1))
+    not_a_list = dict(good, accepts={"scheme": "kaspa-exact-v1"})
+    for bad in (only_exact, twice, mismatched, not_a_list):
+        with pytest.raises(ValueError):
+            sdk.PaymentRequired.from_header(encode(bad))

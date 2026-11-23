@@ -234,7 +234,7 @@ class StubEngine:
             raise self.error
         return verified
 
-    # CONTRACT v2.7: the pure kaspa-exact-v2 checks are the REAL verifier; only the node-facing steps are stubbed.
+    # CONTRACT v2.10: the pure kaspa-exact-v2 checks are the REAL verifier; only the node-facing steps are stubbed.
     def verify_exact_v2(
         self,
         payment: ExactV2PaymentPayload,

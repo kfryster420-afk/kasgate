@@ -114,6 +114,17 @@ Then try to get the call without paying the fee. Each needs a fresh offer and is
 - Replay a settled header, the same `txid` with a new `payment_id`, or that `txid` in a KasGate `PAYMENT-SIGNATURE`. Expected: **409** `payment_replayed`.
 - Send `X-K402-Payment` empty, with two or four tokens, or with `kaspa-session`. Expected: **402** `invalid_payment_header`.
 
+### 9. kaspa-x402 client (`exact` / `kaspa-exact-v2`), no platform fee
+
+Use the official `@kaspa-x402/client` 1.0.1 on testnet-10 with a funded testnet wallet as its funding provider, pointed at your endpoint's `/p/<slug>` URL. If you cannot run Node, skip this scenario and say so in your summary.
+
+- Decode the 402's `PAYMENT-REQUIRED` header. Expected: `x402Version` 2, `resource.url` equal to the exact URL you called, `accepts[0]` with `scheme` `exact`, `extra.binding` `kaspa-exact-v2`, `extra.profile` `standard-native`, `payTo` the merchant and `amount` the full price, and `accepts[1]` the `kaspa-exact-v1` terms. The KasGate SDK and scenario 1 still work against the same endpoint.
+- Pay it with the client. Expected: the upstream response, and a `PAYMENT-RESPONSE` whose `transaction` is your txId, `amount` is the full price, `extensions.kaspa.finality` is `accepted` and `extensions.kasgate.platformFeeSompi` is `"0"`. On the explorer, one output pays the merchant exactly the price, any second output is your change, there is no treasury output and the payload is empty. The dashboard shows the settlement with a fee of 0.
+- Retry the same paid request with the same payment identifier after an upstream 5xx. Expected: redelivered without a second payment. Reuse the identifier for a different URL or body. Expected: **409** `payment_replayed` (`kaspa_payment_identifier_conflict`).
+- Change the body or query after signing, or send the payment to another endpoint. Expected: **402** `invalid_exact_payment` or `payment_expired`, and nothing is served.
+- Replay the settled txId in a KasGate `PAYMENT-SIGNATURE` or an `X-K402-Payment` header. Expected: **409** `payment_replayed`.
+- On a USD-priced endpoint, compare the `exact` amount with the `kaspa-exact-v1` `amount` from the same 402. Expected: they are equal.
+
 ## When you are done
 
 File one bug report per distinct failure, using the [bug report form](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.

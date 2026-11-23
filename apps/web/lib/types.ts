@@ -302,11 +302,13 @@ export interface SettlementRead {
   endpoint_id: Uuid;
   merchant_id: Uuid;
   network: string;
-  /** "k402-kaspa-utxo" payments carry the same treasury output but prove no payer, so payer_address is null. */
-  payment_scheme: "kaspa-exact-v1" | "k402-kaspa-utxo";
+  /** "k402-kaspa-utxo" payments carry the same treasury output but prove no payer, so payer_address is null.
+   *  "kaspa-exact-v2" (community kaspa-x402 `exact`, CONTRACT v2.10) pays the merchant the full price: no platform
+   *  fee during the beta, so fee_amount_sompi is 0 and treasury_address / payment_nonce are null. */
+  payment_scheme: "kaspa-exact-v1" | "k402-kaspa-utxo" | "kaspa-exact-v2";
   payer_address: string | null;
   merchant_address: string;
-  treasury_address: string;
+  treasury_address: string | null;
   amount_sompi: Sompi;
   merchant_amount_sompi: Sompi;
   fee_amount_sompi: Sompi;
@@ -317,6 +319,9 @@ export interface SettlementRead {
   request_method: string;
   request_path: string;
   upstream_status_code: number | null;
+  payment_nonce: string | null;
+  /** kaspa-exact-v2 payment-identifier (idempotency key); null on the other schemes. */
+  payment_identifier: string | null;
   created_at: IsoDateTime;
   settled_at: IsoDateTime | null;
 }

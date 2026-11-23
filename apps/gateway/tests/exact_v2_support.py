@@ -71,6 +71,7 @@ class ExactPaymentSpec:
     authorization_input: int = 0
     payment_output_index: int = 0
     expires_in: timedelta = timedelta(seconds=60)
+    expires_at: str | None = None  # authorization expiresAt chosen by an official client; else now + expires_in
     sighash_byte: int = 0x01
     storage_mass_delta: int = 0
     request_hash: str | None = None
@@ -143,7 +144,7 @@ def build_payment(spec: ExactPaymentSpec) -> BuiltPayment:
         artifact["inputs"][index]["signatureScript"] = f"41{signature}{spec.sighash_byte:02x}"
 
     request_hash = spec.request_hash or request_hash_for(spec)
-    expires_at = iso_z(datetime.now(UTC) + spec.expires_in)
+    expires_at = spec.expires_at or iso_z(datetime.now(UTC) + spec.expires_in)
     digest = spec.digest_override or authorization_digest(
         network=requirement.network,
         transaction_id=tx_id,

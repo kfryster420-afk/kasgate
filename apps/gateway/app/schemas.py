@@ -288,7 +288,7 @@ class PaymentRequired(X402Header):
         """Decode a PAYMENT-REQUIRED header into the kaspa-exact-v1 terms.
 
         CONTRACT v2.10 headers are a `PaymentRequiredEnvelope`; its `kaspa-exact-v1` accepts entry is returned. A flat
-        pre-v2.7 header is still accepted as is.
+        pre-v2.10 header is still accepted as is.
         """
         data = decode_header_json(value, MAX_HEADER_BYTES)
         if isinstance(data, dict) and "accepts" in data:
@@ -366,7 +366,7 @@ class PaymentRequiredEnvelope(BaseModel):
       list price, no platform fee), present whenever the price is payable on that path.
     * The `kaspa-exact-v1` entry carries KasGate's own nonce-bound terms with the atomic merchant/treasury split.
     * Backward compatibility: the same v1 terms are ALSO mirrored at the top level (`scheme`, `network`, `asset`,
-      `amount`, `payTo`, `platformFee`, `nonce`, `expiresAt`), so pre-v2.7 readers that look up those keys keep
+      `amount`, `payTo`, `platformFee`, `nonce`, `expiresAt`), so pre-v2.10 readers that look up those keys keep
       working. The envelope schema allows additional top-level properties, so official clients ignore the mirror.
     * Encoded as canonical (key-sorted) JSON then standard Base64, like @kaspa-x402/core.
     """
@@ -378,7 +378,7 @@ class PaymentRequiredEnvelope(BaseModel):
     accepts: Annotated[list[AcceptsEntry], Field(min_length=1, max_length=EXACT_V2_MAX_ACCEPTS)]
     extensions: PaymentExtensions | None = None
     error: Annotated[str, Field(max_length=500)] | None = None
-    # v1 mirror (pre-v2.7 flat header fields)
+    # v1 mirror (pre-v2.10 flat header fields)
     scheme: Literal["kaspa-exact-v1"]
     network: KaspaNetwork
     asset: Literal["KAS"]
