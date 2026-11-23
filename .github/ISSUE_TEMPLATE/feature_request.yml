@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest an improvement to KasGate
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the change you want and the problem it solves.
+
+        **Never paste seed phrases, private keys, wallet recovery words, API keys (`kg_…`, `kgs_…`), or `.env` contents.**
+
+        Security problems are not feature requests. Use [private vulnerability reporting](https://github.com/kfryster420-afk/kasgate/security/advisories/new) instead. See [SECURITY.md](https://github.com/kfryster420-afk/kasgate/blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      description: Who this would mainly help.
+      options:
+        - Buyer
+        - Merchant
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult or missing today? What did you run into while testing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What you would like KasGate to do instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Other approaches you thought about, or workarounds you used.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional. Screenshots, links, or related issue numbers. Redact any secrets before pasting.

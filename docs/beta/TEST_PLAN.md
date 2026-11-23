@@ -1,0 +1,103 @@
+# KasGate public testnet beta — tester plan
+
+This is the set of scenarios we want external testers to run against the public KasGate beta on **Kaspa testnet-10**. It is not an internal CI suite. Use the web app with KasWare, or the buyer SDK / MCP server, against the beta gateway URL you were given.
+
+KasGate is testnet-verified only. Mainnet has not launched. Use throw-away testnet wallets and never send mainnet funds.
+
+**Never paste seed phrases, private keys, wallet recovery words, API keys (`kg_…`, `kgs_…`), or `.env` contents into an issue, chat, screenshot, or log paste.** A transaction id (`txId`) is safe to share.
+
+## Before you start
+
+- A Kaspa testnet-10 wallet (KasWare is the supported browser wallet) with enough spendable balance for several payments of at least 0.6 KAS plus network fees and change.
+- Access to the beta web app and gateway. Paid endpoints look like `https://<gateway>/p/<slug>`.
+- A way to inspect a transaction: `https://explorer-tn10.kaspa.org/txs/<txid>`.
+- About 15–20 minutes, including one wait of just over two minutes for the expired-nonce case (challenges last `PAYMENT_MAX_AGE_SECONDS`, default 120 seconds; use the `expiresAt` in the challenge you received).
+
+If you are a merchant tester, also register with KasWare, create at least one paid endpoint priced at the 0.6 KAS minimum, and note the merchant address shown in the dashboard.
+
+## What to record for every scenario
+
+Write these down as you go. If something fails, file a [bug report](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml) with the same fields. Report security problems only through [private vulnerability reporting](https://github.com/kfryster420-afk/kasgate/security/advisories/new), not a public issue (see [SECURITY.md](https://github.com/kfryster420-afk/kasgate/blob/main/SECURITY.md)).
+
+- Scenario name and whether it passed or failed
+- Role (buyer or merchant) and network (`kaspa:testnet-10`)
+- Endpoint slug or paid URL
+- HTTP status and, on errors, the `error` field from the JSON body
+- `txId` when a transaction was built or broadcast, plus the explorer link
+- For a 402 challenge, the decoded `PAYMENT-REQUIRED` JSON: `amount`, `payTo`, `platformFee.feeTo`, `platformFee.feeAmount`, `nonce`, `expiresAt` (no keys)
+- For a success, the decoded `PAYMENT-RESPONSE` JSON: `txId`, `settled`, `network`
+- Browser name and version, and KasWare version (or buyer SDK / MCP server package version)
+- Step where it diverged, expected vs actual, and whether funds left the wallet
+- Relevant log lines with secrets removed
+
+## Fee split (applies to every paid call)
+
+Every valid payment is a single Kaspa transaction with this output order:
+
+| Output | Recipient | Amount |
+| --- | --- | --- |
+| 0 | Merchant (`payTo` from `PAYMENT-REQUIRED`) | price minus the platform fee |
+| 1 | Treasury (`platformFee.feeTo`) | the platform fee, exact |
+| 2+ | Change back to the buyer, if any | either omitted (zero change) or at least 0.3 KAS (30,000,000 sompi) |
+
+The fee is `max(ceil(price × 150 / 10,000), 0.2 KAS)`. The minimum endpoint price is **0.6 KAS** (60,000,000 sompi). At that price the split is **0.4 KAS to the merchant and 0.2 KAS to the treasury**. Amounts in the challenge headers are sompi strings (1 KAS = 100,000,000 sompi). The transaction payload must be the bytes `kasgate:v1:` plus the challenge `nonce`.
+
+## Scenarios
+
+### 1. Happy path: pay, then retry
+
+Call a paid endpoint with no payment header.
+
+- Expected: HTTP **402**, `error` is `payment_required`, and a `PAYMENT-REQUIRED` header. The body also carries the challenge. Nothing is spent.
+
+Build and sign one payment that matches that challenge (correct `payTo`, treasury, amounts, payload nonce, and payer proof if you are using the SDK or a wallet flow that attaches it). Retry the same request with a `PAYMENT-SIGNATURE` header.
+
+- Expected: the upstream response (typically HTTP **200**), a `PAYMENT-RESPONSE` header with `settled: true` and a `txId`, and the same `txId` visible on the testnet-10 explorer and, for the merchant, in the dashboard settlements list. Settlement should complete in a few seconds.
+
+If the first paid attempt returns **502** `upstream_error` but still includes `PAYMENT-RESPONSE`, the payment already settled. Retry with the **same** `PAYMENT-SIGNATURE` (do not build a second transaction) within the redelivery window (default 10 minutes). Expected: the upstream is tried again and you are not charged a second time. A later retry after the window, or after the delivery attempt limit, should return **409** without a new on-chain payment.
+
+### 2. Underpay
+
+Take a fresh 402 challenge and submit a signed payment whose total is below the `amount` in `PAYMENT-REQUIRED` (one sompi short is enough), or whose treasury output is below `platformFee.feeAmount`.
+
+- Expected: HTTP **402**, `error` is `underpaid` or `invalid_fee_split`, and a fresh `PAYMENT-REQUIRED`. The underpaying transaction must not settle the call. Note whether the bad transaction was broadcast and whether funds moved.
+
+### 3. Wrong recipient
+
+Take a fresh challenge and pay the correct total, but send output 0 or output 1 to the wrong address (swap merchant and treasury, or substitute any other testnet address).
+
+- Expected: HTTP **402**, `error` is `invalid_fee_split` (or `invalid_payment_header` if the header itself is rejected), and a fresh challenge. The call must not settle. Record the `txId` if one was broadcast and confirm the intended merchant was not credited for this call.
+
+### 4. Replayed txId
+
+Complete scenario 1 so you have a settled `txId` and the `PAYMENT-SIGNATURE` you already used. Submit that same signature again on a new request to the same endpoint (or reuse the same `txId` in a new signature).
+
+- Expected: HTTP **409**, `error` is `payment_replayed`. No second settlement, no second credit to the merchant, and no second treasury payment.
+
+### 5. Expired nonce
+
+Request a challenge and **do not pay it**. Wait until after the `expiresAt` timestamp in `PAYMENT-REQUIRED` (default lifetime is 120 seconds). Then submit a otherwise-valid payment that still uses that expired `nonce`.
+
+- Expected: HTTP **402**, `error` is `payment_expired`, and a **fresh** `PAYMENT-REQUIRED` with a new `nonce` and `expiresAt`. The expired nonce must not be reusable. If you already broadcast a transaction for the stale nonce, say so and include its `txId`; the call itself must still be unpaid.
+
+### 6. Minimum price 0.6 KAS
+
+As a merchant, try to create or update an endpoint priced below 0.6 KAS (for example 0.5 KAS).
+
+- Expected: the request is rejected. The endpoint is not saved at that price.
+
+Then create (or use) an endpoint priced at exactly 0.6 KAS and complete a valid payment as in scenario 1.
+
+- Expected: the payment settles. On the explorer, output 0 is 40,000,000 sompi (0.4 KAS) to the merchant and output 1 is 20,000,000 sompi (0.2 KAS) to the treasury.
+
+### 7. Fee split: output 0 merchant, output 1 treasury
+
+Using the successful 0.6 KAS payment from scenario 6 (or another successful payment if you already have one), open `https://explorer-tn10.kaspa.org/txs/<txid>` and check the outputs against the challenge that was paid.
+
+- Expected: output 0 is the merchant `payTo` address for the exact merchant amount; output 1 is the treasury `feeTo` address for the exact fee; any further output is change to the buyer and is either absent or at least 0.3 KAS. The dashboard settlement, if you are the merchant, shows the same `txId` and amounts.
+
+## When you are done
+
+File one bug report per distinct failure, using the [bug report form](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.
+
+Product ideas go in a [feature request](https://github.com/kfryster420-afk/kasgate/issues/new?template=feature_request.yml). Overall impressions, confusing steps, and suggestions can go in a [beta feedback](https://github.com/kfryster420-afk/kasgate/issues/new?template=beta_feedback.yml) report. Payment-verification bypasses, replay holes, key leaks, and similar issues go only to private vulnerability reporting.

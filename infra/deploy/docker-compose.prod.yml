@@ -1,0 +1,31 @@
+# Production / public-beta override. Always used together with infra/docker-compose.yml:
+#
+#   cd infra
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+# Ports stay on loopback (GATEWAY_BIND / WEB_BIND and the 127.0.0.1 mappings in the base
+# file). Cloudflare Tunnel is the only public ingress. The optional kaspad profile is
+# not started here: the beta uses public Kaspa nodes.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  postgres:
+    logging: *default-logging
+    mem_limit: 512m
+
+  redis:
+    logging: *default-logging
+    mem_limit: 256m
+
+  gateway:
+    logging: *default-logging
+    mem_limit: 768m
+
+  web:
+    logging: *default-logging
+    mem_limit: 512m

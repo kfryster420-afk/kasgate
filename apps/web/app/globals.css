@@ -58,3 +58,7 @@ body {
     @apply px-3 py-2.5 align-top text-sm;
   }
 }
+
+html[data-beta-banner-dismissed] .beta-banner {
+  display: none;
+}

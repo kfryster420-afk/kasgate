@@ -1,7 +1,7 @@
 import { ArrowRight, Bot, FileSpreadsheet, Gauge, Hexagon, Lock, Zap } from "lucide-react";
 import Link from "next/link";
 import { CodeBlock } from "@/components/code-block";
-import { GATEWAY_PUBLIC_URL, NETWORK_LABEL } from "@/lib/config";
+import { GATEWAY_PUBLIC_URL, IS_TESTNET, NETWORK_LABEL } from "@/lib/config";
 import { getMinOutputSompi } from "@/lib/server/gateway";
 import { curlCreateEndpoint, curlRegisterMerchant } from "@/lib/snippets";
 import { flatFeeMaxPriceSompi, formatKas, minPriceSompi } from "@/lib/sompi";
@@ -26,7 +26,11 @@ export default async function LandingPage() {
   return (
     <div>
       <section className="mx-auto max-w-6xl px-4 pb-16 pt-20 text-center">
-        <span className="badge border-kas-700 bg-kas-900/40 font-mono text-kas-300">live on Kaspa {NETWORK_LABEL}</span>
+        {IS_TESTNET ? (
+          <span className="badge border-amber-700 bg-amber-950/60 font-mono text-amber-200">testnet beta · Kaspa {NETWORK_LABEL}</span>
+        ) : (
+          <span className="badge border-kas-700 bg-kas-900/40 font-mono text-kas-300">live on Kaspa {NETWORK_LABEL}</span>
+        )}
         <h1 className="mx-auto mt-6 max-w-3xl text-4xl font-bold tracking-tight text-zinc-50 sm:text-6xl">
           Get paid in <span className="text-kas-400">KAS</span> every time your API is called
         </h1>
@@ -40,6 +44,9 @@ export default async function LandingPage() {
           </Link>
           <Link href="/directory" className="btn-secondary px-6 py-3 text-base">
             Browse the directory
+          </Link>
+          <Link href="/beta" className="btn-secondary px-6 py-3 text-base">
+            Beta guide
           </Link>
         </div>
         <dl className="mx-auto mt-14 grid max-w-3xl grid-cols-3 gap-4 text-left">

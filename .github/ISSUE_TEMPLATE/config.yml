@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/kfryster420-afk/kasgate/security/advisories/new
+    about: Do not open a public issue for a security problem. Use GitHub's private vulnerability reporting. See SECURITY.md.
+  - name: Tester plan (testnet beta)
+    url: https://github.com/kfryster420-afk/kasgate/blob/main/docs/beta/TEST_PLAN.md
+    about: Scenarios to run on the public Kaspa testnet-10 beta, and what to record if something fails.

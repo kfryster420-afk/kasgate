@@ -1,0 +1,100 @@
+name: Beta feedback
+description: Tell us how the KasGate public testnet-10 beta went, even if nothing broke
+title: "[beta] "
+labels: ["beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying the KasGate testnet beta. Use this form for overall impressions, confusing steps, and suggestions. If something is clearly broken, file a [bug report](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml) instead. A structured tester plan is in [docs/beta/TEST_PLAN.md](https://github.com/kfryster420-afk/kasgate/blob/main/docs/beta/TEST_PLAN.md).
+
+        **Never paste seed phrases, private keys, wallet recovery words, API keys (`kg_…`, `kgs_…`), or `.env` contents.** A transaction id (`txId`) is safe to share.
+
+        Do not file security problems here. Use [private vulnerability reporting](https://github.com/kfryster420-afk/kasgate/security/advisories/new) instead. See [SECURITY.md](https://github.com/kfryster420-afk/kasgate/blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      description: How you used KasGate during this session.
+      options:
+        - Buyer
+        - Merchant
+        - Both
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impression
+    attributes:
+      label: Overall impression
+      options:
+        - Worked well
+        - Mixed
+        - I got stuck
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: The public beta runs on kaspa:testnet-10. Choose mainnet only if you were actually pointed at it.
+      options:
+        - kaspa:testnet-10
+        - kaspa:mainnet
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: For example installing KasWare, using the faucet, registering an API, setting a price, paying with the buyer SDK, or walking through the tester plan.
+    validations:
+      required: true
+
+  - type: textarea
+    id: went_well
+    attributes:
+      label: What went well
+      description: Optional. Anything that felt clear, fast, or better than you expected.
+
+  - type: textarea
+    id: stuck
+    attributes:
+      label: What was confusing or blocked you
+      description: Optional. Include the step, the page or command, and what you expected instead.
+
+  - type: input
+    id: txid
+    attributes:
+      label: Example transaction id (txId)
+      description: Optional. One successful or failed payment from your session. 64-character lowercase hex. Safe to share. Never paste a private key next to it.
+      placeholder: e.g. e710f43443383858728eab5331d10691c4e087754e880efd6b350a1b65be0673
+
+  - type: input
+    id: browser_wallet
+    attributes:
+      label: Browser and wallet version
+      description: Browser name and version, plus the KasWare extension version. If you only used the buyer SDK or MCP server, put those package versions here.
+      placeholder: e.g. Firefox 133, KasWare 0.x.x
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mainnet_interest
+    attributes:
+      label: Would you try this on mainnet later?
+      description: Optional. This is not a commitment and does not mean mainnet is available.
+      options:
+        - Yes
+        - Not sure
+        - No
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Optional. Screenshots or links are welcome. Redact secrets before pasting.

@@ -1,0 +1,32 @@
+# Cloudflare Tunnel origin config. Do not commit a rendered copy that contains a real
+# tunnel id if you treat that as sensitive; the credentials JSON never belongs in git.
+#
+# Render with:
+#   infra/deploy/render-tunnel-config.sh --repo-dir /opt/kasgate \
+#     --tunnel-id <UUID> --credentials-file /etc/cloudflared/<UUID>.json \
+#     --output /etc/cloudflared/config.yml
+#
+# The script replaces the TUNNEL_ID, CREDENTIALS_FILE, and KASGATE_DOMAIN placeholders.
+#
+# Ingress:
+#   api.<domain>           -> gateway (127.0.0.1:8000)
+#   <domain> and www.<domain> -> web (127.0.0.1:3000)
+
+tunnel: __TUNNEL_ID__
+credentials-file: __CREDENTIALS_FILE__
+
+ingress:
+  - hostname: api.__KASGATE_DOMAIN__
+    service: http://127.0.0.1:8000
+    originRequest:
+      httpHostHeader: api.__KASGATE_DOMAIN__
+      disableChunkedEncoding: true
+  - hostname: www.__KASGATE_DOMAIN__
+    service: http://127.0.0.1:3000
+    originRequest:
+      httpHostHeader: www.__KASGATE_DOMAIN__
+  - hostname: __KASGATE_DOMAIN__
+    service: http://127.0.0.1:3000
+    originRequest:
+      httpHostHeader: __KASGATE_DOMAIN__
+  - service: http_status:404

@@ -4,6 +4,8 @@
 
 > **Status: testnet-verified, mainnet not yet launched.** Everything below has been exercised on Kaspa testnet-10 with real transactions. KasGate has not had an independent security audit. Do not use it with mainnet funds yet.
 
+A public testnet-10 beta is being prepared. Testers should start at `/beta` on the site (KasWare, the official TN-10 faucet, registering an API, the buyer SDK, and how to report bugs) and follow [docs/beta/TEST_PLAN.md](docs/beta/TEST_PLAN.md). Operators bringing up the public stack should follow [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ## How it works
 
 1. A merchant signs in with a Kaspa wallet (KasWare), registers an upstream API URL and sets a price in KAS.
@@ -40,7 +42,7 @@ The gateway talks to Kaspa through public nodes (the wRPC Resolver) by default. 
 
 ## Quickstart
 
-The full step-by-step guide is **[docs/RUNBOOK.md](docs/RUNBOOK.md)**: configuring `infra/.env`, starting the stack with Docker Compose, funding a testnet-10 wallet, registering a merchant, creating an endpoint, paying it with the SDK or the MCP server, running every test suite, and the production checklist.
+The full step-by-step guide is **[docs/RUNBOOK.md](docs/RUNBOOK.md)**: configuring `infra/.env`, starting the stack with Docker Compose, funding a testnet-10 wallet, registering a merchant, creating an endpoint, paying it with the SDK or the MCP server, running every test suite, and the production checklist. Public testnet-beta hosting (VPS, Cloudflare Tunnel, go-live checklist) is in **[docs/DEPLOY.md](docs/DEPLOY.md)**.
 
 In short:
 

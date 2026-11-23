@@ -8,6 +8,16 @@ export const IS_TESTNET = KASPA_NETWORK === "kaspa:testnet-10";
 export const ADDRESS_PREFIX = IS_TESTNET ? "kaspatest:" : "kaspa:";
 export const NETWORK_LABEL = IS_TESTNET ? "testnet-10" : "mainnet";
 
+/** Official TN-10 faucet, as listed on the Kaspa wiki (https://wiki.kaspa.org/en/testnets). */
+export const TESTNET_FAUCET_URL = "https://faucet-tn10.kaspanet.io/";
+export const TESTNET_EXPLORER_URL = "https://explorer-tn10.kaspa.org";
+export const KASWARE_URL = "https://www.kasware.xyz";
+export const GITHUB_REPO_URL = "https://github.com/kfryster420-afk/kasgate";
+export const GITHUB_BUG_URL = `${GITHUB_REPO_URL}/issues/new?template=bug_report.yml`;
+export const GITHUB_BETA_FEEDBACK_URL = `${GITHUB_REPO_URL}/issues/new?template=beta_feedback.yml`;
+export const GITHUB_SECURITY_URL = `${GITHUB_REPO_URL}/security/advisories/new`;
+export const GITHUB_TEST_PLAN_URL = `${GITHUB_REPO_URL}/blob/main/docs/beta/TEST_PLAN.md`;
+
 export const GATEWAY_PUBLIC_URL = (process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8000").replace(/\/+$/, "");
 
 /**

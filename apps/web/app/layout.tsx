@@ -1,6 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { BetaBanner } from "@/components/beta-banner";
 import { SiteFooter, SiteHeader } from "@/components/site-chrome";
+import { BETA_BANNER_BOOT_SCRIPT } from "@/lib/beta";
+import { IS_TESTNET } from "@/lib/config";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -17,8 +20,10 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
+      <head>{IS_TESTNET ? <script dangerouslySetInnerHTML={{ __html: BETA_BANNER_BOOT_SCRIPT }} /> : null}</head>
       <body className="flex min-h-screen flex-col">
+        {IS_TESTNET ? <BetaBanner /> : null}
         <SiteHeader />
         <main className="flex-1">{children}</main>
         <SiteFooter />

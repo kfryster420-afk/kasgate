@@ -4,6 +4,8 @@ How to configure, start, fund, exercise, test and ship KasGate: the x402 v2 (`ka
 
 Contents: [1 Prerequisites](#1-prerequisites) | [2 Configure `.env`](#2-configure-infraenv) | [3 Start the stack](#3-start-the-stack) | [4 Testnet-10 wallet](#4-testnet-10-wallet) | [5 Register, create an endpoint, pay it](#5-register-a-merchant-create-an-endpoint-and-pay-it) | [6 Test suites](#6-test-suites) | [7 Production checklist](#7-production-checklist) | [8 Optional own node](#8-optional-own-node) | [9 Troubleshooting](#9-troubleshooting) | [10 Verified results](#10-verified-results)
 
+To put the public testnet-10 beta on the internet (VPS, Cloudflare Tunnel, domain, go-live checklist), use [`DEPLOY.md`](DEPLOY.md). This runbook remains the source for configuration, local operation, tests and the later mainnet switch.
+
 Terms used below: 1 KAS = 100,000,000 sompi. "Gateway" is `apps/gateway` (FastAPI). "Web" is `apps/web` (Next.js 15). Paths are relative to the repository root unless a `cd` says otherwise.
 
 ## 1. Prerequisites

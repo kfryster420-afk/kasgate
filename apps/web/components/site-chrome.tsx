@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { Hexagon } from "lucide-react";
-import { NETWORK_LABEL } from "@/lib/config";
+import { GITHUB_REPO_URL, NETWORK_LABEL } from "@/lib/config";
 
 const NAV = [
+  { href: "/beta", label: "Beta" },
   { href: "/directory", label: "Directory" },
   { href: "/onboarding", label: "Onboarding" },
   { href: "/dashboard", label: "Dashboard" },
@@ -39,12 +40,18 @@ export function SiteFooter() {
     <footer className="border-t border-zinc-800/80 py-8 text-sm text-zinc-500">
       <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 sm:flex-row">
         <p>© KasGate. Non-custodial: payments settle directly on the Kaspa network.</p>
-        <div className="flex gap-4 font-mono text-xs">
+        <div className="flex flex-wrap justify-center gap-4 font-mono text-xs">
+          <Link href="/beta" className="hover:text-zinc-300">
+            /beta
+          </Link>
           <Link href="/directory" className="hover:text-zinc-300">
             /directory
           </Link>
           <a href="/directory/manifest.json" className="hover:text-zinc-300">
             /directory/manifest.json
+          </a>
+          <a href={GITHUB_REPO_URL} className="hover:text-zinc-300" rel="noreferrer">
+            GitHub
           </a>
         </div>
       </div>

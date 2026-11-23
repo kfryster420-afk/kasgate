@@ -1,0 +1,110 @@
+name: Bug report
+description: Something does not work as documented on the KasGate testnet beta
+title: "[bug] "
+labels: ["bug", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping test KasGate on Kaspa testnet-10.
+
+        **Never paste seed phrases, private keys, wallet recovery words, API keys (`kg_…`, `kgs_…`), or `.env` contents.** A transaction id (`txId`) is safe to share.
+
+        Do not file security problems here. Use [private vulnerability reporting](https://github.com/kfryster420-afk/kasgate/security/advisories/new) instead. See [SECURITY.md](https://github.com/kfryster420-afk/kasgate/blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      description: How you were using KasGate when this happened.
+      options:
+        - Buyer
+        - Merchant
+        - Both
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Web app
+        - KasWare wallet sign-in or registration
+        - Paid endpoint (HTTP 402 / payment)
+        - Buyer SDK
+        - MCP server
+        - Merchant dashboard (endpoints, settlements, analytics)
+        - Public directory
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: KasGate's public beta runs on kaspa:testnet-10. Choose mainnet only if you were actually pointed at it.
+      options:
+        - kaspa:testnet-10
+        - kaspa:mainnet
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: txid
+    attributes:
+      label: Transaction id (txId)
+      description: Optional. 64-character lowercase hex from the PAYMENT-RESPONSE header, the dashboard, or the testnet-10 explorer. Safe to share. Never paste a private key next to it.
+      placeholder: e.g. e710f43443383858728eab5331d10691c4e087754e880efd6b350a1b65be0673
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps another person can follow. Include the paid URL or endpoint slug if it is public, and whether you used the web app, KasWare, the buyer SDK, or the MCP server.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened, including HTTP status and error code if you know them (for example 200 with PAYMENT-RESPONSE, or 402 underpaid).
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead. Include HTTP status, the error field from the JSON body if present, and whether funds left the wallet.
+    validations:
+      required: true
+
+  - type: input
+    id: browser_wallet
+    attributes:
+      label: Browser and wallet version
+      description: Browser name and version, plus the KasWare extension version. If you only used the buyer SDK or MCP server, put those package versions here and write n/a for the browser.
+      placeholder: e.g. Firefox 133, KasWare 0.x.x
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and responses
+      description: Relevant log lines, HTTP status, and decoded PAYMENT-REQUIRED or PAYMENT-RESPONSE JSON. Redact secrets first. Never paste seed phrases, private keys, or API keys. A txId is fine.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Gateway URL, commit, or version
+      description: Optional. The beta site you used, or a git commit / package version if you were running a local build.
