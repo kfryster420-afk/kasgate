@@ -55,6 +55,7 @@ import random
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final, Protocol, TypeVar
 
 from kaspa import (
@@ -80,6 +81,10 @@ from app.config import (
     Settings,
     get_settings,
 )
+from app.exact_v2 import ExactV2Verification, verify_exact_v2
+from app.payments import PaymentVerificationError as PaymentVerificationError
+from app.payments import RpcUnavailableError as RpcUnavailableError
+from app.payments import VerifiedPayment as VerifiedPayment
 from app.schemas import (
     K402UtxoOffer,
     PaymentRequired,
@@ -88,6 +93,7 @@ from app.schemas import (
     payer_proof_message,
     payment_payload,
 )
+from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements
 
 logger = logging.getLogger("kasgate.kaspa_engine")
 
@@ -135,40 +141,6 @@ MAX_LOOKUP_ADDRESSES: Final[int] = 16
 T = TypeVar("T")
 ScriptKey = tuple[int, str]
 Outpoint = tuple[str, int]
-
-
-class PaymentVerificationError(Exception):
-    """Raised when a payment is not acceptable. ``code`` is one of the x402 error codes."""
-
-    code: str
-    message: str
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
-
-
-class RpcUnavailableError(PaymentVerificationError):
-    """The Kaspa node could not be reached, did not answer in time, or did not confirm acceptance in time.
-
-    ``code`` is ``rpc_unavailable``. Callers answer 503, release the replay lock and keep the nonce; ``retryable`` is
-    True because re-submitting the same transaction is idempotent (a duplicate with a matching nonce is success).
-    """
-
-    retryable: bool = True
-
-    def __init__(self, message: str) -> None:
-        super().__init__("rpc_unavailable", message)
-
-
-@dataclass(frozen=True)
-class VerifiedPayment:
-    tx_id: str
-    payer_address: str | None  # None only for k402 kaspa-utxo, which proves no payer
-    total_sompi: int
-    merchant_sompi: int
-    fee_sompi: int
 
 
 @dataclass(frozen=True)
@@ -674,6 +646,82 @@ class KaspaEngine:
                 )
             outputs[index] = (amount, script)
         return outputs
+
+    # ------------------------------------------------------------------ kaspa-exact-v2 (CONTRACT v2.10)
+
+    def verify_exact_v2(
+        self,
+        payment: ExactV2PaymentPayload,
+        requirement: ExactV2Requirements,
+        *,
+        request_hash: str,
+        now: datetime | None = None,
+        check_expiry: bool = True,
+    ) -> ExactV2Verification:
+        """Pure, network-free kaspa-exact-v2 standard-native verification (see ``app.exact_v2``)."""
+        if requirement.network != self._settings.kaspa_network:
+            raise PaymentVerificationError(
+                "wrong_network",
+                f"payment network {requirement.network} does not match gateway network {self._settings.kaspa_network}",
+            )
+        return verify_exact_v2(
+            payment,
+            requirement,
+            request_hash=request_hash,
+            network_id=self._network_id,
+            network_type=self._network_type,
+            now=now or datetime.now(UTC),
+            check_expiry=check_expiry,
+        )
+
+    async def resolve_exact_v2_inputs(self, verification: ExactV2Verification) -> None:
+        """Every embedded UTXO entry must exist on the node (confirmed UTXO set or mempool outputs) with the same
+        amount and script; queried by the owners of the input scripts (at most 16)."""
+        addresses = list(verification.lookup_addresses)
+        if len(addresses) > MAX_LOOKUP_ADDRESSES:
+            raise PaymentVerificationError(
+                "invalid_exact_payment", f"payment draws from more than {MAX_LOOKUP_ADDRESSES} payer addresses' UTXOs"
+            )
+        utxo_response = await self._rpc(
+            "get_utxos_by_addresses", lambda client: client.get_utxos_by_addresses({"addresses": addresses})
+        )
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        known = self._index_node_utxos(utxo_response, mempool_response)
+        for index, outpoint in enumerate(verification.outpoints):
+            entry = known.get(outpoint)
+            if entry is None:
+                raise PaymentVerificationError(
+                    "invalid_exact_payment",
+                    f"input {index} spends {outpoint[0]}:{outpoint[1]}, which the node does not know as unspent",
+                )
+            embedded = parse_script_key(verification.input_scripts[index])
+            if entry != (verification.input_values[index], embedded):
+                raise PaymentVerificationError(
+                    "invalid_exact_payment", f"input {index} UTXO entry does not match the node's entry"
+                )
+
+    async def settle_exact_v2(self, verification: ExactV2Verification) -> VerifiedPayment:
+        """Submit and wait until a chain block ACCEPTS the transaction, whatever ``settlement_mode`` says: the binding
+        advertises ``finality: accepted`` and the official client rejects weaker settlement evidence.
+
+        A node "already known" reply is success: the id commits to every output, so the known transaction pays the
+        merchant exactly as verified, and the authorization signature already bound it to this request.
+        """
+        tx = verification.transaction
+        tx_id = verification.payment.tx_id
+        tx.finalize()
+        if tx.id != tx_id:
+            raise PaymentVerificationError("invalid_exact_payment", "transaction does not match the verified payment")
+        start_hash = await self._sink_hash()
+        already_accepted = await self._submit(tx, tx_id)
+        if not already_accepted:
+            await self._wait_for_acceptance(tx_id, start_hash)
+        return verification.payment
 
     # ------------------------------------------------------------------ pure checks
 

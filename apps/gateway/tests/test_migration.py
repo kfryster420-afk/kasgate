@@ -1,4 +1,4 @@
-"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002/0003 must carry existing rows over."""
+"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0005 must carry existing rows over."""
 
 import asyncio
 from typing import Any
@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0004_k402_utxo"
+HEAD_REVISION = "0005_exact_v2"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -431,3 +431,100 @@ async def test_0004_k402_constraints_and_guarded_downgrade(pg_server: PgServer) 
     )
     await asyncio.to_thread(command.upgrade, config, "head")
     assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+
+
+def _exact_v2_insert(
+    tx_hex: str,
+    payment_identifier: str | None,
+    request_hash: str | None = "f" * 64,
+    *,
+    fee: int = 0,
+    treasury: str | None = None,
+    nonce: str | None = None,
+    payer: str | None = "p",
+) -> str:
+    """One CONTRACT v2.10 kaspa-exact-v2 settlement row copied from the first endpoint."""
+
+    def lit(value: str | None) -> str:
+        return "NULL" if value is None else f"'{value}'"
+
+    columns = (
+        "id, tx_id, endpoint_id, merchant_id, network, payment_scheme, payer_address, merchant_address, "
+        "treasury_address, amount_sompi, merchant_amount_sompi, fee_amount_sompi, status, request_method, "
+        "request_path, payment_nonce, payment_identifier, request_hash"
+    )
+    values = (
+        f"gen_random_uuid(), '{tx_hex}', e.id, e.merchant_id, 'kaspa:testnet-10', 'kaspa-exact-v2', {lit(payer)}, "
+        f"'m', {lit(treasury)}, 100000000, {100000000 - fee}, {fee}, 'settled', 'GET', '/p/x', {lit(nonce)}, "
+        f"{lit(payment_identifier)}, {lit(request_hash)}"
+    )
+    return f"INSERT INTO settlements ({columns}) SELECT {values} FROM endpoints e LIMIT 1"  # noqa: S608
+
+
+async def test_0005_exact_v2_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_exact_v2")
+    pg_server.create_database("kasgate_exact_v2")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0004_k402_utxo")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100, '{GET}' FROM merchants LIMIT 1",
+        _settlement_insert("a" * 64, "1" * 32),
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    # the pre-existing v1 row is carried over unchanged
+    assert await _scalar(url, "SELECT payment_scheme FROM settlements") == "kaspa-exact-v1"
+    assert await _scalar(url, "SELECT payment_identifier IS NULL AND request_hash IS NULL FROM settlements")
+
+    await _execute(url, _exact_v2_insert("b" * 64, "pay_0123456789abcdef"))
+    assert await _scalar(url, "SELECT fee_amount_sompi FROM settlements WHERE tx_id = '" + "b" * 64 + "'") == 0
+    for bad in (
+        _exact_v2_insert("c" * 64, "pay_0123456789abcdef"),  # unique ix_settlements_payment_identifier
+        _exact_v2_insert("b" * 64, "pay_fedcba9876543210"),  # unique tx_id, shared with every binding
+        _exact_v2_insert("c" * 64, "short"),  # ck_settlements_payment_identifier_format
+        _exact_v2_insert("c" * 64, "pay_0123456789abcde!"),  # ck_settlements_payment_identifier_format
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", "F" * 64),  # ck_settlements_request_hash_hex64
+        _exact_v2_insert("c" * 64, None),  # ck_settlements_exact_v2_identifiers
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", None),  # ck_settlements_exact_v2_identifiers
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", fee=10),  # ck_settlements_exact_v2_shape
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", treasury="t"),  # ck_settlements_exact_v2_shape
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", nonce="2" * 32),  # ck_settlements_exact_v2_shape
+        _exact_v2_insert("c" * 64, "pay_1111111111111111", payer=None),  # ck_settlements_exact_v2_shape
+        # v1 rows keep their treasury split, nonce, and NO payment identifier
+        "UPDATE settlements SET fee_amount_sompi = 0 WHERE tx_id = '" + "a" * 64 + "'",
+        "UPDATE settlements SET treasury_address = NULL WHERE tx_id = '" + "a" * 64 + "'",
+        "UPDATE settlements SET payment_nonce = NULL WHERE tx_id = '" + "a" * 64 + "'",
+        "UPDATE settlements SET payment_identifier = 'pay_2222222222222222' WHERE tx_id = '" + "a" * 64 + "'",
+        "UPDATE settlements SET payment_scheme = 'kaspa-exact-v3' WHERE tx_id = '" + "b" * 64 + "'",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+
+    # a downgrade would have to invent treasury outputs and nonces, so it refuses while kaspa-exact-v2 rows exist
+    with pytest.raises(DBAPIError, match="kaspa-exact-v2 settlements exist"):
+        await asyncio.to_thread(command.downgrade, config, "0004_k402_utxo")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    await _execute(url, "DELETE FROM settlements WHERE payment_scheme = 'kaspa-exact-v2'")
+    await asyncio.to_thread(command.downgrade, config, "0004_k402_utxo")
+    assert await _scalar(url, "SELECT count(*) FROM settlements") == 1
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'settlements' "
+            "AND column_name IN ('payment_identifier', 'request_hash')",
+        )
+        == 0
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()

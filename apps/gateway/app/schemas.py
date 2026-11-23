@@ -6,9 +6,8 @@ import secrets
 import uuid
 from datetime import date, datetime
 from decimal import ROUND_CEILING, Decimal
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from kaspa import Address
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -22,13 +21,25 @@ from pydantic import (
 
 from app.config import (
     BPS_DENOMINATOR,
-    NETWORK_ADDRESS_PREFIX,
     PLATFORM_FEE_BPS,
     SOMPI_PER_KAS,
     KaspaNetwork,
     get_settings,
 )
+from app.kaspa_types import KASPA_ADDRESS_RE as KASPA_ADDRESS_RE
+from app.kaspa_types import MAX_SOMPI as MAX_SOMPI
+from app.kaspa_types import SOMPI_STR_RE as SOMPI_STR_RE
+from app.kaspa_types import TX_ID_RE as TX_ID_RE
+from app.kaspa_types import Sompi, SompiStr, validate_kaspa_address, validate_tx_id
 from app.models import PriceCurrency, SettlementStatus
+from app.x402_v2 import (
+    EXACT_V2_MAX_ACCEPTS,
+    ExactV2Requirements,
+    PaymentExtensions,
+    ResourceInfo,
+    decode_header_json,
+    encode_canonical_header,
+)
 
 HEADER_PAYMENT_REQUIRED = "PAYMENT-REQUIRED"
 HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
@@ -43,8 +54,6 @@ NONCE_RE = r"^[0-9a-f]{32}$"
 AUTH_PURPOSE = "Sign in to the KasGate merchant dashboard. This does not authorise any payment."
 REGISTER_PURPOSE = "Register this address as a KasGate merchant. This does not authorise any payment."
 
-KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
-TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 K402_VERSION = "0.2"
 K402_PAYMENT_ID_RE = r"^p_[0-9a-f]{16}$"
 MAX_K402_HEADER_CHARS = 256
@@ -53,43 +62,19 @@ MAX_K402_HEADER_CHARS = 256
 # one offer; the tag makes a bystander's own offer for the same endpoint very unlikely to match someone else's tx.
 K402_TAG_SPACE = 1_000_000
 K402_NETWORK_BY_CONFIG: dict[str, str] = {"kaspa:testnet-10": "testnet-10", "kaspa:mainnet": "mainnet"}
-PaymentScheme = Literal["kaspa-exact-v1", "k402-kaspa-utxo"]
+PaymentScheme = Literal["kaspa-exact-v1", "k402-kaspa-utxo", "kaspa-exact-v2"]
 K402Network = Literal["testnet-10", "mainnet"]
 SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
-SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
-MAX_SOMPI = 999_999_999_999_999_999  # 18 digits, same cap as SompiStr
 USD_MICROS_PER_DOLLAR = 1_000_000
 MAX_USD_MICROS = 1_000_000_000_000_000  # $1e9
-Sompi = Annotated[int, Field(gt=0, le=MAX_SOMPI)]
-SompiStr = Annotated[str, Field(pattern=SOMPI_STR_RE)]
 UsdMicros = Annotated[int, Field(gt=0, le=MAX_USD_MICROS)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
 
 
 def sompi_to_kas(sompi: int) -> str:
     return format(Decimal(sompi) / Decimal(SOMPI_PER_KAS), "f")
-
-
-def validate_kaspa_address(value: str, network: str | None = None) -> str:
-    value = value.strip().lower()
-    if not KASPA_ADDRESS_RE.fullmatch(value):
-        raise ValueError("invalid Kaspa address")
-    if not Address.validate(value):
-        raise ValueError("invalid Kaspa address checksum")
-    target = network or get_settings().kaspa_network
-    prefix = NETWORK_ADDRESS_PREFIX[target]
-    if not value.startswith(f"{prefix}:"):
-        raise ValueError(f"address must use the '{prefix}:' prefix on {target}")
-    return value
-
-
-def validate_tx_id(value: str) -> str:
-    value = value.strip().lower()
-    if not TX_ID_RE.fullmatch(value):
-        raise ValueError("txId must be 64 lowercase hex characters")
-    return value
 
 
 class FeeSplit(BaseModel):
@@ -298,6 +283,18 @@ class PaymentRequired(X402Header):
             raise ValueError(f"platformFee.feeAmount must be {split.fee_sompi} for amount {self.amount}")
         return self
 
+    @classmethod
+    def from_header(cls, value: str) -> Self:
+        """Decode a PAYMENT-REQUIRED header into the kaspa-exact-v1 terms.
+
+        CONTRACT v2.10 headers are a `PaymentRequiredEnvelope`; its `kaspa-exact-v1` accepts entry is returned. A flat
+        pre-v2.7 header is still accepted as is.
+        """
+        data = decode_header_json(value, MAX_HEADER_BYTES)
+        if isinstance(data, dict) and "accepts" in data:
+            return cls.model_validate(PaymentRequiredEnvelope.model_validate(data).v1_terms().model_dump())
+        return cls.model_validate(data)
+
     @property
     def merchant_amount_sompi(self) -> int:
         return int(self.amount) - int(self.platformFee.feeAmount)
@@ -326,6 +323,126 @@ class PaymentRequired(X402Header):
             platformFee=PlatformFee(feeTo=settings.kasgate_treasury_address, feeAmount=str(split.fee_sompi)),
             extra=extra,
         )
+
+
+class KasGateV1Requirements(StrictModel):
+    """The `kaspa-exact-v1` entry of the CONTRACT v2.10 `accepts[]`: the v1 terms without `x402Version`.
+
+    Official kaspa-x402 clients skip this entry (unknown scheme); KasGate clients select it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    scheme: Literal["kaspa-exact-v1"]
+    network: KaspaNetwork
+    asset: Literal["KAS"]
+    amount: SompiStr
+    payTo: str
+    platformFee: PlatformFee
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    expiresAt: datetime
+    extra: PaymentRequiredExtra | None = None
+
+    @model_validator(mode="after")
+    def _same_rules_as_v1(self) -> Self:
+        self.as_payment_required()
+        return self
+
+    def as_payment_required(self) -> PaymentRequired:
+        return PaymentRequired.model_validate({"x402Version": 2, **self.model_dump()})
+
+    @classmethod
+    def from_required(cls, required: PaymentRequired) -> Self:
+        return cls.model_validate(required.model_dump(exclude={"x402Version"}))
+
+
+AcceptsEntry = Annotated[ExactV2Requirements | KasGateV1Requirements, Field(discriminator="scheme")]
+
+
+class PaymentRequiredEnvelope(BaseModel):
+    """Body of the CONTRACT v2.10 PAYMENT-REQUIRED header: an x402 v2 envelope offering both bindings.
+
+    * `accepts[0]` is the community kaspa-x402 `exact` / `kaspa-exact-v2` standard-native offer (merchant gets the full
+      list price, no platform fee), present whenever the price is payable on that path.
+    * The `kaspa-exact-v1` entry carries KasGate's own nonce-bound terms with the atomic merchant/treasury split.
+    * Backward compatibility: the same v1 terms are ALSO mirrored at the top level (`scheme`, `network`, `asset`,
+      `amount`, `payTo`, `platformFee`, `nonce`, `expiresAt`), so pre-v2.7 readers that look up those keys keep
+      working. The envelope schema allows additional top-level properties, so official clients ignore the mirror.
+    * Encoded as canonical (key-sorted) JSON then standard Base64, like @kaspa-x402/core.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    x402Version: Literal[2]
+    resource: ResourceInfo
+    accepts: Annotated[list[AcceptsEntry], Field(min_length=1, max_length=EXACT_V2_MAX_ACCEPTS)]
+    extensions: PaymentExtensions | None = None
+    error: Annotated[str, Field(max_length=500)] | None = None
+    # v1 mirror (pre-v2.7 flat header fields)
+    scheme: Literal["kaspa-exact-v1"]
+    network: KaspaNetwork
+    asset: Literal["KAS"]
+    amount: SompiStr
+    payTo: str
+    platformFee: PlatformFee
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    expiresAt: datetime
+    extra: PaymentRequiredExtra | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        v1 = [entry for entry in self.accepts if isinstance(entry, KasGateV1Requirements)]
+        v2 = [entry for entry in self.accepts if isinstance(entry, ExactV2Requirements)]
+        if len(v1) != 1 or len(v2) > 1:
+            raise ValueError("accepts must hold exactly one kaspa-exact-v1 entry and at most one exact entry")
+        if v1[0].model_dump() != self.model_dump(include=set(KasGateV1Requirements.model_fields)):
+            raise ValueError("top-level kaspa-exact-v1 terms must mirror the kaspa-exact-v1 accepts entry")
+        if v2 and not isinstance(self.accepts[0], ExactV2Requirements):
+            raise ValueError("the exact (kaspa-exact-v2) entry must come first")
+        if bool(v2) != (self.extensions is not None):
+            raise ValueError("the payment-identifier extension is advertised exactly when the exact entry is")
+        if v2 and (v2[0].network != v1[0].network or v2[0].payTo != v1[0].payTo):
+            raise ValueError("both bindings must pay the same merchant on the same network")
+        return self
+
+    @classmethod
+    def build(
+        cls,
+        required: PaymentRequired,
+        exact: ExactV2Requirements | None,
+        *,
+        resource_url: str,
+        description: str | None = None,
+        error: str | None = None,
+    ) -> Self:
+        accepts: list[ExactV2Requirements | KasGateV1Requirements] = []
+        if exact is not None:
+            accepts.append(exact)
+        accepts.append(KasGateV1Requirements.from_required(required))
+        return cls(
+            x402Version=2,
+            resource=ResourceInfo(url=resource_url, description=description),
+            accepts=accepts,
+            extensions=PaymentExtensions.required_identifier() if exact is not None else None,
+            error=error,
+            **required.model_dump(exclude={"x402Version"}),
+        )
+
+    def v1_terms(self) -> PaymentRequired:
+        return next(e for e in self.accepts if isinstance(e, KasGateV1Requirements)).as_payment_required()
+
+    def exact_v2(self) -> ExactV2Requirements | None:
+        return next((e for e in self.accepts if isinstance(e, ExactV2Requirements)), None)
+
+    def wire(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    def to_header(self) -> str:
+        return encode_canonical_header(self.wire())
+
+    @classmethod
+    def from_header(cls, value: str) -> Self:
+        return cls.model_validate(decode_header_json(value, MAX_HEADER_BYTES))
 
 
 class PaymentSignature(X402Header):
@@ -506,7 +623,9 @@ class K402PaymentHeader(BaseModel):
         return f"{self.scheme} {self.tx_id} {self.payment_id}"
 
 
-PaymentOffer = Annotated[PaymentRequired | K402UtxoOffer, Field(discriminator="scheme")]
+# CONTRACT v2.10: a fresh-challenge 402 body lists the kaspa-exact-v1 terms, the k402 offer and the kaspa-x402
+# `exact` (kaspa-exact-v2) entry; each client family skips the schemes it does not know.
+PaymentOffer = Annotated[PaymentRequired | K402UtxoOffer | ExactV2Requirements, Field(discriminator="scheme")]
 
 
 class X402ErrorBody(StrictModel):
@@ -531,6 +650,7 @@ class X402ErrorBody(StrictModel):
         "endpoint_not_found",
         "method_not_allowed",
         "upstream_error",
+        "invalid_exact_payment",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -868,7 +988,8 @@ class SettlementRead(ReadModel):
     payment_scheme: PaymentScheme
     payer_address: str | None
     merchant_address: str
-    treasury_address: str
+    treasury_address: str | None
+    """None on kaspa-exact-v2 settlements: that path has no treasury output (no platform fee during the beta)."""
     amount_sompi: int
     merchant_amount_sompi: int
     fee_amount_sompi: int
@@ -879,7 +1000,10 @@ class SettlementRead(ReadModel):
     request_method: str
     request_path: str
     upstream_status_code: int | None
-    payment_nonce: str
+    payment_nonce: str | None
+    """Challenge nonce (kaspa-exact-v1, k402 internal); None on kaspa-exact-v2 settlements."""
+    payment_identifier: str | None
+    """kaspa-exact-v2 payment-identifier; None on kaspa-exact-v1 settlements."""
     delivery_attempts: int
     created_at: datetime
     settled_at: datetime | None

@@ -29,6 +29,22 @@ k402 client pays it itself and retries with `X-K402-Payment: kaspa-utxo <txid> <
    no payload or payerProof). `payment_not_found` is a 402 so k402 clients retry the same header,
 4. stores the settlement (unique `tx_id`, `payment_nonce` and `k402_payment_id`) and consumes the offer.
 
+kaspa-x402 ``exact`` / ``kaspa-exact-v2`` standard-native (CONTRACT v2.10)
+-----------------------------------------------------------------------
+Every fresh-challenge 402 also offers the community kaspa-x402 binding. The `PAYMENT-REQUIRED` header becomes ONE
+x402 v2 envelope (`PaymentRequiredEnvelope`): `accepts = [<exact kaspa-exact-v2 entry>, <kaspa-exact-v1 terms>]`, the
+payment-identifier extension, `resource.url` = the public request URL, and the kaspa-exact-v1 terms mirrored at the
+top level for pre-v2.10 readers. The body keeps the k402 shape and appends the exact entry to its `accepts` list. The
+exact entry pays the merchant the SAME locked sompi amount as the v1 challenge (USD endpoints: the same single oracle
+quote), with NO platform fee; it is stored as `kasgate:exact:{slug}:{paymentRequirementsHash}` with the locked rate.
+A PAYMENT-SIGNATURE whose JSON is an x402 v2 PaymentPayload (`accepted` / `payload`) takes `_pay_with_exact_v2`:
+`accepted` must be a stored offer for this slug, `requestHash` must equal the gateway's own fingerprint of method +
+public URL + body + requirements, then the pure verifier, `SET kasgate:pid:{payment identifier} NX` and the SHARED
+`SET kasgate:tx:{txId} NX`, node lookup, submit with `accepted` finality, a settlement row with payment_scheme
+`kaspa-exact-v2` and fee 0, and a `PAYMENT-RESPONSE` SettlementResponse. Retrying the same payment identifier with
+the same request and transaction is idempotent (redelivery rules below); the same identifier with another request is
+a 409 conflict.
+
 Redelivery: the same txId + nonce + slug (and the same payer, method and path) whose settlement has no upstream
 status or a 5xx one, inside `redelivery_window_seconds` and below `redelivery_max_attempts` deliveries, is
 forwarded again and counted in `Settlement.delivery_attempts`. Anything else for a settled txId is 409.
@@ -39,7 +55,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -67,9 +83,10 @@ from app.deps import (
     get_oracle,
     get_redis,
 )
-from app.kaspa_engine import PaymentVerificationError, RpcUnavailableError
+from app.exact_v2 import ExactV2Verification, check_authorization_expiry
 from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
 from app.oracle import OracleUnavailableError, usd_value
+from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.schemas import (
     HEADER_K402_PAYMENT,
     HEADER_PAYMENT_REQUIRED,
@@ -81,6 +98,7 @@ from app.schemas import (
     K402PaymentHeader,
     K402UtxoOffer,
     PaymentRequired,
+    PaymentRequiredEnvelope,
     PaymentRequiredExtra,
     PaymentResponse,
     PaymentScheme,
@@ -99,6 +117,21 @@ from app.security import (
     decrypt_headers,
     enforce_rate_limit,
 )
+from app.x402_v2 import (
+    EXACT_V2_FINALITY,
+    EXACT_V2_PROFILE,
+    EXACT_V2_TRANSACTION_ENCODING,
+    ExactV2PaymentPayload,
+    ExactV2Requirements,
+    KasGateSettlementExtension,
+    KaspaSettlementExtension,
+    SettlementExtensions,
+    SettlementResponse,
+    canonical_json,
+    decode_header_json,
+    http_request_hash,
+    payment_requirements_hash,
+)
 
 logger = logging.getLogger("kasgate.proxy")
 
@@ -110,6 +143,11 @@ K402_OFFER_PREFIX: Final = "kasgate:k402:"
 K402_LOCK_PREFIX: Final = "kasgate:k402lock:"
 SCHEME_V1: Final[PaymentScheme] = "kaspa-exact-v1"
 SCHEME_K402: Final[PaymentScheme] = "k402-kaspa-utxo"
+SCHEME_EXACT_V2: Final[PaymentScheme] = "kaspa-exact-v2"
+EXACT_OFFER_PREFIX: Final = "kasgate:exact:"
+PAYMENT_IDENTIFIER_LOCK_PREFIX: Final = "kasgate:pid:"
+# kaspa-exact-v2 PaymentPayloads carry a whole transaction, so they get a larger header budget than v1 headers.
+MAX_EXACT_V2_HEADER_BYTES: Final = 65_536
 DELIVERY_LOCK_PREFIX: Final = "kasgate:delivery:"
 DELIVERY_LOCK_TTL_SECONDS: Final = 60
 DEAD_LETTER_KEY: Final = "kasgate:deadletter:settlements"
@@ -149,6 +187,7 @@ _DROPPED_RESPONSE_HEADERS: Final[frozenset[str]] = (
 _VERIFICATION_CODES: Final[frozenset[str]] = frozenset(
     {"invalid_payment_header", "underpaid", "invalid_fee_split", "wrong_network", "tx_rejected"}
 )
+_EXACT_V2_VERIFICATION_CODES: Final[frozenset[str]] = _VERIFICATION_CODES | {"invalid_exact_payment"}
 _K402_VERIFICATION_CODES: Final[frozenset[str]] = _VERIFICATION_CODES | {"payment_not_found"}
 
 router = APIRouter(tags=["proxy"])
@@ -174,6 +213,14 @@ def k402_lock_key(payment_id: str) -> str:
     return f"{K402_LOCK_PREFIX}{payment_id}"
 
 
+def exact_offer_key(slug: str, requirements_hash: str) -> str:
+    return f"{EXACT_OFFER_PREFIX}{slug}:{requirements_hash}"
+
+
+def payment_identifier_lock_key(payment_identifier: str) -> str:
+    return f"{PAYMENT_IDENTIFIER_LOCK_PREFIX}{payment_identifier}"
+
+
 def delivery_lock_key(tx_id: str) -> str:
     return f"{DELIVERY_LOCK_PREFIX}{tx_id}"
 
@@ -188,23 +235,28 @@ def _error(
     *,
     required: PaymentRequired | None = None,
     offer: K402UtxoOffer | None = None,
+    exact: ExactV2Requirements | None = None,
+    envelope: PaymentRequiredEnvelope | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """x402 error response. `error` outside the X402ErrorBody vocabulary yields a plain `{error, message}` body.
 
     With `required`, `accepts` lists the v1 terms (also sent as `PAYMENT-REQUIRED`); with `offer` too, the body is a
-    k402 offer body (`k402` set, the `kaspa-utxo` offer appended). Every 503 carries `Retry-After`; 429 callers pass
-    the limiter's own `Retry-After`.
+    k402 offer body (`k402` set, the `kaspa-utxo` offer appended). With `exact` the kaspa-exact-v2 entry is appended
+    too, and `envelope` (CONTRACT v2.10) replaces the flat v1 `PAYMENT-REQUIRED` header. Every 503 carries
+    `Retry-After`; 429 callers pass the limiter's own `Retry-After`.
     """
     out_headers = dict(headers or {})
     if status_code == 503:
         out_headers.setdefault("Retry-After", SERVICE_UNAVAILABLE_RETRY_SECONDS)
     accepts: list[dict[str, object]] | None = None
     if required is not None:
-        out_headers[HEADER_PAYMENT_REQUIRED] = required.to_header()
+        out_headers[HEADER_PAYMENT_REQUIRED] = envelope.to_header() if envelope is not None else required.to_header()
         accepts = [required.model_dump(mode="json", exclude_none=True)]
         if offer is not None:
             accepts.append(offer.model_dump(mode="json"))
+        if exact is not None:
+            accepts.append(exact.wire())
     try:
         content = X402ErrorBody.model_validate(
             {
@@ -217,6 +269,40 @@ def _error(
     except ValueError:
         content = {"error": error, "message": message}
     return JSONResponse(status_code=status_code, content=content, headers=out_headers)
+
+
+def resource_url(request: Request) -> str:
+    """The public URL of this request: the x402 `resource.url` and the URL of the request fingerprint.
+
+    `PUBLIC_BASE_URL` + the raw (still percent-encoded) path + the raw query, which is what a WHATWG client calling
+    the gateway at its public URL has as `new URL(...).href` without the fragment.
+    """
+    raw_path = request.scope.get("raw_path")
+    path = raw_path.decode("latin-1").split("?", 1)[0] if isinstance(raw_path, bytes) else request.url.path
+    query = request.scope.get("query_string", b"")
+    query_text = query.decode("latin-1") if isinstance(query, bytes) else ""
+    return f"{get_settings().public_base_url}{path}" + (f"?{query_text}" if query_text else "")
+
+
+def _exact_settlement_header(settlement: Settlement, payment_output_index: int) -> str:
+    usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
+    return SettlementResponse(
+        success=True,
+        transaction=settlement.tx_id,
+        network=get_settings().kaspa_network,
+        payer=settlement.payer_address or "",
+        amount=str(settlement.amount_sompi),
+        extensions=SettlementExtensions(
+            kaspa=KaspaSettlementExtension(
+                exactProfile=EXACT_V2_PROFILE,
+                paymentOutputIndex=payment_output_index,
+                finality=EXACT_V2_FINALITY,
+                requestHash=settlement.request_hash or "",
+                transactionEncoding=EXACT_V2_TRANSACTION_ENCODING,
+            ),
+            kasgate=KasGateSettlementExtension(platformFeeSompi="0", usdValueAtSettlement=usd.quantize(USD_QUANTUM)),
+        ),
+    ).to_header()
 
 
 def _payment_response_header(verified_tx_id: str, usd: Decimal) -> str:
@@ -407,6 +493,8 @@ def _settlement_payload(settlement: Settlement, endpoint_slug: str) -> str:
     return json.dumps(
         {
             "txId": settlement.tx_id,
+            "paymentIdentifier": settlement.payment_identifier,
+            "requestHash": settlement.request_hash,
             "paymentNonce": settlement.payment_nonce,
             "paymentScheme": settlement.payment_scheme,
             "k402PaymentId": settlement.k402_payment_id,
@@ -482,11 +570,13 @@ class SettlementTerms:
 
     scheme: PaymentScheme
     network: str
-    treasury_address: str
-    nonce: str
+    treasury_address: str | None  # None for kaspa-exact-v2: no treasury output
+    nonce: str | None  # None for kaspa-exact-v2: bound by payment identifier and request hash instead
     k402_payment_id: str | None
-    consume_key: str  # Redis key of the offer, consumed after the settlement is stored
+    consume_key: str | None  # Redis key of the offer, consumed after the settlement is stored
     locked_rate: Decimal | None  # KAS/USD rate locked into a USD-priced quote, used for the settlement's USD value
+    payment_identifier: str | None = None
+    request_hash: str | None = None
 
     @classmethod
     def for_v1(cls, required: PaymentRequired) -> "SettlementTerms":
@@ -498,6 +588,22 @@ class SettlementTerms:
             k402_payment_id=None,
             consume_key=nonce_key(required.nonce),
             locked_rate=_locked_quote_rate(required),
+        )
+
+    @classmethod
+    def for_exact_v2(cls, checked: ExactV2Verification, locked_rate: Decimal | None) -> "SettlementTerms":
+        # The exact offer is NOT consumed: a KAS-priced offer is shared by every 402 at that price, and the unique
+        # payment identifier, txId and request hash already make each settlement single-use.
+        return cls(
+            scheme=SCHEME_EXACT_V2,
+            network=get_settings().kaspa_network,
+            treasury_address=None,
+            nonce=None,
+            k402_payment_id=None,
+            consume_key=None,
+            locked_rate=locked_rate,
+            payment_identifier=checked.payment_identifier,
+            request_hash=checked.request_hash,
         )
 
     @classmethod
@@ -542,6 +648,8 @@ def _new_settlement(
         request_path=request.url.path,
         payment_nonce=terms.nonce,
         k402_payment_id=terms.k402_payment_id,
+        payment_identifier=terms.payment_identifier,
+        request_hash=terms.request_hash,
         delivery_attempts=1,
         created_at=now,
         settled_at=now,
@@ -640,6 +748,61 @@ async def issue_payment_offers(
     return required, offer
 
 
+@dataclass(frozen=True)
+class StoredExactOffer:
+    slug: str
+    requirement: ExactV2Requirements
+    locked_rate: Decimal | None
+
+
+async def issue_exact_offer(redis: Redis, endpoint: Endpoint, required: PaymentRequired) -> ExactV2Requirements | None:
+    """The kaspa-exact-v2 entry for a freshly minted v1 challenge, stored for `payment_max_age_seconds`.
+
+    `amount` is the v1 challenge's LOCKED total (`required.amount`; USD endpoints: the same oracle quote), paid in full
+    to the merchant: no platform fee on this binding. Stored as `kasgate:exact:{slug}:{paymentRequirementsHash}` with
+    the locked rate, because a client returns `accepted` verbatim and a USD amount cannot be re-quoted at payment
+    time. Returns None when the amount is below the v2 merchant-output minimum. Raises RedisError.
+    """
+    settings = get_settings()
+    try:
+        requirement = ExactV2Requirements.for_merchant(
+            network=settings.kaspa_network,
+            amount_sompi=int(required.amount),
+            pay_to=required.payTo,
+            max_timeout_seconds=settings.payment_max_age_seconds,
+        )
+    except ValueError:
+        return None
+    record = canonical_json(
+        {
+            "slug": endpoint.slug,
+            "requirement": requirement.wire(),
+            "kasUsdRate": required.extra.kasUsdRate if required.extra is not None else None,
+        }
+    )
+    key = exact_offer_key(endpoint.slug, payment_requirements_hash(requirement))
+    await redis.set(key, record, ex=settings.payment_max_age_seconds)
+    return requirement
+
+
+async def _load_exact_offer(redis: Redis, slug: str, accepted: ExactV2Requirements) -> StoredExactOffer | None:
+    """The stored offer matching the client's `accepted` for this slug, or None when missing, expired or unreadable."""
+    raw = await redis.get(exact_offer_key(slug, payment_requirements_hash(accepted)))
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        requirement = ExactV2Requirements.model_validate(data["requirement"])
+        stored_slug, raw_rate = data["slug"], data.get("kasUsdRate")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        logger.error("stored kaspa-exact-v2 offer for %s is unreadable", slug, exc_info=True)
+        return None
+    locked_rate = _parse_locked_rate(raw_rate)
+    if stored_slug != slug or requirement != accepted or (raw_rate is not None and locked_rate is None):
+        return None
+    return StoredExactOffer(slug=slug, requirement=requirement, locked_rate=locked_rate)
+
+
 async def _load_k402_offer(redis: Redis, payment_id: str) -> StoredK402Offer | None:
     """The offer stored for `payment_id`, or None when it is missing, expired or unreadable."""
     raw = await redis.get(k402_offer_key(payment_id))
@@ -716,6 +879,7 @@ async def _challenge_error(
             return _limit_error(exc)
     try:
         required, offer = await issue_payment_offers(redis, endpoint, merchant_address, oracle)
+        exact = await issue_exact_offer(redis, endpoint, required)
     except OracleUnavailableError as exc:
         logger.warning("USD price unavailable for %s: %s", endpoint.slug, exc)
         return _error(503, "price_unavailable", "KAS/USD price is temporarily unavailable")
@@ -725,7 +889,14 @@ async def _challenge_error(
     except RedisError:
         logger.exception("payment challenge store unavailable")
         return _error(503, "service_unavailable", "payment challenges are temporarily unavailable")
-    return _error(402, error, message, required=required, offer=offer)
+    envelope = PaymentRequiredEnvelope.build(
+        required,
+        exact,
+        resource_url=resource_url(request),
+        description=endpoint.name[:500] if endpoint.name else None,
+        error=error,
+    )
+    return _error(402, error, message, required=required, offer=offer, exact=exact, envelope=envelope)
 
 
 def _verification_failure(exc: PaymentVerificationError, required: PaymentRequired) -> JSONResponse:
@@ -839,6 +1010,7 @@ async def _redeliver(
     settlement: Settlement,
     method: str,
     prepared: PreparedUpstream,
+    payment_response: str | None = None,
 ) -> Response:
     settings = get_settings()
     tx_id = settlement.tx_id
@@ -858,10 +1030,10 @@ async def _redeliver(
             return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
         if not claimed:
             return _error(409, "payment_replayed", "this transaction was already used")
-        usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
-        return await _forward_and_record(
-            session, client, method, prepared, settlement.id, tx_id, _payment_response_header(tx_id, usd)
-        )
+        if payment_response is None:
+            usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
+            payment_response = _payment_response_header(tx_id, usd)
+        return await _forward_and_record(session, client, method, prepared, settlement.id, tx_id, payment_response)
     finally:
         await _drop_delivery_lock(redis, tx_id)
 
@@ -912,6 +1084,7 @@ async def _settle_and_deliver(
     verified: VerifiedPaymentLike,
     method: str,
     prepared: PreparedUpstream,
+    payment_response: Callable[[Settlement], str] | None = None,
 ) -> Response:
     tx_id = verified.tx_id
     rate = await _lookup_rate(oracle, terms)
@@ -931,15 +1104,18 @@ async def _settle_and_deliver(
         await _dead_letter_settlement(redis, unrecorded_payload)
         return _error(503, "service_unavailable", "payment was accepted but could not be recorded; contact support")
 
-    try:
-        await redis.getdel(terms.consume_key)
-    except RedisError:
-        logger.warning("could not consume %s; the settlement's unique keys still block reuse", terms.consume_key)
+    if terms.consume_key is not None:
+        try:
+            await redis.getdel(terms.consume_key)
+        except RedisError:
+            logger.warning("could not consume %s; the settlement's unique keys still block reuse", terms.consume_key)
 
-    usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
-    return await _forward_and_record(
-        session, client, method, prepared, settlement_id, tx_id, _payment_response_header(tx_id, usd)
-    )
+    if payment_response is not None:
+        header = payment_response(settlement)
+    else:
+        usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
+        header = _payment_response_header(tx_id, usd)
+    return await _forward_and_record(session, client, method, prepared, settlement_id, tx_id, header)
 
 
 # ---------------------------------------------------------------- the route
@@ -1009,6 +1185,11 @@ async def paywalled_proxy(
             "payment_required",
             "payment is required to access this resource",
             limited=False,
+        )
+    exact_v2_data = _exact_v2_header_data(signature_header)
+    if exact_v2_data is not None:
+        return await _pay_with_exact_v2(
+            request, session, redis, client, engine, oracle, endpoint, merchant_address, path, exact_v2_data
         )
     try:
         signature = PaymentSignature.from_header(signature_header)
@@ -1250,3 +1431,248 @@ async def _release_k402_locks(redis: Redis, tx_id: str, payment_id: str) -> None
         await redis.delete(lock_key(tx_id), k402_lock_key(payment_id))
     except RedisError:
         logger.error("could not release replay lock for %s; it will expire in %ss", tx_id, REPLAY_LOCK_TTL_SECONDS)
+
+
+# ---------------------------------------------------------------- kaspa-exact-v2 (CONTRACT v2.10)
+
+
+def _exact_v2_header_data(header: str) -> dict[str, object] | None:
+    """The decoded header when it is an x402 v2 PaymentPayload (has `accepted` or `payload`), else None (v1)."""
+    try:
+        data = decode_header_json(header, MAX_EXACT_V2_HEADER_BYTES)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and ("accepted" in data or "payload" in data):
+        return data
+    return None
+
+
+def _request_body_text(body: bytes) -> str | None:
+    """The body as the official client fingerprints it: the text it sent, JSON null when there is none."""
+    if not body:
+        return None
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PaymentVerificationError(
+            "invalid_exact_payment", "kaspa-exact-v2 requests must have no body or a UTF-8 text body"
+        ) from exc
+
+
+async def _find_exact_settlement(session: AsyncSession, tx_id: str, payment_identifier: str) -> Settlement | None:
+    """The settlement that already uses this txId (any binding) or this payment identifier; the txId match wins."""
+    rows = (
+        (
+            await session.execute(
+                select(Settlement).where(
+                    or_(Settlement.tx_id == tx_id, Settlement.payment_identifier == payment_identifier)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if row.tx_id == tx_id:
+            return row
+    return rows[0] if rows else None
+
+
+def _exact_redelivery_allowed(
+    settings: Settings,
+    settlement: Settlement,
+    checked: ExactV2Verification,
+    endpoint: Endpoint,
+    request: Request,
+) -> bool:
+    """payment-identifier idempotency: the same identifier, transaction, request fingerprint, payer, endpoint, method
+    and path, with no upstream result or a 5xx, inside the redelivery window and below the attempt cap. The request
+    was re-verified in full (authorization signature included) before this is consulted."""
+    if settlement.status != SettlementStatus.SETTLED or settlement.settled_at is None:
+        return False
+    age = datetime.now(UTC) - settlement.settled_at
+    return (
+        settlement.payment_scheme == SCHEME_EXACT_V2
+        and settlement.tx_id == checked.payment.tx_id
+        and settlement.payment_identifier == checked.payment_identifier
+        and settlement.request_hash == checked.request_hash
+        and settlement.payer_address == checked.payment.payer_address
+        and settlement.endpoint_id == endpoint.id
+        and settlement.request_method == request.method
+        and settlement.request_path == request.url.path
+        and (settlement.upstream_status_code is None or settlement.upstream_status_code >= 500)
+        and age < timedelta(seconds=settings.redelivery_window_seconds)
+        and settlement.delivery_attempts < settings.redelivery_max_attempts
+    )
+
+
+async def _release_exact_locks(redis: Redis, tx_id: str, payment_identifier: str) -> None:
+    try:
+        await redis.delete(lock_key(tx_id), payment_identifier_lock_key(payment_identifier))
+    except RedisError:
+        logger.error("could not release replay lock for %s; it will expire in %ss", tx_id, REPLAY_LOCK_TTL_SECONDS)
+
+
+async def _exact_failure(
+    request: Request,
+    redis: Redis,
+    endpoint: Endpoint,
+    merchant_address: str,
+    oracle: RateProvider,
+    exc: PaymentVerificationError,
+) -> JSONResponse:
+    if isinstance(exc, RpcUnavailableError):
+        logger.warning("kaspa-exact-v2 payment not settled, node unavailable: %s", exc.message)
+        return _error(503, "rpc_unavailable", exc.message, headers={"Retry-After": "5"})
+    if exc.code == "payment_replayed":
+        return _error(409, "payment_replayed", exc.message)
+    code = exc.code if exc.code in _EXACT_V2_VERIFICATION_CODES else "tx_rejected"
+    return await _challenge_error(request, redis, endpoint, merchant_address, oracle, code, exc.message)
+
+
+async def _unknown_exact_offer(
+    request: Request, redis: Redis, endpoint: Endpoint, merchant_address: str, oracle: RateProvider
+) -> JSONResponse:
+    """`accepted` is not a live offer for this slug (never issued, altered, or expired): 402 with fresh offers."""
+    return await _challenge_error(
+        request,
+        redis,
+        endpoint,
+        merchant_address,
+        oracle,
+        "payment_expired",
+        "invalid_kaspa_x402_accepted: `accepted` is not a current kaspa-exact-v2 offer for this resource "
+        "(unknown, altered or expired); pay the fresh offer",
+    )
+
+
+async def _pay_with_exact_v2(
+    request: Request,
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    engine: PaymentVerifier,
+    oracle: RateProvider,
+    endpoint: Endpoint,
+    merchant_address: str,
+    path: str,
+    data: dict[str, object],
+) -> Response:
+    """CONTRACT v2.10: a paid call whose PAYMENT-SIGNATURE is a kaspa-x402 `exact` / `kaspa-exact-v2` PaymentPayload.
+
+    `accepted` must be an offer this gateway issued for this slug (stored with its LOCKED amount and rate); a settled
+    payment may also be recognised by its own `accepted` for idempotent redelivery after the offer has expired. Every
+    402 here carries fresh offers (rate limited like any new challenge).
+    """
+    settings = get_settings()
+    method = request.method.upper()
+    try:
+        payment = ExactV2PaymentPayload.model_validate(data)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        location = ".".join(str(part) for part in first["loc"])
+        return await _challenge_error(
+            request,
+            redis,
+            endpoint,
+            merchant_address,
+            oracle,
+            "invalid_payment_header",
+            f"{HEADER_PAYMENT_SIGNATURE} is not a valid kaspa-exact-v2 PaymentPayload ({location}: {first['msg']})",
+        )
+    try:
+        prepared = await _prepare_upstream(request, endpoint, path)
+    except RequestRejectedError as exc:
+        return _error(exc.status_code, exc.error, exc.message)
+
+    try:
+        stored = await _load_exact_offer(redis, endpoint.slug, payment.accepted)
+    except RedisError:
+        logger.exception("kaspa-exact-v2 offer store unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    # Without a stored offer the client's own `accepted` is only used to recognise an already-settled payment: the
+    # request hash binds it, and nothing is settled against it.
+    requirement = stored.requirement if stored is not None else payment.accepted
+
+    try:
+        request_hash = http_request_hash(
+            method, resource_url(request), _request_body_text(prepared.body), payment_requirements_hash(requirement)
+        )
+        # Pure checks first, without expiry so an idempotent retry of a settled payment can still be recognised.
+        checked = engine.verify_exact_v2(payment, requirement, request_hash=request_hash, check_expiry=False)
+    except PaymentVerificationError as exc:
+        if stored is None and not isinstance(exc, RpcUnavailableError):
+            return await _unknown_exact_offer(request, redis, endpoint, merchant_address, oracle)
+        return await _exact_failure(request, redis, endpoint, merchant_address, oracle, exc)
+    except Exception:
+        logger.exception("unexpected failure while checking a kaspa-exact-v2 payment")
+        return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
+    tx_id = checked.payment.tx_id
+    payment_identifier = checked.payment_identifier
+
+    try:
+        existing = await _find_exact_settlement(session, tx_id, payment_identifier)
+    except SQLAlchemyError:
+        logger.exception("settlement lookup failed")
+        return _error(503, "service_unavailable", "settlement store is temporarily unavailable")
+    if existing is not None:
+        if _exact_redelivery_allowed(settings, existing, checked, endpoint, request):
+            header = _exact_settlement_header(existing, checked.payment_output_index)
+            return await _redeliver(session, redis, client, existing, method, prepared, header)
+        if existing.payment_identifier == payment_identifier and existing.request_hash != request_hash:
+            message = "kaspa_payment_identifier_conflict: this payment identifier was used for a different request"
+        else:
+            message = "this transaction or payment identifier was already used"
+        return _error(409, "payment_replayed", message)
+
+    if stored is None:
+        return await _unknown_exact_offer(request, redis, endpoint, merchant_address, oracle)
+    try:
+        check_authorization_expiry(payment, requirement, datetime.now(UTC))
+    except PaymentVerificationError as exc:
+        return await _exact_failure(request, redis, endpoint, merchant_address, oracle, exc)
+
+    # payment-identifier claim first, then the replay lock SHARED with kaspa-exact-v1 and k402 (`kasgate:tx:{txId}`),
+    # so a refused txId lock never releases a lock owned by another request.
+    tx_locked = False
+    try:
+        if await redis.set(payment_identifier_lock_key(payment_identifier), tx_id, nx=True, ex=REPLAY_LOCK_TTL_SECONDS):
+            tx_locked = bool(await redis.set(lock_key(tx_id), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
+            if not tx_locked:
+                await redis.delete(payment_identifier_lock_key(payment_identifier))
+    except RedisError:
+        logger.exception("replay lock unavailable")
+        return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
+    if not tx_locked:
+        return _error(409, "payment_replayed", "this transaction or payment identifier is already being processed")
+
+    try:
+        await engine.resolve_exact_v2_inputs(checked)
+        verified = await engine.settle_exact_v2(checked)
+    except PaymentVerificationError as exc:
+        await _release_exact_locks(redis, tx_id, payment_identifier)
+        return await _exact_failure(request, redis, endpoint, merchant_address, oracle, exc)
+    except Exception:
+        await _release_exact_locks(redis, tx_id, payment_identifier)
+        logger.exception("unexpected failure while settling kaspa-exact-v2 tx %s", tx_id)
+        return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
+
+    output_index = checked.payment_output_index
+    await _hold_delivery_lock(redis, tx_id)
+    try:
+        return await _settle_and_deliver(
+            request,
+            session,
+            redis,
+            client,
+            oracle,
+            endpoint,
+            merchant_address,
+            SettlementTerms.for_exact_v2(checked, stored.locked_rate),
+            verified,
+            method,
+            prepared,
+            lambda row: _exact_settlement_header(row, output_index),
+        )
+    finally:
+        await _drop_delivery_lock(redis, tx_id)

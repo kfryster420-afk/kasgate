@@ -7,12 +7,13 @@ import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet
-from kaspa import Address, PrivateKey, PublicKey, pay_to_address_script, sign_message, verify_message
+from kaspa import Address, NetworkId, PrivateKey, PublicKey, pay_to_address_script, sign_message, verify_message
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key().decode()
 TREASURY = "kaspatest:qzxwgn9qu5mxn379rkp54zs729hrsr5v6045eu8hpze0x8r8caq57w49l62en"
@@ -49,6 +50,7 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
 from app.deps import get_sessionmaker  # noqa: E402
+from app.exact_v2 import ExactV2Verification, verify_exact_v2  # noqa: E402
 from app.kaspa_engine import PaymentVerificationError, VerifiedPayment  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models import Endpoint, Merchant, PriceCurrency  # noqa: E402
@@ -64,6 +66,7 @@ from app.schemas import (  # noqa: E402
     payer_proof_message,
 )
 from app.security import encrypt_headers, generate_api_key, hash_api_key  # noqa: E402
+from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements  # noqa: E402
 
 GATEWAY_DIR = Path(__file__).resolve().parent.parent
 
@@ -230,6 +233,46 @@ class StubEngine:
         if self.error is not None:
             raise self.error
         return verified
+
+    # CONTRACT v2.7: the pure kaspa-exact-v2 checks are the REAL verifier; only the node-facing steps are stubbed.
+    def verify_exact_v2(
+        self,
+        payment: ExactV2PaymentPayload,
+        requirement: ExactV2Requirements,
+        *,
+        request_hash: str,
+        now: datetime | None = None,
+        check_expiry: bool = True,
+    ) -> ExactV2Verification:
+        self.events.append("verify_exact_v2")
+        if self.verify_error is not None:
+            raise self.verify_error
+        checked = verify_exact_v2(
+            payment,
+            requirement,
+            request_hash=request_hash,
+            network_id=NetworkId("testnet-10"),
+            network_type="testnet",
+            now=now or datetime.now(UTC),
+            check_expiry=check_expiry,
+        )
+        self.verify_calls.append(checked.payment.tx_id)
+        return checked
+
+    async def resolve_exact_v2_inputs(self, verification: ExactV2Verification) -> None:
+        self.resolve_calls.append(verification.payment.tx_id)
+        self.events.append("resolve_exact_v2_inputs")
+        if self.resolve_error is not None:
+            raise self.resolve_error
+
+    async def settle_exact_v2(self, verification: ExactV2Verification) -> VerifiedPayment:
+        self.calls.append(verification.payment.tx_id)
+        self.events.append("settle_exact_v2")
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return verification.payment
 
     def fail(self, code: str, message: str = "rejected") -> None:
         """Make the submission step (`settle`) fail with a verification error."""

@@ -1,6 +1,7 @@
 """FastAPI dependency providers for shared application resources."""
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -10,7 +11,9 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import SessionLocal
+from app.exact_v2 import ExactV2Verification
 from app.schemas import K402UtxoOffer, PaymentRequired, PaymentSignature
+from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements
 
 
 class VerifiedPaymentLike(Protocol):
@@ -44,6 +47,20 @@ class PaymentVerifier(Protocol):
     async def settle(self, tx: Any, verified: Any, required: PaymentRequired) -> VerifiedPaymentLike: ...
 
     async def verify_k402(self, tx_id: str, offer: K402UtxoOffer) -> VerifiedPaymentLike: ...
+    # CONTRACT v2.10, community kaspa-x402 `exact` / `kaspa-exact-v2` standard-native
+    def verify_exact_v2(
+        self,
+        payment: ExactV2PaymentPayload,
+        requirement: ExactV2Requirements,
+        *,
+        request_hash: str,
+        now: datetime | None = None,
+        check_expiry: bool = True,
+    ) -> ExactV2Verification: ...
+
+    async def resolve_exact_v2_inputs(self, verification: ExactV2Verification) -> None: ...
+
+    async def settle_exact_v2(self, verification: ExactV2Verification) -> VerifiedPaymentLike: ...
 
 
 class RateProvider(Protocol):

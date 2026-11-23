@@ -522,7 +522,8 @@ async def fetch_offer(client: httpx.AsyncClient, slug: str = "weather") -> tuple
     assert response.status_code == 402, response.text
     body = response.json()
     assert body["k402"] == "0.2"
-    v1, k402 = body["accepts"]
+    v1, k402, exact = body["accepts"]  # CONTRACT v2.10 appends the kaspa-x402 exact entry
+    assert exact["scheme"] == "exact" and exact["amount"] == v1["amount"]
     required = PaymentRequired.from_header(response.headers[HEADER_PAYMENT_REQUIRED])
     assert PaymentRequired.model_validate(v1) == required
     return required, K402UtxoOffer.model_validate(k402)
