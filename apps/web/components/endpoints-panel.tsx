@@ -1,6 +1,6 @@
 "use client";
 
-import { Ban, ExternalLink, Pencil, Plus, RotateCcw, X } from "lucide-react";
+import { Ban, ExternalLink, FileCode2, Pencil, Plus, RotateCcw, X } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
@@ -8,6 +8,7 @@ import { formatKas, formatSompi } from "@/lib/sompi";
 import type { EndpointRead, EndpointUpdate } from "@/lib/types";
 import { CopyButton } from "./copy-button";
 import { EndpointForm } from "./endpoint-form";
+import { OpenApiImport } from "./openapi-import";
 import { ErrorBanner, StatusBadge } from "./ui";
 
 interface Props {
@@ -21,6 +22,7 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
 
   function handle(e: unknown, target: "list" | "form") {
     if (e instanceof ApiError && e.status === 401) {
@@ -78,10 +80,16 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
         <h2 id="endpoints-heading" className="text-lg font-medium text-zinc-100">
           Endpoints
         </h2>
-        <Link href="/onboarding" className="btn-secondary">
-          <Plus className="h-4 w-4" aria-hidden />
-          New endpoint
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className="btn-secondary" onClick={() => setImporting(true)}>
+            <FileCode2 className="h-4 w-4" aria-hidden />
+            Import from OpenAPI
+          </button>
+          <Link href="/onboarding" className="btn-secondary">
+            <Plus className="h-4 w-4" aria-hidden />
+            New endpoint
+          </Link>
+        </div>
       </div>
       <ErrorBanner message={error} />
       {endpoints.length === 0 ? (
@@ -162,6 +170,8 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
           </div>
         </div>
       ) : null}
+
+      {importing ? <OpenApiImport onClose={() => setImporting(false)} onImported={onChanged} onUnauthorized={onUnauthorized} /> : null}
     </section>
   );
 }

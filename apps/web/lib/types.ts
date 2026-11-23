@@ -218,6 +218,67 @@ export interface EndpointRead {
   proxy_url: string;
 }
 
+/* ------------------------------------------------------------------ OpenAPI import (POST /v1/endpoints/import) */
+
+export type OpenApiImportMode = "preview" | "create";
+
+/** One operation to create, addressed by method + path exactly as in the document; `price_sompi` overrides the default. */
+export interface OpenApiImportSelection {
+  method: HttpMethod;
+  path: string;
+  price_sompi?: Sompi;
+}
+
+/** Body accepted by POST /api/endpoints/import. Exactly one of `spec_text` / `spec_url`; sompi values are decimal strings. */
+export interface OpenApiImportBody {
+  mode: OpenApiImportMode;
+  spec_text?: string;
+  spec_url?: string;
+  upstream_base_url: string;
+  default_price_sompi: Sompi;
+  upstream_headers?: Record<string, string>;
+  category?: string;
+  is_public_listed?: boolean;
+  selections?: OpenApiImportSelection[];
+}
+
+export interface OpenApiOperationPreview {
+  /** Stable operation key: "<METHOD> <path>". */
+  key: string;
+  method: string;
+  path: string;
+  operation_id: string | null;
+  summary: string | null;
+  path_params: string[];
+  importable: boolean;
+  skip_reason: string | null;
+  slug: string | null;
+  upstream_url: string | null;
+  /** Buyer route, e.g. "/p/list-pets/{petId}": path parameters become the proxy path suffix. */
+  proxy_path: string | null;
+  proxy_url: string | null;
+  price_sompi: Sompi;
+}
+
+export interface OpenApiImportPreview {
+  mode: "preview";
+  openapi_version: string;
+  title: string | null;
+  api_version: string | null;
+  servers: string[];
+  operation_count: number;
+  importable_count: number;
+  default_price_sompi: Sompi;
+  min_price_sompi: Sompi;
+  operations: OpenApiOperationPreview[];
+}
+
+export interface OpenApiImportCreated {
+  mode: "create";
+  created_count: number;
+  created: EndpointRead[];
+}
+
 /* ------------------------------------------------------------------ analytics & tax */
 
 export interface SettlementRead {
@@ -351,4 +412,6 @@ export interface ApiErrorBody {
   error: string;
   /** Machine-readable X402ErrorCode from the gateway when available (e.g. "rpc_unavailable" for HTTP 503). */
   code?: string;
+  /** POST /api/endpoints/import only: per-selection errors keyed by the selection's index in the request. */
+  row_errors?: Record<string, string>;
 }

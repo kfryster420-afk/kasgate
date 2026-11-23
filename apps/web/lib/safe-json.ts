@@ -77,3 +77,29 @@ export function stringifyWithIntegers(value: Record<string, unknown>, intFields:
   const pattern = new RegExp(`"${marker}(-?\\d+)"`, "g");
   return JSON.stringify(copy).replace(pattern, "$1");
 }
+
+/**
+ * Like `stringifyWithIntegers`, but for nested data: every string value under a key in `intKeys`, at any depth,
+ * is emitted as a bare JSON integer (e.g. `selections[].price_sompi`). Values must be digit-only strings.
+ */
+export function stringifyWithIntegerKeys(value: unknown, intKeys: readonly string[]): string {
+  const marker = `__kg_int_${crypto.randomUUID()}__`;
+  const mark = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(mark);
+    if (node && typeof node === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+        if (intKeys.includes(key) && typeof child === "string") {
+          if (!/^-?\d+$/.test(child)) throw new Error(`${key} must be an integer string`);
+          out[key] = `${marker}${child}`;
+        } else {
+          out[key] = mark(child);
+        }
+      }
+      return out;
+    }
+    return node;
+  };
+  const pattern = new RegExp(`"${marker}(-?\\d+)"`, "g");
+  return JSON.stringify(mark(value)).replace(pattern, "$1");
+}

@@ -129,3 +129,26 @@ export function curlCreateEndpoint(origin: string = GATEWAY_PUBLIC_URL): string 
   }'
 # -> {"slug": "weather-api-1a2b3c", "proxy_url": "${origin}/p/weather-api-1a2b3c", ...}`;
 }
+
+/** Copyable curl for an endpoint created by the OpenAPI import; path parameters are shell variables. */
+export function curlImported(proxyUrl: string, method: HttpMethod | string, url: string, variables: readonly string[]): string {
+  const flag = method === "GET" ? "" : ` -X ${method}`;
+  const lines: string[] = [];
+  if (variables.length > 0) {
+    lines.push(`# Path parameters for this operation:`);
+    for (const variable of variables) lines.push(`${variable}="..."`);
+    lines.push(``);
+  }
+  lines.push(
+    `# 1. Unpaid call: HTTP 402 plus a PAYMENT-REQUIRED header (Base64 JSON) with the nonce-bound terms.`,
+    `curl -i${flag} "${url}"`,
+    ``,
+    `# 2. Same terms as plain JSON, for agents and SDKs:`,
+    `curl -s ${gatewayOriginOf(proxyUrl)}/v1/quote/${slugOf(proxyUrl)}`,
+    ``,
+    `# 3. Paid retry with the signed transaction:`,
+    `curl -i${flag} "${url}" \\`,
+    `  -H "PAYMENT-SIGNATURE: $PAYMENT_SIGNATURE"`,
+  );
+  return lines.join("\n");
+}
