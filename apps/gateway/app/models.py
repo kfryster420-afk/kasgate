@@ -123,6 +123,9 @@ class Endpoint(TimestampMixin, Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     is_public_listed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # CONTRACT v2.11: paid only from a prepaid balance. Such an endpoint may be priced below the on-chain minimum
+    # (0.6 KAS) and its 402 offers no on-chain terms. Every endpoint also accepts prepaid debits.
+    prepaid_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     merchant: Mapped[Merchant] = relationship(back_populates="endpoints")
     settlements: Mapped[list["Settlement"]] = relationship(back_populates="endpoint")
@@ -221,3 +224,117 @@ class Settlement(Base):
             "payment_scheme = 'k402-kaspa-utxo' OR payer_address IS NOT NULL", name="payer_required_for_v1"
         ),
     )
+
+
+# ---------------------------------------------------------------- prepaid credit (CONTRACT v2.11)
+
+PREPAID_DEBIT_DEBITED = "debited"
+PREPAID_DEBIT_REFUNDED = "refunded"
+
+
+class PrepaidBalance(TimestampMixin, Base):
+    """One running prepaid credit balance per (buyer P2PK key, merchant).
+
+    KasGate holds no funds: every deposit already paid the merchant (output 0) and the treasury (output 1) on-chain.
+    The balance is an off-chain record of calls the merchant has been prepaid for. `balance_sompi` can never go
+    negative and always equals `deposited_sompi - debited_sompi` (refunded debits are subtracted from `debited_sompi`).
+    """
+
+    __tablename__ = "prepaid_balances"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
+    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    # x-only Schnorr key of the P2PK address that made the deposits; the only key that can authorise debits.
+    payer_public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    balance_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    deposited_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    debited_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index("ix_prepaid_balances_merchant_id_payer_public_key", "merchant_id", "payer_public_key", unique=True),
+        Index("ix_prepaid_balances_payer_address", "payer_address"),
+        CheckConstraint("balance_sompi >= 0", name="balance_not_negative"),
+        CheckConstraint("deposited_sompi >= 0 AND debited_sompi >= 0", name="totals_not_negative"),
+        CheckConstraint("balance_sompi = deposited_sompi - debited_sompi", name="balance_matches_totals"),
+        CheckConstraint("payer_public_key ~ '^[0-9a-f]{64}$'", name="payer_public_key_hex64"),
+    )
+
+
+class PrepaidDeposit(Base):
+    """A prepaid deposit: the on-chain kaspa-exact-v1 split payment (its `settlements` row) that funded a balance."""
+
+    __tablename__ = "prepaid_deposits"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    balance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prepaid_balances.id", ondelete="RESTRICT"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
+    settlement_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("settlements.id", ondelete="RESTRICT"), nullable=False
+    )
+    tx_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    deposit_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fee_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    credit_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_prepaid_deposits_tx_id", "tx_id", unique=True),
+        Index("ix_prepaid_deposits_settlement_id", "settlement_id", unique=True),
+        Index("ix_prepaid_deposits_balance_id", "balance_id"),
+        Index("ix_prepaid_deposits_merchant_created", "merchant_id", "created_at"),
+        CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
+        CheckConstraint("credit_sompi > 0 AND fee_sompi > 0", name="amounts_positive"),
+        CheckConstraint("credit_sompi + fee_sompi = deposit_sompi", name="split_sums_to_deposit"),
+    )
+
+
+class PrepaidDebit(Base):
+    """One off-chain prepaid call: a signed, single-use debit of a balance. Not revenue: the deposit was."""
+
+    __tablename__ = "prepaid_debits"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    balance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prepaid_balances.id", ondelete="RESTRICT"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("endpoints.id", ondelete="RESTRICT"), nullable=False
+    )
+    nonce: Mapped[str] = mapped_column(String(32), nullable=False)
+    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    amount_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kas_usd_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    usd_value: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default=PREPAID_DEBIT_DEBITED, server_default=PREPAID_DEBIT_DEBITED
+    )
+    request_method: Mapped[str] = mapped_column(String(10), nullable=False)
+    request_path: Mapped[str] = mapped_column(Text, nullable=False)
+    body_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upstream_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_prepaid_debits_nonce", "nonce", unique=True),
+        Index("ix_prepaid_debits_balance_id", "balance_id"),
+        Index("ix_prepaid_debits_merchant_created", "merchant_id", "created_at"),
+        Index("ix_prepaid_debits_endpoint_created", "endpoint_id", "created_at"),
+        CheckConstraint("amount_sompi > 0", name="amount_positive"),
+        CheckConstraint("nonce ~ '^[0-9a-f]{32}$'", name="nonce_hex32"),
+        CheckConstraint("body_hash ~ '^[0-9a-f]{64}$'", name="body_hash_hex64"),
+        CheckConstraint("status IN ('debited', 'refunded')", name="status_known"),
+        CheckConstraint("(status = 'refunded') = (refunded_at IS NOT NULL)", name="refunded_at_iff_refunded"),
+    )
+
