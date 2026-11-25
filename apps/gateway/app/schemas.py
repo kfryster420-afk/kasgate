@@ -14,10 +14,12 @@ from pydantic import (
     EmailStr,
     Field,
     HttpUrl,
+    ValidationError,
     computed_field,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from app.config import (
     BPS_DENOMINATOR,
@@ -875,11 +877,18 @@ OPENAPI_PREVIEW_TEXT_LENGTH = 200
 
 
 class OpenApiImportSelection(StrictModel):
-    """One operation to create, addressed by its stable key (method + path exactly as in the document)."""
+    """One operation to create, addressed by its stable key (method + path exactly as in the document).
+
+    A row override is in the import's default_price_currency: price_sompi for KAS imports, price_usd_micros for
+    USD imports. The request rejects an override in the other currency.
+    """
 
     method: HttpMethod
     path: str = Field(min_length=1, max_length=OPENAPI_MAX_PATH_LENGTH)
     price_sompi: Sompi | None = Field(default=None, description="Per-operation override of default_price_sompi.")
+    price_usd_micros: UsdMicros | None = Field(
+        default=None, description="Per-operation override of default_price_usd_micros."
+    )
 
     @field_validator("method", mode="before")
     @classmethod
@@ -894,11 +903,16 @@ class OpenApiImportSelection(StrictModel):
         return v
 
 
+def _price_error(loc: tuple[str | int, ...], message: str) -> InitErrorDetails:
+    return InitErrorDetails(type=PydanticCustomError("value_error", message), loc=loc, input=None)
+
+
 class OpenApiImportRequest(StrictModel):
     """POST /v1/endpoints/import body. Exactly one of spec_text / spec_url.
 
     mode="preview" lists the operations and creates nothing; mode="create" creates one endpoint per selection
-    in a single transaction (all-or-nothing).
+    in a single transaction (all-or-nothing). Prices follow EndpointCreate: default_price_currency KAS (the default)
+    needs default_price_sompi and no USD fields; USD needs default_price_usd_micros and no sompi fields.
     """
 
     mode: Literal["preview", "create"]
@@ -907,7 +921,9 @@ class OpenApiImportRequest(StrictModel):
         default=None, description="Public http(s) URL the gateway fetches the document from."
     )
     upstream_base_url: HttpUrl
-    default_price_sompi: Sompi
+    default_price_currency: PriceCurrency = PriceCurrency.KAS
+    default_price_sompi: Sompi | None = None
+    default_price_usd_micros: UsdMicros | None = None
     upstream_headers: dict[str, str] = Field(default_factory=dict, max_length=20)
     category: str | None = Field(default=None, max_length=60)
     is_public_listed: bool = True
@@ -922,8 +938,9 @@ class OpenApiImportRequest(StrictModel):
 
     @field_validator("default_price_sompi")
     @classmethod
-    def _price(cls, v: int) -> int:
-        compute_fee_split(v)
+    def _price(cls, v: int | None) -> int | None:
+        if v is not None:
+            compute_fee_split(v)
         return v
 
     @model_validator(mode="after")
@@ -938,7 +955,59 @@ class OpenApiImportRequest(StrictModel):
             keys = [(item.method, item.path) for item in self.selections]
             if len(set(keys)) != len(keys):
                 raise ValueError("each operation may be selected only once")
+        self._check_prices()
         return self
+
+    def _check_prices(self) -> None:
+        errors: list[InitErrorDetails] = []
+        if self.default_price_currency is PriceCurrency.KAS:
+            if self.default_price_sompi is None:
+                errors.append(
+                    _price_error(("default_price_sompi",), "default_price_sompi is required when price currency is KAS")
+                )
+            if self.default_price_usd_micros is not None:
+                errors.append(
+                    _price_error(
+                        ("default_price_usd_micros",),
+                        "default_price_usd_micros must be omitted when default_price_currency is KAS",
+                    )
+                )
+            wrong_field, wrong_message = "price_usd_micros", "price_usd_micros must be omitted in a KAS-priced import"
+        else:
+            if self.default_price_usd_micros is None:
+                errors.append(
+                    _price_error(
+                        ("default_price_usd_micros",),
+                        "default_price_usd_micros is required when default_price_currency is USD",
+                    )
+                )
+            if self.default_price_sompi is not None:
+                errors.append(
+                    _price_error(
+                        ("default_price_sompi",),
+                        "default_price_sompi must be omitted when default_price_currency is USD",
+                    )
+                )
+            wrong_field, wrong_message = "price_sompi", "price_sompi must be omitted in a USD-priced import"
+        for index, item in enumerate(self.selections or []):
+            if getattr(item, wrong_field) is not None:
+                errors.append(_price_error(("selections", index, wrong_field), wrong_message))
+        if errors:
+            raise ValidationError.from_exception_data(type(self).__name__, errors)
+
+    def default_price(self) -> tuple[PriceCurrency, int]:
+        """(currency, amount) of the default: sompi for KAS, micro-dollars for USD."""
+        if self.default_price_currency is PriceCurrency.USD:
+            assert self.default_price_usd_micros is not None  # noqa: S101 - enforced by _check_prices
+            return PriceCurrency.USD, self.default_price_usd_micros
+        assert self.default_price_sompi is not None  # noqa: S101 - enforced by _check_prices
+        return PriceCurrency.KAS, self.default_price_sompi
+
+    def row_price(self, selection: OpenApiImportSelection) -> tuple[PriceCurrency, int]:
+        """(currency, amount) for one selection: its override in the import currency, else the default."""
+        currency, amount = self.default_price()
+        override = selection.price_usd_micros if currency is PriceCurrency.USD else selection.price_sompi
+        return currency, amount if override is None else override
 
 
 class OpenApiOperationPreview(BaseModel):
@@ -954,7 +1023,9 @@ class OpenApiOperationPreview(BaseModel):
     upstream_url: str | None = Field(description="Upstream URL: base URL + the path up to the first {param} segment.")
     proxy_path: str | None = Field(description="Buyer route, e.g. /p/{slug}/{petId}; path params are the suffix.")
     proxy_url: str | None
-    price_sompi: int
+    price_currency: PriceCurrency
+    price_sompi: int | None = Field(description="Default KAS price; null when price_currency is USD.")
+    price_usd_micros: int | None = Field(description="Default USD price in micro-dollars; null when KAS.")
 
 
 class OpenApiImportPreview(BaseModel):
@@ -965,7 +1036,9 @@ class OpenApiImportPreview(BaseModel):
     servers: list[str]
     operation_count: int
     importable_count: int
-    default_price_sompi: int
+    default_price_currency: PriceCurrency
+    default_price_sompi: int | None
+    default_price_usd_micros: int | None
     min_price_sompi: int
     operations: list[OpenApiOperationPreview]
 

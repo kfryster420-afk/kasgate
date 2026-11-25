@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.api_routes as api_routes
 from app import security
-from app.models import Endpoint
+from app.models import Endpoint, PriceCurrency
 from app.openapi_import import (
     MAX_NESTING_DEPTH,
     OpenApiImportError,
@@ -31,7 +31,9 @@ from app.schemas import (
     EndpointRead,
     OpenApiImportCreated,
     OpenApiImportPreview,
+    PaymentRequired,
     min_price_sompi,
+    usd_micros_to_sompi,
 )
 from app.security import build_upstream_client, decrypt_headers
 from tests.conftest import (
@@ -47,6 +49,8 @@ BASE_URL = "https://api.petstore.example/v1"
 SPEC_URL = "https://specs.petstore.example/openapi.yaml"
 DEFAULT_PRICE = 100_000_000  # 1 KAS
 MIN_PRICE = 60_000_000
+USD_DEFAULT = 1_500_000  # $1.50
+USD_OVERRIDE = 2_250_000  # $2.25
 
 PETSTORE_30: dict[str, Any] = {
     "openapi": "3.0.3",
@@ -331,6 +335,202 @@ async def test_create_rejects_prices_below_the_minimum_per_row(
     )
     assert at_floor.status_code == 201
     assert await endpoint_count(sessionmaker) == before + 1
+
+
+def usd_body(mode: str = "preview", **overrides: Any) -> dict[str, Any]:
+    return body(
+        mode,
+        default_price_sompi=None,
+        default_price_currency="USD",
+        default_price_usd_micros=USD_DEFAULT,
+        **overrides,
+    )
+
+
+async def test_kas_default_is_unchanged_and_explicit_kas_matches_it(client: httpx.AsyncClient, seeded: Seed) -> None:
+    implicit = await preview(client, seeded)
+    explicit = await preview(client, seeded, default_price_currency="KAS")
+    for result in (implicit, explicit):
+        assert result.default_price_currency is PriceCurrency.KAS
+        assert result.default_price_sompi == DEFAULT_PRICE
+        assert result.default_price_usd_micros is None
+        for row in result.operations:
+            assert row.price_currency is PriceCurrency.KAS
+            assert row.price_sompi == DEFAULT_PRICE
+            assert row.price_usd_micros is None
+    raw = (await client.post("/v1/endpoints/import", json=body(), headers=bearer(seeded))).json()
+    assert raw["default_price_currency"] == "KAS" and raw["default_price_usd_micros"] is None
+    assert raw["operations"][0]["price_currency"] == "KAS"
+
+
+async def test_preview_with_a_usd_default_shows_usd_prices(client: httpx.AsyncClient, seeded: Seed) -> None:
+    response = await client.post("/v1/endpoints/import", json=usd_body(), headers=bearer(seeded))
+    assert response.status_code == 200, response.text
+    raw = response.json()
+    assert raw["default_price_currency"] == "USD"
+    assert raw["default_price_sompi"] is None
+    assert raw["default_price_usd_micros"] == USD_DEFAULT
+    assert raw["min_price_sompi"] == MIN_PRICE
+    importable = [row for row in raw["operations"] if row["importable"]]
+    assert len(importable) == 5
+    for row in raw["operations"]:
+        assert row["price_currency"] == "USD"
+        assert row["price_sompi"] is None
+        assert row["price_usd_micros"] == USD_DEFAULT
+
+
+async def test_create_with_a_usd_default_and_per_row_override(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_oracle: Any,
+) -> None:
+    selections = [
+        {"method": "GET", "path": "/pets"},
+        {"method": "GET", "path": "/pets/{petId}", "price_usd_micros": USD_OVERRIDE},
+    ]
+    response = await client.post(
+        "/v1/endpoints/import", json=usd_body("create", selections=selections), headers=bearer(seeded)
+    )
+    assert response.status_code == 201, response.text
+    raw = {row["slug"]: row for row in response.json()["created"]}
+    listed, show = raw["list-pets"], raw["show-pet-by-id"]
+    assert listed["price_currency"] == "USD"
+    assert listed["price_sompi"] is None and listed["price_kas"] is None
+    assert listed["price_usd_micros"] == USD_DEFAULT and listed["price_usd"] == "1.5"
+    assert show["price_currency"] == "USD"
+    assert show["price_sompi"] is None
+    assert show["price_usd_micros"] == USD_OVERRIDE and show["price_usd"] == "2.25"
+    OpenApiImportCreated.model_validate(response.json())
+    async with sessionmaker() as session:
+        stored = (await session.execute(select(Endpoint).where(Endpoint.slug == "show-pet-by-id"))).scalar_one()
+        assert stored.price_currency is PriceCurrency.USD
+        assert stored.price_sompi is None and stored.price_usd_micros == USD_OVERRIDE
+    listing = {item["slug"]: item for item in (await client.get("/v1/endpoints", headers=bearer(seeded))).json()}
+    assert listing["list-pets"]["price_currency"] == "USD" and listing["list-pets"]["price_sompi"] is None
+    # an imported USD endpoint quotes exactly like a hand-made one: one oracle conversion with the 0.6 KAS floor
+    quote = await client.get("/v1/quote/show-pet-by-id")
+    assert quote.status_code == 200, quote.text
+    required = PaymentRequired.model_validate(quote.json())
+    assert required.amount == str(usd_micros_to_sompi(USD_OVERRIDE, stub_oracle.rate))
+
+
+async def test_create_with_a_kas_default_still_takes_sompi_overrides_only(
+    client: httpx.AsyncClient, seeded: Seed
+) -> None:
+    response = await client.post(
+        "/v1/endpoints/import",
+        json=body(
+            "create",
+            default_price_currency="KAS",
+            selections=[{"method": "GET", "path": "/pets", "price_sompi": 150_000_000}],
+        ),
+        headers=bearer(seeded),
+    )
+    assert response.status_code == 201, response.text
+    row = response.json()["created"][0]
+    assert row["price_currency"] == "KAS"
+    assert row["price_sompi"] == 150_000_000 and row["price_usd_micros"] is None and row["price_usd"] is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "locations"),
+    [
+        (
+            {"default_price_currency": "USD"},
+            [["body", "default_price_usd_micros"], ["body", "default_price_sompi"]],
+        ),
+        (
+            {"default_price_currency": "USD", "default_price_sompi": None},
+            [["body", "default_price_usd_micros"]],
+        ),
+        (
+            {"default_price_usd_micros": USD_DEFAULT},
+            [["body", "default_price_usd_micros"]],
+        ),
+        (
+            {"default_price_sompi": None},
+            [["body", "default_price_sompi"]],
+        ),
+        (
+            {"default_price_sompi": None, "default_price_usd_micros": USD_DEFAULT},
+            [["body", "default_price_sompi"], ["body", "default_price_usd_micros"]],
+        ),
+        (
+            {
+                "mode": "create",
+                "selections": [
+                    {"method": "GET", "path": "/pets"},
+                    {"method": "POST", "path": "/pets", "price_usd_micros": USD_OVERRIDE},
+                ],
+            },
+            [["body", "selections", 1, "price_usd_micros"]],
+        ),
+        (
+            {
+                "mode": "create",
+                "default_price_sompi": None,
+                "default_price_currency": "USD",
+                "default_price_usd_micros": USD_DEFAULT,
+                "selections": [
+                    {"method": "GET", "path": "/pets", "price_sompi": DEFAULT_PRICE},
+                    {"method": "POST", "path": "/pets", "price_usd_micros": USD_OVERRIDE},
+                    {"method": "GET", "path": "/pets/{petId}", "price_sompi": DEFAULT_PRICE},
+                ],
+            },
+            [["body", "selections", 0, "price_sompi"], ["body", "selections", 2, "price_sompi"]],
+        ),
+        (
+            {"default_price_sompi": None, "default_price_currency": "USD", "default_price_usd_micros": 0},
+            [["body", "default_price_usd_micros"]],
+        ),
+        (
+            {
+                "default_price_sompi": None,
+                "default_price_currency": "USD",
+                "default_price_usd_micros": 10**15 + 1,
+            },
+            [["body", "default_price_usd_micros"]],
+        ),
+        (
+            {
+                "default_price_sompi": None,
+                "default_price_currency": "USD",
+                "default_price_usd_micros": 1.5,
+            },
+            [["body", "default_price_usd_micros"]],
+        ),
+        (
+            {"default_price_currency": "EUR"},
+            [["body", "default_price_currency"]],
+        ),
+        (
+            {
+                "mode": "create",
+                "default_price_sompi": None,
+                "default_price_currency": "USD",
+                "default_price_usd_micros": USD_DEFAULT,
+                "selections": [{"method": "GET", "path": "/pets", "price_usd_micros": -1}],
+            },
+            [["body", "selections", 0, "price_usd_micros"]],
+        ),
+    ],
+)
+async def test_mixed_or_incomplete_prices_are_422_at_their_location(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    payload: dict[str, Any],
+    locations: list[list[Any]],
+) -> None:
+    before = await endpoint_count(sessionmaker)
+    request = body()
+    request.update(payload)
+    request = {key: value for key, value in request.items() if value is not None}
+    response = await client.post("/v1/endpoints/import", json=request, headers=bearer(seeded))
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == locations
+    assert await endpoint_count(sessionmaker) == before
 
 
 async def test_create_rejects_unknown_skipped_and_disallowed_selections(

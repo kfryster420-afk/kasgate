@@ -552,7 +552,9 @@ async def _plan_import(
                 description=operation.description or operation.summary,
                 category=payload.category or operation.tag,
                 upstream_url=upstream_url_for(str(payload.upstream_base_url), operation.path),
+                price_currency=payload.default_price_currency,
                 price_sompi=payload.default_price_sompi,
+                price_usd_micros=payload.default_price_usd_micros,
                 allowed_methods=[operation.method],
                 is_public_listed=payload.is_public_listed,
             )
@@ -572,7 +574,7 @@ async def _plan_import(
     return plans
 
 
-def _preview_row(plan: _ImportPlan, price_sompi: int) -> OpenApiOperationPreview:
+def _preview_row(plan: _ImportPlan, payload: OpenApiImportRequest) -> OpenApiOperationPreview:
     operation = plan.operation
     base_url = get_settings().public_base_url
     proxy_url = f"{base_url}{PROXY_PATH_PREFIX}/{plan.slug}" if plan.slug else None
@@ -589,7 +591,9 @@ def _preview_row(plan: _ImportPlan, price_sompi: int) -> OpenApiOperationPreview
         upstream_url=str(plan.candidate.upstream_url) if plan.candidate is not None else None,
         proxy_path=f"{PROXY_PATH_PREFIX}/{plan.slug}{proxy_suffix(operation.path)}" if plan.slug else None,
         proxy_url=proxy_url,
-        price_sompi=price_sompi,
+        price_currency=payload.default_price_currency,
+        price_sompi=payload.default_price_sompi,
+        price_usd_micros=payload.default_price_usd_micros,
     )
 
 
@@ -597,8 +601,13 @@ IMPORT_DOC = """Import paid endpoints from an OpenAPI 3.0/3.1 document (JSON or 
 
 `mode: "preview"` parses the document (`spec_text`, or `spec_url` fetched through the SSRF guard) and lists every
 operation with its proposed slug, upstream URL and buyer route; nothing is written. `mode: "create"` re-parses the
-same document and creates one endpoint per entry in `selections` (method + path, optional `price_sompi` override)
+same document and creates one endpoint per entry in `selections` (method + path, optional price override)
 in ONE transaction: either every selected endpoint is created or none is.
+
+Prices: `default_price_currency` is `KAS` (default) or `USD`. KAS imports send `default_price_sompi` and optional
+per-row `price_sompi` (each >= the 0.6 KAS minimum); USD imports send `default_price_usd_micros` and optional
+per-row `price_usd_micros` (1 USD = 1_000_000 micros) and create USD-priced endpoints whose `price_sompi` is null.
+A price field in the other currency is a 422 at its own location, e.g. `["body", "selections", 2, "price_sompi"]`.
 
 Path parameters map onto the proxy's suffix routing: `GET /pets/{petId}` becomes an endpoint whose upstream URL is
 `<base>/pets` and which buyers call as `/p/<slug>/<petId>`. Limits: document <= 2 MiB, <= 500 operations, only local
@@ -654,15 +663,17 @@ async def import_openapi(
             servers=document_servers(document),
             operation_count=len(plans),
             importable_count=sum(1 for plan in plans if plan.candidate is not None),
+            default_price_currency=payload.default_price_currency,
             default_price_sompi=payload.default_price_sompi,
+            default_price_usd_micros=payload.default_price_usd_micros,
             min_price_sompi=min_price_sompi(),
-            operations=[_preview_row(plan, payload.default_price_sompi) for plan in plans],
+            operations=[_preview_row(plan, payload) for plan in plans],
         )
         return JSONResponse(content=preview.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
 
     by_key = {(plan.operation.method, plan.operation.path): plan for plan in plans}
     errors: list[dict[str, Any]] = []
-    chosen: list[tuple[_ImportPlan, int]] = []
+    chosen: list[tuple[_ImportPlan, PriceCurrency, int]] = []
     for index, selection in enumerate(payload.selections or []):
         plan = by_key.get((selection.method, selection.path))
         if plan is None:
@@ -670,12 +681,13 @@ async def import_openapi(
         elif plan.candidate is None or plan.slug is None:
             errors.append(_row_error(index, f"{plan.operation.key} cannot be imported: {plan.skip_reason}"))
         else:
-            chosen.append((plan, selection.price_sompi or payload.default_price_sompi))
+            currency, amount = payload.row_price(selection)
+            chosen.append((plan, currency, amount))
     if errors:
         raise RequestValidationError(errors)
 
     endpoints: list[Endpoint] = []
-    for plan, price in chosen:
+    for plan, currency, amount in chosen:
         candidate = plan.candidate
         assert candidate is not None and plan.slug is not None  # noqa: S101 - guaranteed by the loop above
         endpoints.append(
@@ -687,9 +699,9 @@ async def import_openapi(
                 category=candidate.category,
                 upstream_url=str(candidate.upstream_url),
                 upstream_headers_encrypted=encrypted,
-                price_currency=PriceCurrency.KAS,
-                price_sompi=price,
-                price_usd_micros=None,
+                price_currency=currency,
+                price_sompi=amount if currency is PriceCurrency.KAS else None,
+                price_usd_micros=amount if currency is PriceCurrency.USD else None,
                 allowed_methods=list(candidate.allowed_methods),
                 is_public_listed=candidate.is_public_listed,
             )
