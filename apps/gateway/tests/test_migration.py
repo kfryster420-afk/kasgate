@@ -1,4 +1,4 @@
-"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0005 must carry existing rows over."""
+"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0006 must carry existing rows over."""
 
 import asyncio
 from typing import Any
@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0005_exact_v2"
+HEAD_REVISION = "0006_prepaid"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -518,6 +518,123 @@ async def test_0005_exact_v2_constraints_and_guarded_downgrade(pg_server: PgServ
             url,
             "SELECT count(*) FROM information_schema.columns WHERE table_name = 'settlements' "
             "AND column_name IN ('payment_identifier', 'request_hash')",
+        )
+        == 0
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
+
+
+_PK = "a" * 64
+
+
+def _balance_insert(balance: int, deposited: int, debited: int, *, key: str = _PK) -> str:
+    return (
+        "INSERT INTO prepaid_balances (id, merchant_id, payer_address, payer_public_key, balance_sompi, "  # noqa: S608
+        f"deposited_sompi, debited_sompi) SELECT gen_random_uuid(), id, 'p', '{key}', {balance}, {deposited}, "
+        f"{debited} FROM merchants LIMIT 1"
+    )
+
+
+def _deposit_insert(tx_hex: str, deposit: int, fee: int, credit: int, *, settlement_tx: str | None = None) -> str:
+    """One deposit row funded by the settlement whose tx_id is `settlement_tx` (default: `tx_hex`)."""
+    source = tx_hex if settlement_tx is None else settlement_tx
+    return (
+        "INSERT INTO prepaid_deposits (id, balance_id, merchant_id, settlement_id, tx_id, payer_address, "  # noqa: S608
+        "deposit_sompi, fee_sompi, credit_sompi) SELECT gen_random_uuid(), b.id, b.merchant_id, s.id, "
+        f"'{tx_hex}', 'p', {deposit}, {fee}, {credit} FROM prepaid_balances b, settlements s "
+        f"WHERE s.tx_id = '{source}' LIMIT 1"
+    )
+
+
+def _debit_insert(
+    nonce: str, amount: int = 1000, *, status: str = "debited", refunded: bool = False, body_hash: str | None = None
+) -> str:
+    refunded_at = "now()" if refunded else "NULL"
+    body = "NULL" if body_hash is None else f"'{body_hash}'"
+    return (
+        "INSERT INTO prepaid_debits (id, balance_id, merchant_id, endpoint_id, nonce, payer_address, amount_sompi, "  # noqa: S608
+        "status, request_method, request_path, body_hash, refunded_at) SELECT gen_random_uuid(), b.id, "
+        f"b.merchant_id, e.id, '{nonce}', 'p', {amount}, '{status}', 'GET', '/p/weather', {body}, {refunded_at} "
+        "FROM prepaid_balances b, endpoints e LIMIT 1"
+    )
+
+
+async def test_0006_prepaid_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_prepaid")
+    pg_server.create_database("kasgate_prepaid")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0005_exact_v2")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100, '{GET}' FROM merchants LIMIT 1",
+        _settlement_insert("a" * 64, "1" * 32),
+        _settlement_insert("b" * 64, "5" * 32),
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    # existing endpoints are not prepaid-only (server default false)
+    assert await _scalar(url, "SELECT prepaid_only FROM endpoints") is False
+
+    await _execute(
+        url,
+        _balance_insert(70_000_000, 70_000_000, 0),
+        _deposit_insert("a" * 64, 90_000_000, 20_000_000, 70_000_000),
+        _debit_insert("2" * 32),
+        _debit_insert("3" * 32, status="refunded", refunded=True, body_hash="e" * 64),
+    )
+    for bad in (
+        _balance_insert(0, 0, 0),  # unique (merchant_id, payer_public_key)
+        _balance_insert(-1, 0, 1, key="b" * 64),  # ck_prepaid_balances_balance_not_negative
+        _balance_insert(5, 10, 4, key="b" * 64),  # ck_prepaid_balances_balance_matches_totals
+        _balance_insert(1, 1, 0, key="B" * 64),  # ck_prepaid_balances_payer_public_key_hex64
+        _balance_insert(1, 1, 0, key="b" * 63),  # ck_prepaid_balances_payer_public_key_hex64
+        # ck_prepaid_balances_balance_not_negative: no overdraft even with consistent totals
+        "UPDATE prepaid_balances SET balance_sompi = balance_sompi - 70000001, "
+        "debited_sompi = debited_sompi + 70000001",
+        _deposit_insert("a" * 64, 90_000_000, 20_000_000, 70_000_000, settlement_tx="b" * 64),  # unique tx_id
+        _deposit_insert("c" * 64, 90_000_000, 20_000_000, 70_000_000, settlement_tx="a" * 64),  # unique settlement
+        _deposit_insert("B" * 64, 90_000_000, 20_000_000, 70_000_000, settlement_tx="b" * 64),  # tx_id_hex64
+        _deposit_insert("b" * 64, 90_000_000, 20_000_000, 60_000_000),  # split_sums_to_deposit
+        _deposit_insert("b" * 64, 70_000_000, 0, 70_000_000),  # amounts_positive
+        _debit_insert("2" * 32),  # unique ix_prepaid_debits_nonce
+        _debit_insert("4" * 31),  # ck_prepaid_debits_nonce_hex32
+        _debit_insert("4" * 32, 0),  # ck_prepaid_debits_amount_positive
+        _debit_insert("4" * 32, status="refunded"),  # ck_prepaid_debits_refunded_at_iff_refunded
+        _debit_insert("4" * 32, refunded=True),  # ck_prepaid_debits_refunded_at_iff_refunded
+        _debit_insert("4" * 32, status="settled"),  # ck_prepaid_debits_status_known
+        _debit_insert("4" * 32, body_hash="xyz"),  # ck_prepaid_debits_body_hash_hex64
+        "DELETE FROM settlements",  # fk RESTRICT: a deposit's settlement cannot disappear
+        "DELETE FROM prepaid_balances",  # fk RESTRICT: deposits and debits keep their balance
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+
+    # a downgrade would drop buyer credit the merchant was already paid for, so it refuses
+    with pytest.raises(DBAPIError, match="prepaid balances, deposits, debits or prepaid-only endpoints exist"):
+        await asyncio.to_thread(command.downgrade, config, "0005_exact_v2")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    await _execute(url, "DELETE FROM prepaid_debits", "DELETE FROM prepaid_deposits", "DELETE FROM prepaid_balances")
+    await _execute(url, "UPDATE endpoints SET prepaid_only = true")
+    with pytest.raises(DBAPIError, match="prepaid-only endpoints exist"):
+        await asyncio.to_thread(command.downgrade, config, "0005_exact_v2")
+    await _execute(url, "UPDATE endpoints SET prepaid_only = false")
+    await asyncio.to_thread(command.downgrade, config, "0005_exact_v2")
+    assert await _scalar(url, "SELECT count(*) FROM settlements") == 2
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'prepaid_%'",
         )
         == 0
     )
