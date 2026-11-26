@@ -910,6 +910,9 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         "UPDATE prepaid_refunds SET claimed_at = NULL WHERE status = 'paying'",  # paying_is_claimed
         "UPDATE prepaid_refunds SET first_claimed_at = NULL WHERE status = 'paying'",  # claimed_has_first_claim
         "UPDATE prepaid_refunds SET hold_until = now() WHERE status = 'paying'",  # hold_until_only_cancelled
+        "UPDATE prepaid_refunds SET first_claimed_daa_score = -1 WHERE status = 'paying'",  # claimed_daa_after
+        "UPDATE prepaid_refunds SET first_claimed_daa_score = 1, first_claimed_at = NULL "
+        "WHERE status = 'paid'",  # claimed_daa_after_first_claim
         attempt_of(of="paying"),  # ix_prepaid_refund_payouts_tx_id: one refund per tx_id
         attempt_of(tx=f"'{'f' * 64}'", status="lost", of="paying"),  # status_known
         attempt_of(tx=f"'{'f' * 64}'", method="wallet", of="paying"),  # method_known

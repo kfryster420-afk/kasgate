@@ -107,7 +107,8 @@ class Settings(BaseSettings):
     prepaid_payout_unseen_backoff_fraction: float = Field(default=0.1, gt=0, le=1)
     # POST /v1/prepaid/refunds/{id}/payout per merchant per minute.
     rl_refund_payout_per_merchant_per_minute: int = Field(default=20, ge=1)
-    # Signed buyer refund writes (POST /v1/prepaid/refunds, /cancel, /status) per client IP per minute.
+    # Signed buyer refund/credit-status writes (POST /v1/prepaid/refunds, /cancel, /status, /credits/status)
+    # per client IP per minute.
     rl_prepaid_refund_per_minute: int = Field(default=30, ge=1)
     # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate
     # limits. Empty (default): X-Forwarded-For is ignored and the TCP peer address is the client.

@@ -77,9 +77,12 @@ refund_hold_sompi)`):
 * **Calls spend credit first**, then deposited sompi. `prepaid_debits.credit_sompi` is the part of each debit paid
   from credit; a debit restored after an upstream failure gives that part back to the credit.
 * **Refunds take deposited, unspent sompi only**: `refundable = max(0, balance - refund_hold - credit_balance)`
-  (`refund_hold` includes an open refund and a cancel cooldown). The refund
+  (`refund_hold` includes an open refund and a cancel cooldown, including after `hold_until` while a payout
+  attempt for that refund is still pending). Spendable for calls follows v2.13: `max(0, balance - refund_hold)`
+  (0 if expired), so credit still pays calls during that hold. The refund
   challenge's default amount is `refundable_sompi`; asking for more is `409 insufficient_balance`. So the refund
-  hold never covers credit, and credit keeps paying calls while a refund is open.
+  hold never covers credit, and credit keeps paying calls while a refund is open. Signed
+  `POST /v1/prepaid/credits/status` reports the same `refundable_sompi`.
 * A **late payout** of a cancelled or rejected refund re-debits deposited sompi first, then credit (the coins
   already reached the buyer, so the same sompi never stays spendable too).
 * **Expiry** drops the unspent credit with the rest of the spendable balance.
@@ -105,11 +108,20 @@ adds or drops credit for calls already paid. There is no per-endpoint override (
   `credited_sompi`, `credit_balance_sompi` and `refundable_sompi`.
 * Response header `X-KasGate-Credit` (Base64 JSON, exposed via CORS, stripped from upstream responses so an
   upstream cannot forge it): `{creditId, kind, txId, merchantId, creditSompi, balanceSompi, reason,
-  shortfallSompi?}`, sent only when something was credited.
-* Buyer view: the signed `POST /v1/prepaid/refunds/status` reply keeps its body (the list of refunds) and adds
-  `X-KasGate-Credit-Summary` (Base64 JSON `{merchantId, creditedSompi, creditBalanceSompi, refundableSompi,
-  creditCount, credits}`, the newest 10 credits as `{txId, slug, creditSompi, shortfallSompi, reason, createdAt}`).
-  The public `GET` status does not carry it.
+  shortfallSompi?}`, sent only when something was credited. `creditId` is the ledger entry id, the same value as
+  `credit_id` on each item of signed `POST /v1/prepaid/credits/status`.
+* Buyer view: `POST /v1/prepaid/credits/challenge` `{slug, payer_address}` then signed
+  `POST /v1/prepaid/credits/status` `{nonce, signature, before?, limit?}` (action `credits`; same challenge store,
+  message layout, Purpose, key binding, single-use consume and rate limit as refunds/status). The challenge's
+  `spendable_sompi` and `refundable_sompi` are informational only. Each page needs a fresh challenge. `limit`
+  defaults to 10, max 100 (else 422). `before` is the opaque `next_cursor` from the previous page (newest first
+  by `(created_at, id)`, bound to this merchant and key). Reply is
+  `{merchant_id, credited_sompi, credit_balance_sompi, refundable_sompi, credit_count, credits, next_cursor}`
+  with a page of `{credit_id, tx_id, slug, credit_sompi, shortfall_sompi, reason, created_at}`. `credit_count` is
+  the total. `next_cursor` is null when there are no more pages. A malformed or foreign `before` is 400
+  `invalid_cursor` (no data leaked; the challenge is not burned). A buyer with no credits gets zeros,
+  `credits: []` and `next_cursor: null`. A refunds `status` challenge cannot be replayed here, and the reverse is
+  refused. `GET` and signed `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 
 ## Webhooks
 
@@ -153,5 +165,5 @@ The sweep runs in the ledger worker (`LEDGER_WORKER_ENABLED`, `LEDGER_POLL_INTER
 ## Out of scope
 
 * No per-endpoint override of the failed-delivery policy (merchant-level only).
-* No public credit-lookup route; the buyer's view is the signed refund-status summary above. SDK and MCP reading
-  of `X-KasGate-Credit` and `X-KasGate-Credit-Summary` is 05's follow-up.
+* No other public credit-lookup route; the buyer's view is the signed `POST /v1/prepaid/credits/status` above.
+  SDK and MCP reading of `X-KasGate-Credit` and of that endpoint is 05's follow-up.

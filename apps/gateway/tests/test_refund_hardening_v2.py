@@ -393,3 +393,46 @@ async def test_app_startup_refuses_an_earlier_draft_0008_schema(pg_server: PgSer
         await check_database_schema(unreachable)  # logged, not raised
     finally:
         await unreachable.dispose()
+
+
+async def test_scan_attempts_do_not_fill_the_tx_id_cap(
+    client: httpx.AsyncClient, shop: Seed, sessionmaker: async_sessionmaker[AsyncSession], stub_engine: StubEngine
+) -> None:
+    await fund(client)
+    refund = await open_refund(client)
+    assert (await claim(client, shop, refund.id)).status_code == 200
+    await age(sessionmaker, refund.id, claimed_at=datetime.now(UTC) - LAPSED)
+    stub_engine.payout_sightings = [PayoutSighting(tx_of(i), payload_seen=False) for i in range(1, 4)]
+    assert (await cancel(client, refund.id)).status_code == 409
+    assert len(await attempts_of(sessionmaker, refund.id)) == 3
+    stub_engine.payout_error = PaymentVerificationError("payment_not_found", "not visible")
+    posted = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
+    assert posted.status_code == 202
+    methods = {a.method for a in await attempts_of(sessionmaker, refund.id)}
+    assert methods == {"scan", "tx_id"}
+
+
+async def test_cooldown_hold_is_released_once_pending_attempts_are_abandoned(
+    client: httpx.AsyncClient, shop: Seed, sessionmaker: async_sessionmaker[AsyncSession], stub_engine: StubEngine
+) -> None:
+    await fund(client)
+    refund = await open_refund(client)
+    assert (await claim(client, shop, refund.id)).status_code == 200
+    await age(sessionmaker, refund.id, claimed_at=datetime.now(UTC) - LAPSED)
+    assert (await cancel(client, refund.id)).status_code == 200
+    stub_engine.payout_error = PaymentVerificationError("payload_unverified", "accepted, payload not seen yet")
+    assert (await payout(client, shop, refund.id, tx_id=PAYOUT_TX)).status_code == 202
+    await age(sessionmaker, refund.id, hold_until=datetime.now(UTC) - timedelta(seconds=1))
+    await run_ledger_pass(sessionmaker, stub_engine)
+    assert spendable_sompi(await balance_of(sessionmaker, shop.merchant_id)) == 0
+    async with sessionmaker() as session:
+        await session.execute(
+            update(PrepaidRefundPayout)
+            .where(PrepaidRefundPayout.refund_id == refund.id)
+            .values(created_at=datetime.now(UTC) - timedelta(days=30), next_check_at=datetime.now(UTC))
+        )
+        await session.commit()
+    await run_ledger_pass(sessionmaker, stub_engine)
+    balance = await balance_of(sessionmaker, shop.merchant_id)
+    assert spendable_sompi(balance) == CREDIT_SOMPI and balance.refund_hold_sompi == 0
+    assert_identity(balance)
