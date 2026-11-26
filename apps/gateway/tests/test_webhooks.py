@@ -122,6 +122,24 @@ def test_signature_round_trip_and_forgeries() -> None:
     assert verify_signature(secret, f"t={now},v1={'0' * 64},v1={compute_signature(secret, now, body)}", body, now=now)
 
 
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["\u00b2", "1\u00b2", "\u0661\u0662", "\uff11", "9" * 5000, "+1", " 1", "-1"],
+)
+def test_signature_header_with_a_non_ascii_or_absurd_timestamp_is_rejected_not_crashed(timestamp: str) -> None:
+    """str.isdigit() is True for '²', Arabic-Indic and full-width digits; int() then raised (or hit the 4300-digit
+    limit). Each must simply fail verification."""
+    secret = "whsec_" + "a" * 43
+    body = b"{}"
+    assert verify_signature(secret, f"t={timestamp},v1={'0' * 64}", body, now=1_800_000_000) is False
+
+
+def test_signature_header_with_a_non_ascii_v1_is_rejected_not_crashed() -> None:
+    secret = "whsec_" + "a" * 43
+    now = 1_800_000_000
+    assert verify_signature(secret, f"t={now},v1=\u00e9\u00e9", b"{}", now=now) is False
+
 # ---------------------------------------------------------------- CRUD + secret handling
 
 

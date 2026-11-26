@@ -184,9 +184,10 @@ def verify_webhook_signature(
     candidates: list[str] = []
     for part in signature_header.split(","):
         key, _, value = part.strip().partition("=")
-        if key == "t" and value.isdigit():
+        # ASCII only: str.isdigit() accepts "²" (int() then raises) and compare_digest raises on non-ASCII str.
+        if key == "t" and value.isascii() and value.isdigit() and len(value) <= 12:
             timestamp = int(value)
-        elif key == "v1" and value:
+        elif key == "v1" and value and value.isascii():
             candidates.append(value)
     if timestamp is None or not candidates:
         return False
