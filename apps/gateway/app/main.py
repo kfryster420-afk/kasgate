@@ -24,6 +24,7 @@ from app.prepaid import router as prepaid_router
 from app.proxy import router as proxy_router
 from app.refunds import router as refunds_router
 from app.schemas import (
+    HEADER_CREDIT_SUMMARY,
     HEADER_FAILED_DELIVERY_CREDIT,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
@@ -102,6 +103,7 @@ def create_app() -> FastAPI:
             HEADER_TRIAL_LIMIT,
             HEADER_TRIAL_REMAINING,
             HEADER_FAILED_DELIVERY_CREDIT,
+            HEADER_CREDIT_SUMMARY,
         ],
         max_age=600,
     )

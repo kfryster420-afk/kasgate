@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
-from sqlalchemy import ColumnElement, and_, case, func, literal, select, update
+from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -69,6 +69,24 @@ def spendable_sompi(balance: PrepaidBalance | None, now: datetime | None = None)
     if balance.expires_at is not None and balance.expires_at <= (now or datetime.now(UTC)):
         return 0
     return max(0, balance.balance_sompi - balance.refund_hold_sompi)
+
+
+def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None) -> int:
+    """CONTRACT v2.14: what a refund request may take: spendable credit minus the unspent failed-delivery credit.
+
+    Failed-delivery credit is call-only: debits spend it first and a refund never pays it out on-chain.
+    """
+    if balance is None:
+        return 0
+    return max(0, spendable_sompi(balance, now) - balance.credit_balance_sompi)
+
+
+def refundable_covers(amount: int | ColumnElement[int]) -> ColumnElement[bool]:
+    """SQL guard for a refund hold of `amount`: deposited, unspent and unexpired credit covers it (v2.13 + v2.14)."""
+    return and_(
+        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi >= amount,
+        or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
+    )
 
 
 def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -> dict[str, str | None]:
@@ -253,6 +271,7 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
         return None
     amount = refund.amount_sompi
     late_from: str | None = None
+    from_credit = 0
     if refund.status in PREPAID_REFUND_OPEN_STATUSES:
         debit, hold_release = amount, amount
         note = "refund paid on-chain by the merchant"
@@ -260,6 +279,15 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
         late_from = refund.status
         hold_release = await _supersede_open_refund(session, refund, attempt.tx_id, balance_row, amount, now)
         debit = min(amount, max(0, balance_row.balance_sompi - (balance_row.refund_hold_sompi - hold_release)))
+        # CONTRACT v2.14: the coins already reached the buyer, so the re-debit takes deposited credit first and only
+        # then call-only failed-delivery credit (it never stays spendable next to an on-chain payout of the same sompi).
+        deposited_free = max(
+            0,
+            balance_row.balance_sompi
+            - (balance_row.refund_hold_sompi - hold_release)
+            - balance_row.credit_balance_sompi,
+        )
+        from_credit = max(0, debit - deposited_free)
         note = clip(
             f"late payout of a {late_from} refund: re-debited {debit} sompi"
             + (f", {amount - debit} sompi already spent or expired" if debit < amount else "")
@@ -273,6 +301,7 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
                     balance_sompi=PrepaidBalance.balance_sompi - debit,
                     refund_hold_sompi=PrepaidBalance.refund_hold_sompi - hold_release,
                     refunded_sompi=PrepaidBalance.refunded_sompi + debit,
+                    credit_balance_sompi=PrepaidBalance.credit_balance_sompi - from_credit,
                     updated_at=func.now(),
                 )
                 .returning(PrepaidBalance.balance_sompi)
@@ -350,6 +379,8 @@ async def expire_balance(session: AsyncSession, balance_id: uuid.UUID) -> int:
             .values(
                 balance_sompi=PrepaidBalance.balance_sompi - amount,
                 expired_sompi=PrepaidBalance.expired_sompi + amount,
+                # CONTRACT v2.14: unspent failed-delivery credit is part of what expires.
+                credit_balance_sompi=0,
                 updated_at=func.now(),
             )
             .returning(PrepaidBalance.balance_sompi)

@@ -67,6 +67,9 @@ HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit"
 HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining"
 # Failed-delivery auto-credit: on the failing response when the call was credited back to prepaid there and then.
 HEADER_FAILED_DELIVERY_CREDIT = "X-KasGate-Credit"
+# CONTRACT v2.14: the buyer's failed-delivery credit summary on the signed POST /v1/prepaid/refunds/status reply.
+HEADER_CREDIT_SUMMARY = "X-KasGate-Credit-Summary"
+MAX_SUMMARY_CREDITS = 10
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -1640,6 +1643,11 @@ class PrepaidBalanceRead(BaseModel):
     expires_at: datetime | None = None
     credited_sompi: BalanceSompiStr = "0"
     """Merchant shares of failed paid calls credited back onto this balance (ledger kind failed_delivery_credit)."""
+    # CONTRACT v2.14
+    credit_balance_sompi: BalanceSompiStr = "0"
+    """Unspent failed-delivery credit inside the balance: spent first by calls, never refundable on-chain."""
+    refundable_sompi: BalanceSompiStr = "0"
+    """What a refund request may take right now: spendable credit minus the unspent failed-delivery credit."""
 
 
 class PrepaidDebitRead(ReadModel):
@@ -1733,6 +1741,8 @@ class PrepaidRefundChallenge(BaseModel):
     refund_id: uuid.UUID | None
     spendable_sompi: BalanceSompiStr
     expires_at: datetime
+    refundable_sompi: BalanceSompiStr = "0"
+    """CONTRACT v2.14: the most a refund may take (deposited, unspent credit; failed-delivery credit is excluded)."""
 
 
 class PrepaidRefundSigned(StrictModel):
@@ -1840,6 +1850,7 @@ class PrepaidRefundReject(StrictModel):
 
 PrepaidLedgerKindName = Literal["refund", "expiry", "failed_delivery_credit"]
 FailedDeliveryCreditReason = Literal["attempts_exhausted", "window_expired"]
+DeliveryFailureName = Literal["upstream_5xx", "connect_error", "timeout", "oversized"]
 
 
 class PrepaidLedgerEntryRead(ReadModel):
@@ -1847,7 +1858,8 @@ class PrepaidLedgerEntryRead(ReadModel):
     payer_address: str
     kind: PrepaidLedgerKindName
     direction: Literal["credit", "debit"]
-    amount_sompi: SompiStr
+    amount_sompi: BalanceSompiStr
+    """Positive, except a failed-delivery credit fully clamped by the balance cap (0, see shortfall_sompi)."""
     balance_after_sompi: BalanceSompiStr
     tx_id: str | None
     refund_id: uuid.UUID | None
@@ -1857,8 +1869,9 @@ class PrepaidLedgerEntryRead(ReadModel):
     settlement_id: uuid.UUID | None = None
     slug: str | None = None
     credit_reason: FailedDeliveryCreditReason | None = None
+    shortfall_sompi: BalanceSompiStr = "0"
 
-    @field_validator("amount_sompi", "balance_after_sompi", mode="before")
+    @field_validator("amount_sompi", "balance_after_sompi", "shortfall_sompi", mode="before")
     @classmethod
     def _sompi(cls, v: object) -> object:
         return str(v) if isinstance(v, int) else v
@@ -1880,6 +1893,42 @@ class FailedDeliveryCreditReceipt(X402Header):
     creditSompi: SompiStr
     balanceSompi: BalanceSompiStr
     reason: FailedDeliveryCreditReason
+    shortfallSompi: BalanceSompiStr | None = None
+    """Part of the merchant share not credited because the balance reached PREPAID_MAX_BALANCE_SOMPI."""
+
+
+class BuyerCreditItem(BaseModel):
+    """One failed-delivery credit in the buyer's credit summary (newest first)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    txId: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    creditSompi: BalanceSompiStr
+    shortfallSompi: BalanceSompiStr
+    reason: FailedDeliveryCreditReason
+    createdAt: datetime
+
+
+class BuyerCreditSummary(X402Header):
+    """Body of the X-KasGate-Credit-Summary header on the signed POST /v1/prepaid/refunds/status reply (v2.14).
+
+    The JSON body stays v2.13's list of refunds; this header adds the signing buyer's failed-delivery credit at
+    that merchant. Credit is call-only: `refundableSompi` (deposited and unspent, minus the open hold) is what a
+    refund may take; `creditBalanceSompi` can only pay for calls.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    merchantId: uuid.UUID
+    creditedSompi: BalanceSompiStr
+    """All failed-delivery credit ever added to this balance (the `credited_sompi` total)."""
+    creditBalanceSompi: BalanceSompiStr
+    """Unspent call-only credit (spent before deposited sompi; never refundable)."""
+    refundableSompi: BalanceSompiStr
+    creditCount: Annotated[int, Field(ge=0)]
+    credits: Annotated[list[BuyerCreditItem], Field(max_length=MAX_SUMMARY_CREDITS)]
+    """The newest credits, at most 10; the merchant lists all with GET /v1/prepaid/credits."""
 
 
 class PrepaidCreditRead(BaseModel):
@@ -1899,10 +1948,13 @@ class PrepaidCreditRead(BaseModel):
     """What the buyer paid on-chain for the call."""
     fee_sompi: BalanceSompiStr
     """Platform fee in output 1: already paid to the treasury and NOT reversed."""
-    credit_sompi: SompiStr
-    """The merchant share, credited to the buyer's prepaid balance at this merchant."""
+    credit_sompi: BalanceSompiStr
+    """The merchant share credited to the buyer's prepaid balance at this merchant (call-only, non-refundable)."""
+    shortfall_sompi: BalanceSompiStr
+    """The part of the merchant share not credited because the balance reached PREPAID_MAX_BALANCE_SOMPI."""
     balance_after_sompi: BalanceSompiStr
     reason: FailedDeliveryCreditReason
+    delivery_failure: DeliveryFailureName
     upstream_status_code: Annotated[int, Field(ge=500)] | None
     delivery_attempts: Annotated[int, Field(ge=1)]
     settled_at: datetime | None
@@ -1910,21 +1962,32 @@ class PrepaidCreditRead(BaseModel):
 
 
 class FailedDeliveryPolicyRead(BaseModel):
-    """GET/PUT /v1/prepaid/failed-delivery-policy. While `enabled`, paid calls settled since `enabled_at` whose
-    upstream fails for good are credited to the buyer's prepaid balance. Turning it off stops crediting calls settled
-    after `disabled_at`. Neither change is applied retroactively."""
+    """GET/PUT /v1/prepaid/failed-delivery-policy. The policy in force when a call SETTLES is stamped on it: while
+    `enabled`, its last delivery failing for good (5xx, connection error, and a timeout if `credit_timeouts`) is
+    credited to the buyer's prepaid balance. A later change never adds or drops credit for calls already paid.
+    `enabled_at` / `disabled_at` are the times of the last switch on / off."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     enabled: bool
+    credit_timeouts: bool
     enabled_at: datetime
     disabled_at: datetime | None
 
 
 class FailedDeliveryPolicyUpdate(StrictModel):
+    """Omitted fields keep their current value; at least one must be given."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
-    enabled: bool
+    enabled: bool | None = None
+    credit_timeouts: bool | None = None
+
+    @model_validator(mode="after")
+    def _something(self) -> Self:
+        if self.enabled is None and self.credit_timeouts is None:
+            raise ValueError("give enabled and/or credit_timeouts")
+        return self
 
 
 # ---------------------------------------------------------------- free trial calls (CONTRACT v2.12)
@@ -2022,6 +2085,7 @@ WebhookEventType = Literal[
     "prepaid.refund.payout_reverted",
     "prepaid.credit.expired",
     "prepaid.credit.failed_delivery",
+    "prepaid.credit.failed_delivery_shortfall",
 ]
 WebhookDeliveryStatus = Literal["pending", "delivering", "succeeded", "dead"]
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain")
