@@ -780,6 +780,15 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         == 0
     )
     assert await _scalar(url, "SELECT count(*) FROM merchants WHERE prepaid_expiry_days IS NULL") == 1
+    # Explicit tx_id indexes: unique per attempted payout, unique per paid refund, and on the ledger.
+    tx_id_indexes = (
+        "SELECT count(*) FROM pg_indexes WHERE indexname IN "
+        "('ix_prepaid_refund_payouts_tx_id', 'ix_prepaid_refunds_tx_id', 'ix_prepaid_ledger_entries_tx_id')"
+    )
+    assert await _scalar(url, tx_id_indexes) == 3
+    assert "UNIQUE" in str(
+        await _scalar(url, "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_prepaid_refund_payouts_tx_id'")
+    )
 
     refund = (
         "INSERT INTO prepaid_refunds (id, balance_id, merchant_id, payer_address, payer_public_key, amount_sompi, "
@@ -823,6 +832,38 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         entry.format(kind="refund", direction="debit", amount=10, after=60, tx=tx, refund=paid_refund),
         entry.format(kind="expiry", direction="debit", amount=5, after=55, tx="NULL", refund="NULL"),
     )
+    attempt = (
+        "INSERT INTO prepaid_refund_payouts (id, refund_id, merchant_id, tx_id, method, status, confirmed_at, "
+        "resolved_at) SELECT gen_random_uuid(), r.id, r.merchant_id, {tx}, '{method}', '{status}', {confirmed}, "
+        "{resolved} FROM prepaid_refunds r WHERE r.status = '{of}' LIMIT 1"
+    )
+
+    def attempt_of(**overrides: object) -> str:
+        values: dict[str, object] = {
+            "tx": f"'{'e' * 64}'",
+            "method": "tx_id",
+            "status": "pending",
+            "confirmed": "NULL",
+            "resolved": "NULL",
+            "of": "requested",
+        }
+        values.update(overrides)
+        return attempt.format(**values)
+
+    await _execute(
+        url,
+        attempt_of(tx=tx, status="confirmed", confirmed="now()", resolved="now()", of="paid"),
+        attempt_of(),  # a pending attempt of the requested refund (e.g. after a revert)
+        "UPDATE prepaid_refunds SET late_paid_from = 'cancelled', shortfall_sompi = 4 WHERE status = 'paid'",
+        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now(), first_claimed_at = now() "
+        "WHERE status = 'requested'",
+    )
+    # A late payout that found nothing left to debit is recorded with a 0 sompi refund ledger row.
+    await _execute(
+        url,
+        "UPDATE prepaid_ledger_entries SET amount_sompi = 0 WHERE kind = 'refund'",
+        "UPDATE prepaid_ledger_entries SET amount_sompi = 10 WHERE kind = 'refund'",
+    )
 
     def requested(**overrides: object) -> str:
         values: dict[str, object] = {
@@ -862,6 +903,19 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         entry.format(kind="expiry", direction="debit", amount=1, after=-1, tx="NULL", refund="NULL"),  # after >= 0
         entry.format(kind="gift", direction="debit", amount=1, after=1, tx="NULL", refund="NULL"),  # kind_known
         entry.format(kind="expiry", direction="up", amount=1, after=1, tx="NULL", refund="NULL"),  # direction
+        "UPDATE prepaid_refunds SET shortfall_sompi = 11 WHERE status = 'paid'",  # shortfall_within_amount
+        "UPDATE prepaid_refunds SET late_paid_from = 'expired' WHERE status = 'paid'",  # late_paid_from_known
+        "UPDATE prepaid_refunds SET late_paid_from = 'cancelled' WHERE status = 'paying'",  # only when paid
+        "UPDATE prepaid_refunds SET late_paid_from = NULL WHERE status = 'paid'",  # shortfall_only_when_late
+        "UPDATE prepaid_refunds SET claimed_at = NULL WHERE status = 'paying'",  # paying_is_claimed
+        "UPDATE prepaid_refunds SET first_claimed_at = NULL WHERE status = 'paying'",  # claimed_has_first_claim
+        "UPDATE prepaid_refunds SET hold_until = now() WHERE status = 'paying'",  # hold_until_only_cancelled
+        attempt_of(of="paying"),  # ix_prepaid_refund_payouts_tx_id: one refund per tx_id
+        attempt_of(tx=f"'{'f' * 64}'", status="lost", of="paying"),  # status_known
+        attempt_of(tx=f"'{'f' * 64}'", method="wallet", of="paying"),  # method_known
+        attempt_of(tx="'xyz'", of="paying"),  # tx_id_hex64
+        attempt_of(tx=f"'{'f' * 64}'", status="invalid", of="paying"),  # resolved_at_iff_resolved
+        attempt_of(tx=f"'{'f' * 64}'", status="confirmed", resolved="now()", of="paying"),  # confirmed_at iff
         "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
         "'evt_' || repeat('f', 32), id, 'prepaid.refund.lost', '{}'::jsonb FROM merchants LIMIT 1",
     ):
@@ -879,6 +933,7 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
     await _execute(
         url,
         "DELETE FROM prepaid_ledger_entries",
+        "DELETE FROM prepaid_refund_payouts",
         "DELETE FROM prepaid_refunds",
         "DELETE FROM webhook_events",
         "UPDATE prepaid_balances SET refund_hold_sompi = 0, refunded_sompi = 0, balance_sompi = 70, expires_at = NULL",
@@ -1015,3 +1070,183 @@ async def test_0009_failed_delivery_credit_constraints_and_guarded_downgrade(pg_
             assert await conn.run_sync(_diff) == []
     finally:
         await migrated.dispose()
+
+
+async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(pg_server: PgServer) -> None:
+    """QA round: delivery outcome + stamped policy on settlements, call-only credit, clamped credit rows."""
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_credits_qa")
+    pg_server.create_database("kasgate_credits_qa")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0008_prepaid_refunds")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100000000, '{GET}' FROM merchants LIMIT 1",
+        _settlement_insert("a" * 64, "1" * 32),
+        "INSERT INTO prepaid_balances (id, merchant_id, payer_address, payer_public_key, balance_sompi, "
+        "deposited_sompi, debited_sompi) SELECT gen_random_uuid(), id, 'p', repeat('a', 64), 100, 100, 0 "
+        "FROM merchants LIMIT 1",
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    # Settlements from before the upgrade have no outcome and no stamped policy, so they are never credited.
+    assert await _scalar(url, "SELECT count(*) FROM settlements WHERE delivery_outcome IS NULL") == 1
+    assert await _scalar(url, "SELECT count(*) FROM settlements WHERE pending_alerted_at IS NULL") == 1
+    assert await _scalar(url, "SELECT count(*) FROM settlements WHERE failed_delivery_credit_policy IS NULL") == 1
+    assert await _scalar(url, "SELECT bool_and(failed_delivery_credit_timeouts) FROM merchants") is True
+    assert await _scalar(url, "SELECT credit_balance_sompi FROM prepaid_balances") == 0
+
+    tx_a = "'" + "a" * 64 + "'"
+    settlement_a = "(SELECT id FROM settlements WHERE tx_id = " + tx_a + ")"  # noqa: S608
+    for good in (
+        "UPDATE settlements SET delivery_outcome = 'pending', failed_delivery_credit_policy = 'errors'",
+        "UPDATE settlements SET delivery_outcome = 'delivered'",
+        "UPDATE settlements SET delivery_outcome = 'failed', delivery_failure = 'oversized'",
+        "UPDATE settlements SET delivery_outcome = 'failed', delivery_failure = 'upstream_5xx'",
+    ):
+        await _execute(url, good)
+    for bad in (
+        "UPDATE settlements SET delivery_outcome = 'lost'",  # ck_settlements_delivery_outcome_known
+        "UPDATE settlements SET delivery_failure = 'tired'",  # ck_settlements_delivery_failure_known
+        "UPDATE settlements SET delivery_outcome = 'delivered'",  # failure kept: delivery_failure_iff_failed
+        "UPDATE settlements SET delivery_failure = NULL",  # failed without a failure: delivery_failure_iff_failed
+        "UPDATE settlements SET failed_delivery_credit_policy = 'all'",  # ck_settlements_credit_policy_known
+        # credit_balance_within_spendable: at most what was credited and what the hold leaves spendable
+        "UPDATE prepaid_balances SET credit_balance_sompi = 1",
+        "UPDATE prepaid_balances SET credited_sompi = 50, balance_sompi = 150, credit_balance_sompi = 60",
+        "UPDATE prepaid_balances SET credited_sompi = 50, balance_sompi = 150, credit_balance_sompi = 50, "
+        "refund_hold_sompi = 101",
+        "UPDATE prepaid_balances SET credited_sompi = 50, balance_sompi = 150, credit_balance_sompi = -1",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+    await _execute(
+        url,
+        "UPDATE prepaid_balances SET credited_sompi = 50, balance_sompi = 150, credit_balance_sompi = 50, "
+        "refund_hold_sompi = 100",
+    )
+
+    entry = (
+        "INSERT INTO prepaid_ledger_entries (id, balance_id, merchant_id, payer_address, kind, direction, "
+        "amount_sompi, shortfall_sompi, balance_after_sompi, tx_id, settlement_id, slug, credit_reason) "
+        "SELECT gen_random_uuid(), b.id, b.merchant_id, 'p', {kind}, {direction}, {amount}, {shortfall}, 150, "
+        "{tx}, {settlement}, {slug}, {reason} FROM prepaid_balances b LIMIT 1"
+    )
+
+    def credit_row(amount: int, shortfall: int) -> str:
+        return entry.format(
+            kind="'failed_delivery_credit'",
+            direction="'credit'",
+            amount=amount,
+            shortfall=shortfall,
+            tx=tx_a,
+            settlement=settlement_a,
+            slug="'weather'",
+            reason="'attempts_exhausted'",
+        )
+
+    def expiry_row(amount: int, shortfall: int) -> str:
+        return entry.format(
+            kind="'expiry'",
+            direction="'debit'",
+            amount=amount,
+            shortfall=shortfall,
+            tx="NULL",
+            settlement="NULL",
+            slug="NULL",
+            reason="NULL",
+        )
+
+    for bad in (
+        credit_row(0, 0),  # ck_prepaid_ledger_entries_amount_valid: a 0 credit must carry its shortfall
+        credit_row(10, -1),  # ck_prepaid_ledger_entries_shortfall_only_on_credit_rows
+        expiry_row(0, 0),  # amount_valid: only refund rows (0008) and clamped credit rows may be 0
+        expiry_row(5, 1),  # shortfall_only_on_credit_rows
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+    await _execute(url, credit_row(0, 90))  # fully clamped by the cap: amount 0, shortfall 90
+    await _execute(url, _debit_insert("5" * 32, 1000), "UPDATE prepaid_debits SET credit_sompi = 1000")
+    for bad in (
+        "UPDATE prepaid_debits SET credit_sompi = 1001",  # ck_prepaid_debits_credit_within_amount
+        "UPDATE prepaid_debits SET credit_sompi = -1",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+    await _execute(
+        url,
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
+        "'evt_' || repeat('d', 32), id, 'prepaid.credit.failed_delivery_shortfall', '{}'::jsonb FROM merchants "
+        "LIMIT 1",
+    )
+
+    with pytest.raises(DBAPIError, match="failed-delivery credits"):
+        await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    await _execute(url, "DELETE FROM prepaid_ledger_entries", "DELETE FROM webhook_events")
+    with pytest.raises(DBAPIError, match="failed-delivery credits"):  # a credit-paid debit blocks it too
+        await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    await _execute(
+        url,
+        "DELETE FROM prepaid_debits",
+        "UPDATE prepaid_balances SET credited_sompi = 0, balance_sompi = 100, credit_balance_sompi = 0, "
+        "refund_hold_sompi = 0",
+    )
+    await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    # 0008's amount CHECK is back exactly: a 0-sompi refund row (late payout shortfall) stays allowed.
+    assert (
+        await _scalar(
+            url,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = 'ck_prepaid_ledger_entries_amount_valid'",
+        )
+        == "CHECK (((amount_sompi > 0) OR (((kind)::text = 'refund'::text) AND (amount_sompi = 0))))"
+    )
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE column_name IN ('delivery_outcome', "
+            "'delivery_failure', 'failed_delivery_credit_policy', 'credit_balance_sompi', "
+            "'failed_delivery_credit_timeouts', 'pending_alerted_at') "
+            "OR (table_name = 'prepaid_debits' AND column_name = 'credit_sompi') "
+            "OR (table_name = 'prepaid_ledger_entries' AND column_name = 'shortfall_sompi')",
+        )
+        == 0
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
+
+
+async def test_0009_head_passes_the_0008_schema_guard(pg_server: PgServer) -> None:
+    """The 0008 schema guard (final refund columns + prepaid_refund_payouts) must accept a database at 0009 head.
+
+    The guard does not inspect 0009-level columns; it must not false-positive once 0009 is applied on top of the
+    final 0008.
+    """
+    from app.schema_guard import stale_0008_problem
+
+    url = pg_server.make_url("kasgate_guard_head")
+    pg_server.create_database("kasgate_guard_head")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0008_prepaid_refunds")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+    finally:
+        await engine.dispose()
+    await asyncio.to_thread(command.upgrade, config, "head")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await engine.dispose()

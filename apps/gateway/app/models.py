@@ -51,7 +51,37 @@ TREASURY_SPLIT_SQL = (
     "payment_scheme = 'kaspa-exact-v2' OR "
     "(fee_amount_sompi > 0 AND treasury_address IS NOT NULL AND payment_nonce IS NOT NULL)"
 )
-UNDELIVERED_SETTLEMENT_SQL = "status = 'settled' AND (upstream_status_code IS NULL OR upstream_status_code >= 500)"
+
+
+def _sql_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
+# Failed-delivery auto-credit (CONTRACT v2.14). A /p settlement records how its LAST delivery ended:
+# `pending` is written with the settlement (and again by every redelivery claim) BEFORE the upstream is called,
+# `delivered` / `failed` after it answered. `credited` is terminal: the failure became prepaid credit. NULL = no
+# delivery outcome (prepaid deposits, rows from before 0009): never credited.
+DELIVERY_PENDING = "pending"
+DELIVERY_DELIVERED = "delivered"
+DELIVERY_FAILED = "failed"
+DELIVERY_CREDITED = "credited"
+DELIVERY_OUTCOMES: tuple[str, ...] = (DELIVERY_PENDING, DELIVERY_DELIVERED, DELIVERY_FAILED, DELIVERY_CREDITED)
+# Why a delivery failed. Only `upstream_5xx` and `connect_error` are credited by default; `timeout` unless the
+# merchant excluded timeouts; `oversized` (the upstream answered, the gateway refused to relay it) never.
+FAILURE_UPSTREAM_5XX = "upstream_5xx"
+FAILURE_CONNECT_ERROR = "connect_error"
+FAILURE_TIMEOUT = "timeout"
+FAILURE_OVERSIZED = "oversized"
+DELIVERY_FAILURES: tuple[str, ...] = (FAILURE_UPSTREAM_5XX, FAILURE_CONNECT_ERROR, FAILURE_TIMEOUT, FAILURE_OVERSIZED)
+# The merchant's failed-delivery credit policy, stamped on the settlement when it settles (NULL = not covered).
+CREDIT_POLICY_ERRORS = "errors"
+CREDIT_POLICY_ERRORS_AND_TIMEOUTS = "errors_and_timeouts"
+CREDIT_POLICIES: tuple[str, ...] = (CREDIT_POLICY_ERRORS, CREDIT_POLICY_ERRORS_AND_TIMEOUTS)
+DELIVERY_FAILURE_IFF_FAILED_SQL = "(delivery_failure IS NOT NULL) = (delivery_outcome IN ('failed', 'credited'))"
+UNDELIVERED_SETTLEMENT_SQL = (
+    "status = 'settled' AND delivery_outcome = 'failed' AND failed_delivery_credit_policy IS NOT NULL"
+)
+STALE_PENDING_SETTLEMENT_SQL = "status = 'settled' AND delivery_outcome = 'pending' AND pending_alerted_at IS NULL"
 EXACT_V2_SHAPE_SQL = (
     "payment_scheme <> 'kaspa-exact-v2' OR (fee_amount_sompi = 0 AND treasury_address IS NULL "
     "AND payment_nonce IS NULL AND k402_payment_id IS NULL AND payer_address IS NOT NULL)"
@@ -96,13 +126,18 @@ class Merchant(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     # CONTRACT v2.13: default prepaid credit expiry for this merchant's buyers (None = never expires).
     prepaid_expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Failed-delivery auto-credit policy (opt-out). Credits are on while `failed_delivery_credit_disabled_at` is NULL
-    # or older than `failed_delivery_credit_enabled_at`. A paid call is credited only if it settled inside the latest
-    # enabled interval, so neither turning the policy on nor turning it off is ever applied retroactively.
+    # Failed-delivery auto-credit policy (opt-out, CONTRACT v2.14). On while `failed_delivery_credit_disabled_at` is
+    # NULL or older than `failed_delivery_credit_enabled_at` (the times of the last switch). The policy in force is
+    # stamped on each settlement when it settles (`settlements.failed_delivery_credit_policy`), so a later switch
+    # never adds or drops credit for calls already paid.
     failed_delivery_credit_enabled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     failed_delivery_credit_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # False = upstream timeouts are not credited (5xx answers and connection errors still are).
+    failed_delivery_credit_timeouts: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
 
     endpoints: Mapped[list["Endpoint"]] = relationship(back_populates="merchant", cascade="all, delete-orphan")
     settlements: Mapped[list["Settlement"]] = relationship(back_populates="merchant")
@@ -226,6 +261,15 @@ class Settlement(Base):
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     k402_payment_id: Mapped[str | None] = mapped_column(String(18), nullable=True)
     delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    # CONTRACT v2.14: outcome of the last delivery (see DELIVERY_OUTCOMES), why it failed, the merchant's
+    # failed-delivery credit policy at settle time (NULL = this payment is never credited), and when a still-
+    # `pending` row was first alerted after the redelivery window plus grace.
+    delivery_outcome: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    delivery_failure: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    failed_delivery_credit_policy: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Set once when the ledger sweep finds this row still `pending` after the redelivery window plus grace
+    # (a crash or a failed outcome write). The settlement is not credited; operators alert on the ERROR log.
+    pending_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -240,8 +284,10 @@ class Settlement(Base):
         Index("ix_settlements_payer_address", "payer_address"),
         Index("ix_settlements_k402_payment_id", "k402_payment_id", unique=True),
         Index("ix_settlements_payment_identifier", "payment_identifier", unique=True),
-        # Failed-delivery auto-credit sweeper: settled calls with no upstream answer or a 5xx one.
+        # Failed-delivery auto-credit sweeper: covered settlements whose last delivery failed.
         Index("ix_settlements_undelivered", "settled_at", postgresql_where=UNDELIVERED_SETTLEMENT_SQL),
+        # Sweep of settlements still `pending` after the redelivery window plus grace (crash / lost outcome write).
+        Index("ix_settlements_stale_pending", "settled_at", postgresql_where=STALE_PENDING_SETTLEMENT_SQL),
         CheckConstraint("amount_sompi > 0", name="amount_positive"),
         CheckConstraint("merchant_amount_sompi > 0 AND fee_amount_sompi >= 0", name="outputs_positive"),
         CheckConstraint("merchant_amount_sompi + fee_amount_sompi = amount_sompi", name="split_sums_to_total"),
@@ -261,6 +307,10 @@ class Settlement(Base):
         CheckConstraint(
             "payment_scheme = 'k402-kaspa-utxo' OR payer_address IS NOT NULL", name="payer_required_for_v1"
         ),
+        CheckConstraint(f"delivery_outcome IN ({_sql_list(DELIVERY_OUTCOMES)})", name="delivery_outcome_known"),
+        CheckConstraint(f"delivery_failure IN ({_sql_list(DELIVERY_FAILURES)})", name="delivery_failure_known"),
+        CheckConstraint(DELIVERY_FAILURE_IFF_FAILED_SQL, name="delivery_failure_iff_failed"),
+        CheckConstraint(f"failed_delivery_credit_policy IN ({_sql_list(CREDIT_POLICIES)})", name="credit_policy_known"),
     )
 
 
@@ -271,7 +321,18 @@ PREPAID_DEBIT_REFUNDED = "refunded"
 BALANCE_IDENTITY_SQL = (
     "balance_sompi = deposited_sompi + credited_sompi - debited_sompi - refunded_sompi - expired_sompi"
 )
+# CONTRACT v2.14: `credit_balance_sompi` is the part of the balance that came from failed-delivery credits and is
+# still unspent. Calls spend it first; it is never refundable on-chain; expiry clears it. It never exceeds the
+# credit ever granted nor what is spendable (balance minus the refund hold), so refundable = spendable - it.
+CREDIT_BALANCE_SQL = "credit_balance_sompi BETWEEN 0 AND LEAST(credited_sompi, balance_sompi - refund_hold_sompi)"
 FAILED_DELIVERY_CREDIT_ROW_SQL = "kind = 'failed_delivery_credit'"
+# v2.13 (0008) allows a 0-sompi `refund` row (a late payout that found nothing left to debit); v2.14 adds a 0-sompi
+# failed-delivery credit row fully clamped by the balance cap (its shortfall > 0).
+LEDGER_AMOUNT_SQL = (
+    "amount_sompi > 0 OR (kind = 'refund' AND amount_sompi = 0) "
+    "OR (kind = 'failed_delivery_credit' AND amount_sompi = 0 AND shortfall_sompi > 0)"
+)
+LEDGER_SHORTFALL_SQL = "shortfall_sompi >= 0 AND (shortfall_sompi = 0 OR kind = 'failed_delivery_credit')"
 # Credit rows, and only they, carry settlement_id + slug + credit_reason; they also carry tx_id and are credits.
 CREDIT_ROWS_CARRY_SETTLEMENT_SQL = (
     "(kind = 'failed_delivery_credit') = (settlement_id IS NOT NULL) "
@@ -292,6 +353,8 @@ class PrepaidBalance(TimestampMixin, Base):
     CONTRACT v2.13: `refund_hold_sompi` is the part of the balance an open refund request has set aside (it cannot
     be spent); it leaves the balance as `refunded_sompi` only once the merchant's payout transaction is seen on-chain.
     Spendable credit is `balance_sompi - refund_hold_sompi`, and none while `expires_at` has passed.
+    CONTRACT v2.14: `credit_balance_sompi` is the unspent failed-delivery credit inside the balance. Debits spend it
+    before deposited funds, refunds can never take it (refundable = spendable - credit_balance) and expiry clears it.
     """
 
     __tablename__ = "prepaid_balances"
@@ -310,6 +373,7 @@ class PrepaidBalance(TimestampMixin, Base):
     expired_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     refund_hold_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     credited_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    credit_balance_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -323,6 +387,7 @@ class PrepaidBalance(TimestampMixin, Base):
         ),
         CheckConstraint(BALANCE_IDENTITY_SQL, name="balance_matches_totals"),
         CheckConstraint("credited_sompi >= 0", name="credited_not_negative"),
+        CheckConstraint(CREDIT_BALANCE_SQL, name="credit_balance_within_spendable"),
         CheckConstraint("refund_hold_sompi BETWEEN 0 AND balance_sompi", name="refund_hold_within_balance"),
         CheckConstraint("payer_public_key ~ '^[0-9a-f]{64}$'", name="payer_public_key_hex64"),
     )
@@ -388,6 +453,9 @@ class PrepaidDebit(Base):
     request_path: Mapped[str] = mapped_column(Text, nullable=False)
     body_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     upstream_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # CONTRACT v2.14: the part of `amount_sompi` paid from failed-delivery credit (spent first); a refunded debit
+    # gives exactly this part back to `credit_balance_sompi`, so a failed call never turns credit into deposit.
+    credit_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -401,17 +469,23 @@ class PrepaidDebit(Base):
         CheckConstraint("body_hash ~ '^[0-9a-f]{64}$'", name="body_hash_hex64"),
         CheckConstraint("status IN ('debited', 'refunded')", name="status_known"),
         CheckConstraint("(status = 'refunded') = (refunded_at IS NOT NULL)", name="refunded_at_iff_refunded"),
+        CheckConstraint("credit_sompi BETWEEN 0 AND amount_sompi", name="credit_within_amount"),
     )
 
 
 # ---------------------------------------------------------------- prepaid refunds and expiry (CONTRACT v2.13)
 
 PREPAID_REFUND_REQUESTED = "requested"
+PREPAID_REFUND_PAYING = "paying"
 PREPAID_REFUND_PAYOUT_SUBMITTED = "payout_submitted"
 PREPAID_REFUND_PAID = "paid"
 PREPAID_REFUND_REJECTED = "rejected"
 PREPAID_REFUND_CANCELLED = "cancelled"
-PREPAID_REFUND_OPEN_STATUSES: tuple[str, ...] = (PREPAID_REFUND_REQUESTED, PREPAID_REFUND_PAYOUT_SUBMITTED)
+PREPAID_REFUND_OPEN_STATUSES: tuple[str, ...] = (
+    PREPAID_REFUND_REQUESTED,
+    PREPAID_REFUND_PAYING,
+    PREPAID_REFUND_PAYOUT_SUBMITTED,
+)
 PREPAID_REFUND_STATUSES: tuple[str, ...] = (
     *PREPAID_REFUND_OPEN_STATUSES,
     PREPAID_REFUND_PAID,
@@ -425,10 +499,20 @@ LEDGER_KINDS: tuple[str, ...] = (LEDGER_KIND_REFUND, LEDGER_KIND_EXPIRY, LEDGER_
 CREDIT_REASON_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
 CREDIT_REASON_WINDOW_EXPIRED = "window_expired"
 CREDIT_REASONS: tuple[str, ...] = (CREDIT_REASON_ATTEMPTS_EXHAUSTED, CREDIT_REASON_WINDOW_EXPIRED)
-
-
-def _sql_list(values: tuple[str, ...]) -> str:
-    return ", ".join(f"'{value}'" for value in values)
+PAYOUT_ATTEMPT_PENDING = "pending"
+PAYOUT_ATTEMPT_CONFIRMED = "confirmed"
+PAYOUT_ATTEMPT_INVALID = "invalid"
+PAYOUT_ATTEMPT_DUPLICATE = "duplicate"
+PAYOUT_ATTEMPT_ABANDONED = "abandoned"
+PAYOUT_ATTEMPT_STATUSES: tuple[str, ...] = (
+    PAYOUT_ATTEMPT_PENDING,
+    PAYOUT_ATTEMPT_CONFIRMED,
+    PAYOUT_ATTEMPT_INVALID,
+    PAYOUT_ATTEMPT_DUPLICATE,
+    PAYOUT_ATTEMPT_ABANDONED,
+)
+# `scan`: found by the gateway itself on the node (mempool or UTXO index) when the buyer tried to cancel.
+PAYOUT_METHODS: tuple[str, ...] = ("tx_id", "transaction", "scan")
 
 
 class PrepaidRefund(TimestampMixin, Base):
@@ -438,6 +522,11 @@ class PrepaidRefund(TimestampMixin, Base):
     ordinary payment with no platform fee and no treasury output). Opening a request moves the amount into the
     balance's `refund_hold_sompi`; the ledger is debited only when the payout `tx_id` is seen on-chain (status
     `paid`). A rejected or cancelled request releases the hold. At most one request per balance is open at a time.
+
+    `paying` is the merchant's claim (before broadcasting): the buyer cannot cancel it. Every attempted payout
+    transaction is kept in `prepaid_refund_payouts`; `tx_id` here is the latest attempt while `payout_submitted` and
+    the confirmed payout once `paid`. A payout confirmed for a refund that was already cancelled or rejected is still
+    recorded (`late_paid_from`), debiting what the balance still holds (`shortfall_sompi` is what it could not).
     """
 
     __tablename__ = "prepaid_refunds"
@@ -457,8 +546,17 @@ class PrepaidRefund(TimestampMixin, Base):
     )
     # The single-use nonce of the signed buyer request that opened this refund.
     request_nonce: Mapped[str] = mapped_column(String(32), nullable=False)
-    # The merchant's payout transaction (set from payout_submitted on).
+    # The merchant's payout transaction (latest attempt while payout_submitted, the confirmed one once paid).
     tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The first claim: claims cannot be renewed past first_claimed_at + prepaid_refund_claim_max_seconds. Kept after
+    # the claim ends, so a cancel knows the merchant may have broadcast a payout.
+    first_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A cancelled refund the merchant had claimed keeps its amount in the balance's refund hold until this time.
+    hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set when a payout was confirmed after the refund had been cancelled or rejected.
+    late_paid_from: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    shortfall_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
     payout_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -469,18 +567,26 @@ class PrepaidRefund(TimestampMixin, Base):
         Index("ix_prepaid_refunds_tx_id", "tx_id", unique=True),
         Index("ix_prepaid_refunds_request_nonce", "request_nonce", unique=True),
         Index("ix_prepaid_refunds_merchant_status_created", "merchant_id", "status", "created_at"),
+        Index("ix_prepaid_refunds_hold_until", "hold_until", postgresql_where="hold_until IS NOT NULL"),
         Index(
             "ix_prepaid_refunds_open_balance_id",
             "balance_id",
             unique=True,
             postgresql_where=f"status IN ({_sql_list(PREPAID_REFUND_OPEN_STATUSES)})",
         ),
-        Index(
-            "ix_prepaid_refunds_payout_submitted",
-            "payout_submitted_at",
-            postgresql_where=f"status = '{PREPAID_REFUND_PAYOUT_SUBMITTED}'",
-        ),
         CheckConstraint("amount_sompi > 0", name="amount_positive"),
+        CheckConstraint("shortfall_sompi BETWEEN 0 AND amount_sompi", name="shortfall_within_amount"),
+        CheckConstraint(
+            "late_paid_from IS NULL OR (late_paid_from IN ('cancelled', 'rejected') AND status = 'paid')",
+            name="late_paid_from_known",
+        ),
+        CheckConstraint("late_paid_from IS NOT NULL OR shortfall_sompi = 0", name="shortfall_only_when_late"),
+        CheckConstraint("status <> 'paying' OR claimed_at IS NOT NULL", name="paying_is_claimed"),
+        CheckConstraint(
+            "claimed_at IS NULL OR first_claimed_at IS NOT NULL",
+            name="claimed_has_first_claim",
+        ),
+        CheckConstraint("hold_until IS NULL OR status = 'cancelled'", name="hold_until_only_cancelled"),
         CheckConstraint(f"status IN ({_sql_list(PREPAID_REFUND_STATUSES)})", name="status_known"),
         CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
         CheckConstraint("request_nonce ~ '^[0-9a-f]{32}$'", name="request_nonce_hex32"),
@@ -501,7 +607,8 @@ class PrepaidLedgerEntry(Base):
     """One movement of a prepaid balance that is neither a deposit nor a call debit: a paid refund, an expiry, or a
     failed-delivery credit.
 
-    `amount_sompi` is always positive; `direction` says which way it moved the balance. Refund rows carry the
+    `amount_sompi` is positive, except for a late payout (of an already cancelled or rejected refund) that found
+    nothing left to debit, recorded with 0; `direction` says which way it moved the balance. Refund rows carry the
     merchant's payout `tx_id` and `refund_id`. `failed_delivery_credit` rows (direction `credit`) carry the paid
     call's on-chain `tx_id`, its `settlement_id`, the endpoint `slug` and the `credit_reason`; their amount is the
     merchant share of that payment (the treasury fee in output 1 is never reversed). At most one credit row exists
@@ -532,6 +639,8 @@ class PrepaidLedgerEntry(Base):
     )
     slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
     credit_reason: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Credit rows: the part of the merchant share NOT credited because the balance reached PREPAID_MAX_BALANCE_SOMPI.
+    shortfall_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -547,7 +656,8 @@ class PrepaidLedgerEntry(Base):
         Index("ix_prepaid_ledger_entries_balance_id", "balance_id"),
         Index("ix_prepaid_ledger_entries_merchant_created", "merchant_id", "created_at"),
         Index("ix_prepaid_ledger_entries_refund_id", "refund_id", unique=True),
-        CheckConstraint("amount_sompi > 0", name="amount_positive"),
+        CheckConstraint(LEDGER_AMOUNT_SQL, name="amount_valid"),
+        CheckConstraint(LEDGER_SHORTFALL_SQL, name="shortfall_only_on_credit_rows"),
         CheckConstraint("balance_after_sompi >= 0", name="balance_after_not_negative"),
         CheckConstraint(f"kind IN ({_sql_list(LEDGER_KINDS)})", name="kind_known"),
         CheckConstraint("direction IN ('credit', 'debit')", name="direction_known"),
@@ -560,6 +670,56 @@ class PrepaidLedgerEntry(Base):
             name="credit_rows_carry_settlement",
         ),
         CheckConstraint(f"credit_reason IN ({_sql_list(CREDIT_REASONS)})", name="credit_reason_known"),
+    )
+
+
+class PrepaidRefundPayout(TimestampMixin, Base):
+    """Every payout transaction a merchant posted (or the gateway broadcast) for a refund, kept for good.
+
+    A tx_id can belong to one refund only (unique index). `pending` attempts are re-checked by the ledger worker,
+    even after the refund went back to `requested`, until confirmed, proven invalid, or `abandoned` after
+    `prepaid_payout_attempt_max_seconds`. `payload_verified` records that the `kasgate:v1:refund:<id>` payload was
+    seen (mempool entry or the signed transaction itself), which a later UTXO-index sighting relies on.
+    """
+
+    __tablename__ = "prepaid_refund_payouts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    refund_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prepaid_refunds.id", ondelete="RESTRICT"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
+    tx_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=PAYOUT_ATTEMPT_PENDING, server_default=PAYOUT_ATTEMPT_PENDING
+    )
+    payload_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    check_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_prepaid_refund_payouts_tx_id", "tx_id", unique=True),
+        Index("ix_prepaid_refund_payouts_refund_id", "refund_id"),
+        Index(
+            "ix_prepaid_refund_payouts_pending_next_check",
+            "next_check_at",
+            postgresql_where=f"status = '{PAYOUT_ATTEMPT_PENDING}'",
+        ),
+        CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
+        CheckConstraint(f"status IN ({_sql_list(PAYOUT_ATTEMPT_STATUSES)})", name="status_known"),
+        CheckConstraint(f"method IN ({_sql_list(PAYOUT_METHODS)})", name="method_known"),
+        CheckConstraint("check_count >= 0 AND error_count >= 0", name="counts_not_negative"),
+        CheckConstraint("(status = 'pending') = (resolved_at IS NULL)", name="resolved_at_iff_resolved"),
+        CheckConstraint(
+            "(status IN ('confirmed', 'duplicate')) = (confirmed_at IS NOT NULL)", name="confirmed_at_iff_confirmed"
+        ),
     )
 
 
@@ -665,8 +825,10 @@ WEBHOOK_EVENT_TYPES: tuple[str, ...] = (
     "prepaid.refund.paid",
     "prepaid.refund.rejected",
     "prepaid.refund.cancelled",
+    "prepaid.refund.payout_reverted",
     "prepaid.credit.expired",
     "prepaid.credit.failed_delivery",
+    "prepaid.credit.failed_delivery_shortfall",
 )
 WEBHOOK_TEST_EVENT = "webhook.test"
 WEBHOOK_EVENT_TYPES_SQL = ", ".join(f"'{name}'" for name in (*WEBHOOK_EVENT_TYPES, WEBHOOK_TEST_EVENT))

@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
-from app.ledger import credit_expiry, expire_balance_for, spendable_sompi
+from app.ledger import credit_expiry, expire_balance_for, refundable_sompi, spendable_sompi
 from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
@@ -161,6 +161,8 @@ def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBa
         spendable_sompi=str(spendable_sompi(balance)),
         expires_at=None if balance is None else balance.expires_at,
         credited_sompi=str(0 if balance is None else balance.credited_sompi),
+        credit_balance_sompi=str(0 if balance is None else balance.credit_balance_sompi),
+        refundable_sompi=str(refundable_sompi(balance)),
     )
 
 

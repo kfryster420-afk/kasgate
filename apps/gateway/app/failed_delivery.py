@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import ColumnElement, and_, exists, func, literal, or_, select, tuple_
+from sqlalchemy import ColumnElement, and_, exists, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -39,8 +39,16 @@ from app.deps import get_db_session
 from app.kaspa_types import payer_public_key, validate_kaspa_address
 from app.ledger import credit_expiry, expire_balance_for
 from app.models import (
+    CREDIT_POLICY_ERRORS,
+    CREDIT_POLICY_ERRORS_AND_TIMEOUTS,
     CREDIT_REASON_ATTEMPTS_EXHAUSTED,
     CREDIT_REASON_WINDOW_EXPIRED,
+    DELIVERY_CREDITED,
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+    FAILURE_CONNECT_ERROR,
+    FAILURE_TIMEOUT,
+    FAILURE_UPSTREAM_5XX,
     LEDGER_KIND_FAILED_DELIVERY_CREDIT,
     Endpoint,
     Merchant,
@@ -52,6 +60,7 @@ from app.models import (
 )
 from app.schemas import (
     SLUG_RE,
+    DeliveryFailureName,
     FailedDeliveryCreditReason,
     FailedDeliveryCreditReceipt,
     FailedDeliveryPolicyRead,
@@ -65,48 +74,77 @@ from app.webhooks import enqueue_event
 logger = logging.getLogger("kasgate.failed_delivery")
 
 EVENT_TYPE: Final = "prepaid.credit.failed_delivery"
+SHORTFALL_EVENT_TYPE: Final = "prepaid.credit.failed_delivery_shortfall"
 SCHEME_K402: Final = "k402-kaspa-utxo"
 
 
 # ---------------------------------------------------------------- policy and eligibility
 
 
-def upstream_failed(status_code: int | None) -> bool:
-    """No upstream answer (None) or a 5xx one."""
-    return status_code is None or status_code >= 500
-
-
 def policy_enabled(merchant: Merchant) -> bool:
+    """On while it was never switched off, or was switched back on after the last switch off."""
     disabled = merchant.failed_delivery_credit_disabled_at
     return disabled is None or disabled < merchant.failed_delivery_credit_enabled_at
 
 
-def policy_covers(merchant: Merchant, settled_at: datetime) -> bool:
-    """True when the call settled inside the merchant's latest enabled interval."""
-    if settled_at < merchant.failed_delivery_credit_enabled_at:
+def stamped_policy(merchant: Merchant) -> str | None:
+    """The value stamped on a settlement that settles now: None = this payment is never credited."""
+    if not policy_enabled(merchant):
+        return None
+    return CREDIT_POLICY_ERRORS_AND_TIMEOUTS if merchant.failed_delivery_credit_timeouts else CREDIT_POLICY_ERRORS
+
+
+async def credit_policy_for(session: AsyncSession, merchant_id: uuid.UUID) -> str | None:
+    """Settle-time stamp for `settlements.failed_delivery_credit_policy` (CONTRACT v2.14)."""
+    merchant = (await session.execute(select(Merchant).where(Merchant.id == merchant_id))).scalar_one()
+    return stamped_policy(merchant)
+
+
+def creditable_failure(settlement: Settlement) -> bool:
+    """The last delivery failed in a way the policy stamped at settle time credits.
+
+    5xx answers and connection errors are credited; timeouts only under `errors_and_timeouts`; an oversized body
+    (the upstream answered, the gateway refused to relay it) never. A NULL, `pending` or `delivered` outcome is
+    never a credit: only an explicitly recorded failure is.
+    """
+    policy = settlement.failed_delivery_credit_policy
+    if policy is None or settlement.delivery_outcome != DELIVERY_FAILED:
         return False
-    disabled = merchant.failed_delivery_credit_disabled_at
-    return policy_enabled(merchant) or disabled is None or settled_at < disabled
+    failure = settlement.delivery_failure
+    if failure == FAILURE_UPSTREAM_5XX:
+        return settlement.upstream_status_code is not None and settlement.upstream_status_code >= 500
+    if failure == FAILURE_CONNECT_ERROR:
+        return True
+    return failure == FAILURE_TIMEOUT and policy == CREDIT_POLICY_ERRORS_AND_TIMEOUTS
 
 
-def _policy_covers_sql() -> ColumnElement[bool]:
-    enabled_at = Merchant.failed_delivery_credit_enabled_at
-    disabled_at = Merchant.failed_delivery_credit_disabled_at
+def _creditable_failure_sql() -> ColumnElement[bool]:
     return and_(
-        Settlement.settled_at >= enabled_at,
-        or_(disabled_at.is_(None), disabled_at < enabled_at, Settlement.settled_at < disabled_at),
+        Settlement.delivery_outcome == DELIVERY_FAILED,
+        Settlement.failed_delivery_credit_policy.is_not(None),
+        or_(
+            and_(Settlement.delivery_failure == FAILURE_UPSTREAM_5XX, Settlement.upstream_status_code >= 500),
+            Settlement.delivery_failure == FAILURE_CONNECT_ERROR,
+            and_(
+                Settlement.delivery_failure == FAILURE_TIMEOUT,
+                Settlement.failed_delivery_credit_policy == CREDIT_POLICY_ERRORS_AND_TIMEOUTS,
+            ),
+        ),
     )
 
 
 def redelivery_closed(settings: Settings, settlement: Settlement, now: datetime) -> FailedDeliveryCreditReason | None:
-    """Why this settlement can no longer be redelivered, or None while a redelivery is still possible."""
+    """Why this settlement can no longer be redelivered, or None while a redelivery is still possible.
+
+    `now` is the database clock (the redelivery claim checks its window on the same clock).
+    """
     if settlement.delivery_attempts >= settings.redelivery_max_attempts or settings.redelivery_window_seconds == 0:
         return "attempts_exhausted"
     settled_at = settlement.settled_at
     if settled_at is None:
         return None
     closes = settled_at + timedelta(
-        seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_grace_seconds
+        seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_wait_seconds
     )
     return "window_expired" if closes <= now else None
 
@@ -120,10 +158,14 @@ class CreditOutcome:
     merchant_id: uuid.UUID
     tx_id: str
     credit_sompi: int
+    shortfall_sompi: int
     balance_sompi: int
     reason: FailedDeliveryCreditReason
 
-    def receipt(self) -> FailedDeliveryCreditReceipt:
+    def receipt(self) -> FailedDeliveryCreditReceipt | None:
+        """The X-KasGate-Credit body, or None when the balance cap left nothing to credit."""
+        if self.credit_sompi <= 0:
+            return None
         return FailedDeliveryCreditReceipt(
             creditId=self.entry_id,
             kind="failed_delivery_credit",
@@ -132,13 +174,22 @@ class CreditOutcome:
             creditSompi=str(self.credit_sompi),
             balanceSompi=str(self.balance_sompi),
             reason=self.reason,
+            shortfallSompi=str(self.shortfall_sompi) if self.shortfall_sompi else None,
         )
 
 
-def _credit_note(settlement: Settlement, reason: str) -> str:
-    status = "no response" if settlement.upstream_status_code is None else f"HTTP {settlement.upstream_status_code}"
+def _credit_note(settlement: Settlement, reason: str, shortfall: int) -> str:
+    if settlement.delivery_failure == FAILURE_UPSTREAM_5XX:
+        status = f"HTTP {settlement.upstream_status_code}"
+    elif settlement.delivery_failure == FAILURE_TIMEOUT:
+        status = "timeout"
+    else:
+        status = "no response"
     attempts = settlement.delivery_attempts
-    return f"upstream {status} after {attempts} deliver{'y' if attempts == 1 else 'ies'} ({reason})"
+    note = f"upstream {status} after {attempts} deliver{'y' if attempts == 1 else 'ies'} ({reason})"
+    if shortfall:
+        note += f"; {shortfall} sompi not credited (prepaid balance cap)"
+    return note
 
 
 async def credit_failed_delivery(
@@ -146,13 +197,15 @@ async def credit_failed_delivery(
 ) -> CreditOutcome | None:
     """Credit one failed delivery if it is eligible now; None when it is not (or was already credited). Commits.
 
+    One transaction: lock the settlement, re-check eligibility on the database clock, expire overdue credit, clamp
+    the credit to PREPAID_MAX_BALANCE_SOMPI, raise the balance (credited + call-only credit_balance), write the
+    ledger row (with any shortfall), mark the settlement `credited` and queue the signed webhook(s).
     Raises SQLAlchemyError only for unexpected database failures (the caller rolls back and logs).
     """
     settings = get_settings()
-    current = now or datetime.now(UTC)
     row = (
         await session.execute(
-            select(Settlement, Merchant, Endpoint)
+            select(Settlement, Merchant, Endpoint, func.now())
             .join(Merchant, Merchant.id == Settlement.merchant_id)
             .join(Endpoint, Endpoint.id == Settlement.endpoint_id)
             .where(Settlement.id == settlement_id)
@@ -163,8 +216,8 @@ async def credit_failed_delivery(
     if row is None:
         await session.rollback()
         return None
-    settlement, merchant, endpoint = row
-    reason = _eligible_reason(settings, settlement, merchant, current)
+    settlement, merchant, endpoint, db_now = row
+    reason = _eligible_reason(settings, settlement, now or db_now)
     public_key = None if settlement.payer_address is None else payer_public_key(settlement.payer_address)
     if reason is None or public_key is None or settlement.payer_address is None:
         await session.rollback()
@@ -182,35 +235,48 @@ async def credit_failed_delivery(
         return None
 
     payer = settlement.payer_address
-    credit = settlement.merchant_amount_sompi
+    share = settlement.merchant_amount_sompi
     await expire_balance_for(session, merchant.id, public_key)
-    new_expiry, next_expiry = await credit_expiry(session, endpoint)
-    balance_id, balance = (
+    await session.execute(
+        pg_insert(PrepaidBalance)
+        .values(
+            id=uuid.uuid4(),
+            merchant_id=merchant.id,
+            payer_address=payer,
+            payer_public_key=public_key,
+            balance_sompi=0,
+            deposited_sompi=0,
+            debited_sompi=0,
+        )
+        .on_conflict_do_nothing(index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key])
+    )
+    balance_id, current = (
         await session.execute(
-            pg_insert(PrepaidBalance)
-            .values(
-                id=uuid.uuid4(),
-                merchant_id=merchant.id,
-                payer_address=payer,
-                payer_public_key=public_key,
-                balance_sompi=credit,
-                deposited_sompi=0,
-                debited_sompi=0,
-                credited_sompi=credit,
-                expires_at=new_expiry,
-            )
-            .on_conflict_do_update(
-                index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key],
-                set_={
-                    "balance_sompi": PrepaidBalance.balance_sompi + credit,
-                    "credited_sompi": PrepaidBalance.credited_sompi + credit,
-                    "expires_at": next_expiry,
-                    "updated_at": func.now(),
-                },
-            )
-            .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
+            select(PrepaidBalance.id, PrepaidBalance.balance_sompi)
+            .where(PrepaidBalance.merchant_id == merchant.id, PrepaidBalance.payer_public_key == public_key)
+            .with_for_update()
         )
     ).one()
+    # CONTRACT v2.14: credits respect the prepaid balance cap; what does not fit is recorded as the shortfall.
+    credit = max(0, min(share, settings.prepaid_max_balance_sompi - int(current)))
+    shortfall = share - credit
+    balance = int(current)
+    if credit > 0:
+        _new_expiry, next_expiry = await credit_expiry(session, endpoint)
+        balance = (
+            await session.execute(
+                update(PrepaidBalance)
+                .where(PrepaidBalance.id == balance_id)
+                .values(
+                    balance_sompi=PrepaidBalance.balance_sompi + credit,
+                    credited_sompi=PrepaidBalance.credited_sompi + credit,
+                    credit_balance_sompi=PrepaidBalance.credit_balance_sompi + credit,
+                    expires_at=next_expiry,
+                    updated_at=func.now(),
+                )
+                .returning(PrepaidBalance.balance_sompi)
+            )
+        ).scalar_one()
     entry = PrepaidLedgerEntry(
         id=uuid.uuid4(),
         balance_id=balance_id,
@@ -219,14 +285,15 @@ async def credit_failed_delivery(
         kind=LEDGER_KIND_FAILED_DELIVERY_CREDIT,
         direction="credit",
         amount_sompi=credit,
+        shortfall_sompi=shortfall,
         balance_after_sompi=int(balance),
         tx_id=settlement.tx_id,
         refund_id=None,
-        note=_credit_note(settlement, reason),
+        note=_credit_note(settlement, reason, shortfall),
         settlement_id=settlement.id,
         slug=endpoint.slug,
         credit_reason=reason,
-        created_at=current,
+        created_at=datetime.now(UTC),
     )
     session.add(entry)
     try:
@@ -235,34 +302,48 @@ async def credit_failed_delivery(
         await session.rollback()
         logger.info("failed delivery of tx %s was already credited", settlement.tx_id)
         return None
-    await enqueue_event(
-        session,
-        merchant_id=merchant.id,
-        event_type=EVENT_TYPE,
-        data={
-            "ledger_entry_id": str(entry.id),
-            "kind": LEDGER_KIND_FAILED_DELIVERY_CREDIT,
-            "settlement_id": str(settlement.id),
-            "tx_id": settlement.tx_id,
-            "payment_scheme": settlement.payment_scheme,
-            "endpoint_id": str(endpoint.id),
-            "endpoint_slug": endpoint.slug,
-            "payer_address": payer,
-            "amount_sompi": str(settlement.amount_sompi),
-            "fee_sompi": str(settlement.fee_amount_sompi),
-            "credit_sompi": str(credit),
-            "balance_sompi": str(int(balance)),
-            "reason": reason,
-            "upstream_status_code": settlement.upstream_status_code,
-            "delivery_attempts": settlement.delivery_attempts,
-            "settled_at": None if settlement.settled_at is None else settlement.settled_at.isoformat(),
-        },
-        source_id=str(entry.id),
+    await session.execute(
+        update(Settlement).where(Settlement.id == settlement.id).values(delivery_outcome=DELIVERY_CREDITED)
     )
+    base = {
+        "ledger_entry_id": str(entry.id),
+        "kind": LEDGER_KIND_FAILED_DELIVERY_CREDIT,
+        "settlement_id": str(settlement.id),
+        "tx_id": settlement.tx_id,
+        "payment_scheme": settlement.payment_scheme,
+        "endpoint_id": str(endpoint.id),
+        "endpoint_slug": endpoint.slug,
+        "payer_address": payer,
+        "amount_sompi": str(settlement.amount_sompi),
+        "fee_sompi": str(settlement.fee_amount_sompi),
+        "credit_sompi": str(credit),
+        "shortfall_sompi": str(shortfall),
+        "balance_sompi": str(int(balance)),
+        "reason": reason,
+        "delivery_failure": settlement.delivery_failure,
+        "upstream_status_code": settlement.upstream_status_code,
+        "delivery_attempts": settlement.delivery_attempts,
+        "settled_at": None if settlement.settled_at is None else settlement.settled_at.isoformat(),
+    }
+    if credit > 0:
+        await enqueue_event(session, merchant_id=merchant.id, event_type=EVENT_TYPE, data=base, source_id=str(entry.id))
+    if shortfall > 0:
+        await enqueue_event(
+            session,
+            merchant_id=merchant.id,
+            event_type=SHORTFALL_EVENT_TYPE,
+            data={
+                **base,
+                "merchant_share_sompi": str(share),
+                "max_balance_sompi": str(settings.prepaid_max_balance_sompi),
+            },
+            source_id=str(entry.id),
+        )
     await session.commit()
     logger.info(
-        "credited %s sompi to %s at merchant %s for failed delivery of tx %s (%s)",
+        "credited %s sompi (shortfall %s) to %s at merchant %s for failed delivery of tx %s (%s)",
         credit,
+        shortfall,
         payer,
         merchant.id,
         settlement.tx_id,
@@ -273,22 +354,20 @@ async def credit_failed_delivery(
         merchant_id=merchant.id,
         tx_id=settlement.tx_id,
         credit_sompi=credit,
+        shortfall_sompi=shortfall,
         balance_sompi=int(balance),
         reason=reason,
     )
 
 
-def _eligible_reason(
-    settings: Settings, settlement: Settlement, merchant: Merchant, now: datetime
-) -> FailedDeliveryCreditReason | None:
+def _eligible_reason(settings: Settings, settlement: Settlement, now: datetime) -> FailedDeliveryCreditReason | None:
     if (
         settlement.status != SettlementStatus.SETTLED
         or settlement.settled_at is None
         or settlement.payment_scheme == SCHEME_K402
         or settlement.payer_address is None
         or settlement.merchant_amount_sompi <= 0
-        or not upstream_failed(settlement.upstream_status_code)
-        or not policy_covers(merchant, settlement.settled_at)
+        or not creditable_failure(settlement)
     ):
         return None
     return redelivery_closed(settings, settlement, now)
@@ -307,32 +386,26 @@ async def credit_if_exhausted(session: AsyncSession, settlement_id: uuid.UUID) -
         return None
 
 
-async def sweep_failed_deliveries(
-    maker: async_sessionmaker[AsyncSession], *, limit: int, now: datetime | None = None
-) -> int:
+async def sweep_failed_deliveries(maker: async_sessionmaker[AsyncSession], *, limit: int) -> int:
     """Ledger-worker pass: credit every eligible failed delivery whose redelivery window has closed. Returns how many
-    were credited. Walks the candidates in (settled_at, id) order, `limit` per query, inside the lookback horizon."""
+    were credited. Walks the candidates in (settled_at, id) order, `limit` per query, inside the lookback horizon.
+    Times are compared on the database clock, the same clock the redelivery claim uses."""
     settings = get_settings()
-    current = now or datetime.now(UTC)
-    cutoff = current - timedelta(
-        seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_grace_seconds
-    )
-    horizon = current - timedelta(seconds=settings.failed_delivery_credit_lookback_seconds)
+    closed_after = timedelta(seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_wait_seconds)
+    lookback = timedelta(seconds=settings.failed_delivery_credit_lookback_seconds)
     credited = 0
     cursor: tuple[datetime, uuid.UUID] | None = None
     while True:
         query = (
             select(Settlement.id, Settlement.settled_at)
-            .join(Merchant, Merchant.id == Settlement.merchant_id)
             .where(
                 Settlement.status == SettlementStatus.SETTLED,
-                or_(Settlement.upstream_status_code.is_(None), Settlement.upstream_status_code >= 500),
+                _creditable_failure_sql(),
                 Settlement.settled_at.is_not(None),
-                Settlement.settled_at >= horizon,
-                Settlement.settled_at <= cutoff,
+                Settlement.settled_at >= func.now() - lookback,
+                Settlement.settled_at <= func.now() - closed_after,
                 Settlement.payer_address.is_not(None),
                 Settlement.payment_scheme != SCHEME_K402,
-                _policy_covers_sql(),
                 ~exists().where(PrepaidLedgerEntry.settlement_id == Settlement.id),
                 ~exists().where(PrepaidDeposit.settlement_id == Settlement.id),
             )
@@ -348,7 +421,7 @@ async def sweep_failed_deliveries(
         for settlement_id, _settled_at in rows:
             async with maker() as session:
                 try:
-                    if await credit_failed_delivery(session, settlement_id, now=current) is not None:
+                    if await credit_failed_delivery(session, settlement_id) is not None:
                         credited += 1
                 except SQLAlchemyError:
                     await session.rollback()
@@ -361,9 +434,71 @@ async def sweep_failed_deliveries(
         cursor = (last_settled, last_id)
 
 
+STALE_PENDING_ALERT: Final = (
+    "delivery outcome still pending after the redelivery window: settlement %s (tx %s) settled at %s; "
+    "it will not be credited. Reconcile delivery_outcome from kasgate:deadletter:delivery-outcomes or "
+    "the process log, then set delivery_outcome/delivery_failure by hand."
+)
+
+
+async def alert_stale_pending_deliveries(maker: async_sessionmaker[AsyncSession], *, limit: int) -> int:
+    """Ledger-worker pass: log ERROR once for each settlement still `pending` after the redelivery window plus
+    grace (a crash mid-call, or an outcome write that never landed). Never credits them.
+
+    Deduped by `settlements.pending_alerted_at` (FOR UPDATE SKIP LOCKED, so replicas share the work). Times use
+    the database clock and the same window, grace and lookback as the credit sweep. Returns how many were newly
+    alerted.
+    """
+    settings = get_settings()
+    closed_after = timedelta(seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_wait_seconds)
+    lookback = timedelta(seconds=settings.failed_delivery_credit_lookback_seconds)
+    alerted = 0
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while True:
+        query = (
+            select(Settlement.id, Settlement.settled_at, Settlement.tx_id)
+            .where(
+                Settlement.status == SettlementStatus.SETTLED,
+                Settlement.delivery_outcome == DELIVERY_PENDING,
+                Settlement.pending_alerted_at.is_(None),
+                Settlement.settled_at.is_not(None),
+                Settlement.settled_at >= func.now() - lookback,
+                Settlement.settled_at <= func.now() - closed_after,
+            )
+            .order_by(Settlement.settled_at, Settlement.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        if cursor is not None:
+            query = query.where(
+                tuple_(Settlement.settled_at, Settlement.id) > tuple_(literal(cursor[0]), literal(cursor[1]))
+            )
+        async with maker() as session:
+            rows = list((await session.execute(query)).all())
+            if not rows:
+                return alerted
+            ids = [row[0] for row in rows]
+            await session.execute(
+                update(Settlement)
+                .where(Settlement.id.in_(ids), Settlement.pending_alerted_at.is_(None))
+                .values(pending_alerted_at=func.now())
+            )
+            await session.commit()
+        for settlement_id, settled_at, tx_id in rows:
+            logger.error(STALE_PENDING_ALERT, settlement_id, tx_id, settled_at)
+            alerted += 1
+        if len(rows) < limit:
+            return alerted
+        last = rows[-1]
+        if last[1] is None:
+            return alerted
+        cursor = (last[1], last[0])
+
+
 async def sweep_pass(maker: async_sessionmaker[AsyncSession], limit: int) -> int:
-    """`LedgerPass` adapter so the ledger worker runs the sweep on its timer."""
-    return await sweep_failed_deliveries(maker, limit=limit)
+    """`LedgerPass` adapter so the ledger worker runs the credit sweep and the stale-pending alert on its timer."""
+    credited = await sweep_failed_deliveries(maker, limit=limit)
+    return credited + await alert_stale_pending_deliveries(maker, limit=limit)
 
 
 # ---------------------------------------------------------------- merchant routes
@@ -376,6 +511,7 @@ CurrentMerchant = Annotated[Merchant, Depends(get_current_merchant)]
 def _policy_read(merchant: Merchant) -> FailedDeliveryPolicyRead:
     return FailedDeliveryPolicyRead(
         enabled=policy_enabled(merchant),
+        credit_timeouts=merchant.failed_delivery_credit_timeouts,
         enabled_at=merchant.failed_delivery_credit_enabled_at,
         disabled_at=merchant.failed_delivery_credit_disabled_at,
     )
@@ -390,13 +526,20 @@ async def read_policy(merchant: CurrentMerchant) -> FailedDeliveryPolicyRead:
 async def update_policy(
     payload: FailedDeliveryPolicyUpdate, merchant: CurrentMerchant, session: DbSession
 ) -> FailedDeliveryPolicyRead:
-    """Opt in or out of failed-delivery auto-credit. Setting the current state again changes nothing."""
-    if payload.enabled != policy_enabled(merchant):
+    """Opt in or out, and choose whether timeouts are credited. Applies to calls that SETTLE afterwards only: the
+    policy is stamped on each settlement, so calls already paid keep the policy they were paid under."""
+    changed = False
+    if payload.enabled is not None and payload.enabled != policy_enabled(merchant):
         now = datetime.now(UTC)
         if payload.enabled:
             merchant.failed_delivery_credit_enabled_at = now
         else:
             merchant.failed_delivery_credit_disabled_at = now
+        changed = True
+    if payload.credit_timeouts is not None and payload.credit_timeouts != merchant.failed_delivery_credit_timeouts:
+        merchant.failed_delivery_credit_timeouts = payload.credit_timeouts
+        changed = True
+    if changed:
         session.add(merchant)
         await session.commit()
         await session.refresh(merchant)
@@ -448,6 +591,15 @@ def _credit_read(entry: PrepaidLedgerEntry, settlement: Settlement) -> PrepaidCr
     reason: FailedDeliveryCreditReason = (
         "attempts_exhausted" if entry.credit_reason == CREDIT_REASON_ATTEMPTS_EXHAUSTED else "window_expired"
     )
+    failure: DeliveryFailureName
+    if settlement.delivery_failure == FAILURE_UPSTREAM_5XX:
+        failure = "upstream_5xx"
+    elif settlement.delivery_failure == FAILURE_TIMEOUT:
+        failure = "timeout"
+    elif settlement.delivery_failure == FAILURE_CONNECT_ERROR:
+        failure = "connect_error"
+    else:
+        raise ValueError(f"settlement {settlement.id} has no creditable delivery failure")
     scheme: PaymentScheme
     if settlement.payment_scheme == "kaspa-exact-v2":
         scheme = "kaspa-exact-v2"
@@ -467,8 +619,10 @@ def _credit_read(entry: PrepaidLedgerEntry, settlement: Settlement) -> PrepaidCr
         amount_sompi=str(settlement.amount_sompi),
         fee_sompi=str(settlement.fee_amount_sompi),
         credit_sompi=str(entry.amount_sompi),
+        shortfall_sompi=str(entry.shortfall_sompi),
         balance_after_sompi=str(entry.balance_after_sompi),
         reason=reason,
+        delivery_failure=failure,
         upstream_status_code=settlement.upstream_status_code,
         delivery_attempts=settlement.delivery_attempts,
         settled_at=settlement.settled_at,

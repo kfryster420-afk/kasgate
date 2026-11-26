@@ -13,10 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.failed_delivery import (
+    alert_stale_pending_deliveries,
     credit_failed_delivery,
-    policy_covers,
     policy_enabled,
     redelivery_closed,
+    stamped_policy,
     sweep_failed_deliveries,
     sweep_pass,
 )
@@ -128,30 +129,26 @@ async def _exhaust(client: httpx.AsyncClient, tx_id: str = TX, slug: str = "weat
 # ---------------------------------------------------------------- pure policy rules
 
 
-def _merchant(enabled_at: datetime, disabled_at: datetime | None) -> Merchant:
+def _merchant(enabled_at: datetime, disabled_at: datetime | None, *, timeouts: bool = True) -> Merchant:
     return Merchant(
         kaspa_address=MERCHANT_ADDRESS,
         display_name="m",
         api_key_hash="a" * 64,
         failed_delivery_credit_enabled_at=enabled_at,
         failed_delivery_credit_disabled_at=disabled_at,
+        failed_delivery_credit_timeouts=timeouts,
     )
 
 
-def test_policy_covers_only_the_latest_enabled_interval() -> None:
+def test_policy_stamp_follows_the_last_switch() -> None:
     t0 = datetime(2026, 11, 1, tzinfo=UTC)
     on = _merchant(t0, None)
-    assert policy_enabled(on)
-    assert policy_covers(on, t0) and policy_covers(on, t0 + timedelta(days=9))
-    assert not policy_covers(on, t0 - timedelta(seconds=1))  # never retroactive
+    assert policy_enabled(on) and stamped_policy(on) == "errors_and_timeouts"
+    assert stamped_policy(_merchant(t0, None, timeouts=False)) == "errors"
     off = _merchant(t0, t0 + timedelta(hours=1))
-    assert not policy_enabled(off)
-    assert policy_covers(off, t0 + timedelta(minutes=59))  # paid while on: still credited after opting out
-    assert not policy_covers(off, t0 + timedelta(hours=1))
+    assert not policy_enabled(off) and stamped_policy(off) is None
     back_on = _merchant(t0 + timedelta(hours=2), t0 + timedelta(hours=1))
-    assert policy_enabled(back_on)
-    assert not policy_covers(back_on, t0 + timedelta(minutes=90))  # paid while off: never credited
-    assert policy_covers(back_on, t0 + timedelta(hours=3))
+    assert policy_enabled(back_on) and stamped_policy(back_on) == "errors_and_timeouts"
 
 
 def test_redelivery_closed_reasons(override_settings: SettingsOverride) -> None:
@@ -511,8 +508,16 @@ async def test_policy_defaults_on_and_can_be_switched_off_and_on(
     read = await client.get("/v1/prepaid/failed-delivery-policy", headers=auth)
     assert read.status_code == 200
     assert read.json()["enabled"] is True and read.json()["disabled_at"] is None
+    assert read.json()["credit_timeouts"] is True
     assert (await client.get("/v1/prepaid/failed-delivery-policy")).status_code == 401
-    for bad in ({"enabled": "no"}, {"enabled": 0}, {}, {"enabled": True, "extra": 1}):
+    for bad in (
+        {"enabled": "no"},
+        {"enabled": 0},
+        {},
+        {"enabled": None, "credit_timeouts": None},
+        {"credit_timeouts": "yes"},
+        {"enabled": True, "extra": 1},
+    ):
         assert (await client.put("/v1/prepaid/failed-delivery-policy", json=bad, headers=auth)).status_code == 422
 
     off = await client.put("/v1/prepaid/failed-delivery-policy", json={"enabled": False}, headers=auth)
@@ -526,8 +531,8 @@ async def test_policy_defaults_on_and_can_be_switched_off_and_on(
     assert await _credits(sessionmaker) == []
 
     on = await client.put("/v1/prepaid/failed-delivery-policy", json={"enabled": True}, headers=auth)
-    assert on.json()["enabled"] is True
-    # turning it back on is not retroactive: the call paid while it was off stays uncredited
+    assert on.json()["enabled"] is True and on.json()["credit_timeouts"] is True
+    # turning it back on is not retroactive: the call paid while it was off stays uncredited (stamped NULL)
     async with sessionmaker() as session:
         settlement_id = (await session.execute(select(Settlement.id))).scalar_one()
         assert await credit_failed_delivery(session, settlement_id) is None
@@ -586,8 +591,10 @@ async def test_each_credit_sends_one_signed_webhook(
         "amount_sompi": str(PRICE_SOMPI),
         "fee_sompi": str(SPLIT.fee_sompi),
         "credit_sompi": str(SPLIT.merchant_sompi),
+        "shortfall_sompi": "0",
         "balance_sompi": str(SPLIT.merchant_sompi),
         "reason": "attempts_exhausted",
+        "delivery_failure": "upstream_5xx",
         "upstream_status_code": 502,
         "delivery_attempts": 3,
         "settled_at": settlement.settled_at.isoformat() if settlement.settled_at else None,
@@ -797,30 +804,253 @@ async def test_credit_expires_overdue_credit_before_adding_the_new_credit(
     _expires_around(row.expires_at, before, 1)
 
 
-async def test_credit_may_exceed_prepaid_max_balance_as_restitution(
+async def test_credit_is_clamped_to_prepaid_max_balance_and_the_shortfall_is_recorded(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: SettingsOverride,
+    webhook_receiver: WebhookReceiver,
+) -> None:
+    """Revised decision 4: a credit never lifts a balance above PREPAID_MAX_BALANCE_SOMPI. The cut part is kept on
+    the ledger row (`shortfall_sompi`) and announced with a signed `prepaid.credit.failed_delivery_shortfall`."""
+    created = await client.post(
+        "/v1/webhooks",
+        json={"url": HOOK_URL, "event_types": ["prepaid.credit.failed_delivery_shortfall"]},
+        headers=bearer(seeded.api_key),
+    )
+    assert created.status_code == 201, created.text
+    secret = WebhookCreated.model_validate(created.json()).secret
+    await add_endpoint(sessionmaker, seeded.merchant_id, "cheap")
+    await fund(client)
+    cap = DEPOSIT_SOMPI
+    override_settings(prepaid_max_balance_sompi=cap)
+    _fail_upstream(upstream)
+    receipt = _receipt((await _exhaust(client))[-1])
+    room = cap - CREDIT_SOMPI
+    assert (int(receipt.creditSompi), receipt.shortfallSompi) == (room, str(SPLIT.merchant_sompi - room))
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    assert (row.balance_sompi, row.credited_sompi, row.credit_balance_sompi) == (cap, room, room)
+    [entry] = await _credits(sessionmaker)
+    assert (entry.amount_sompi, entry.shortfall_sompi) == (room, SPLIT.merchant_sompi - room)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(webhook_receiver)) as hook_client:
+        assert await deliver_due(sessionmaker, hook_client) == 1
+    [request] = webhook_receiver.requests
+    assert verify_signature(secret, request.headers[WEBHOOK_SIGNATURE_HEADER], request.content)
+    envelope: dict[str, Any] = json.loads(request.content)
+    assert envelope["type"] == "prepaid.credit.failed_delivery_shortfall"
+    assert (envelope["data"]["credit_sompi"], envelope["data"]["shortfall_sompi"]) == (
+        str(room),
+        str(SPLIT.merchant_sompi - room),
+    )
+    assert envelope["data"]["merchant_share_sompi"] == str(SPLIT.merchant_sompi)
+    assert envelope["data"]["max_balance_sompi"] == str(cap)
+
+
+async def test_a_full_balance_gets_a_zero_credit_row_and_only_the_shortfall_event(
     client: httpx.AsyncClient,
     seeded: Seed,
     upstream: Upstream,
     sessionmaker: async_sessionmaker[AsyncSession],
     override_settings: SettingsOverride,
 ) -> None:
-    """A failed-delivery credit is restitution of sompi the buyer already paid, so it may exceed the deposit cap."""
+    subscribed = await client.post(
+        "/v1/webhooks",
+        json={
+            "url": HOOK_URL,
+            "event_types": ["prepaid.credit.failed_delivery", "prepaid.credit.failed_delivery_shortfall"],
+        },
+        headers=bearer(seeded.api_key),
+    )
+    assert subscribed.status_code == 201, subscribed.text
     await add_endpoint(sessionmaker, seeded.merchant_id, "cheap")
     await fund(client)
-    override_settings(prepaid_max_balance_sompi=DEPOSIT_SOMPI)
-    refused = await client.post(
-        "/v1/prepaid/deposits/quote",
-        json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": DEPOSIT_SOMPI},
-    )
-    assert refused.status_code == 422 and "cap" in refused.json()["detail"]
+    override_settings(prepaid_max_balance_sompi=60_000_000)
+    async with sessionmaker() as session:
+        # Lift the balance to the cap with deposited credit (identity kept), so nothing is left for a credit.
+        await session.execute(
+            update(PrepaidBalance).values(
+                balance_sompi=60_000_000, deposited_sompi=PrepaidBalance.deposited_sompi + 20_000_000
+            )
+        )
+        await session.commit()
     _fail_upstream(upstream)
-    receipt = _receipt((await _exhaust(client))[-1])
-    assert int(receipt.creditSompi) == SPLIT.merchant_sompi
-    row = await _balance(sessionmaker, seeded.merchant_id)
-    assert row is not None
-    assert (row.deposited_sompi, row.credited_sompi, row.balance_sompi) == (
-        CREDIT_SOMPI,
-        SPLIT.merchant_sompi,
-        CREDIT_SOMPI + SPLIT.merchant_sompi,
+    responses = await _exhaust(client)
+    assert HEADER_FAILED_DELIVERY_CREDIT not in responses[-1].headers  # nothing was credited
+    [entry] = await _credits(sessionmaker)
+    assert (entry.amount_sompi, entry.shortfall_sompi) == (0, SPLIT.merchant_sompi)
+    async with sessionmaker() as session:
+        types = [e.event_type for e in (await session.execute(select(WebhookEvent))).scalars()]
+    assert "prepaid.credit.failed_delivery" not in types
+    assert types.count("prepaid.credit.failed_delivery_shortfall") == 1
+    async with sessionmaker() as session:
+        outcome = (
+            await session.execute(select(Settlement.delivery_outcome).where(Settlement.tx_id == TX))
+        ).scalar_one()
+    assert outcome == "credited"
+    # The settlement is closed: no redelivery and no second credit row.
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
+
+
+# ---------------------------------------------------------------- what gets credited (QA decision 3)
+
+
+async def test_timeouts_are_credited_by_default_and_never_once_the_merchant_excludes_them(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    upstream.handler = timeout
+    responses = await _exhaust(client)
+    assert responses[-1].status_code == 502
+    assert _receipt(responses[-1]).reason == "attempts_exhausted"
+    assert (await _settlement(sessionmaker)).delivery_failure == "timeout"
+    off = await client.put(
+        "/v1/prepaid/failed-delivery-policy", json={"credit_timeouts": False}, headers=bearer(seeded.api_key)
     )
-    assert row.balance_sompi > DEPOSIT_SOMPI
+    assert off.status_code == 200 and off.json() == {**off.json(), "enabled": True, "credit_timeouts": False}
+    later = await _exhaust(client, TX2)
+    assert HEADER_FAILED_DELIVERY_CREDIT not in later[-1].headers
+    await _age(sessionmaker, WINDOW_PAST)
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
+    assert len(await _credits(sessionmaker)) == 1
+    # A 5xx and a connection error are still credited under the `errors` policy.
+    _fail_upstream(upstream)
+    third = await _exhaust(client, "cf" * 32)
+    assert HEADER_FAILED_DELIVERY_CREDIT in third[-1].headers
+
+
+async def test_an_unrecorded_delivery_outcome_is_alerted_and_never_credited(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    redis: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The outcome write fails: the settlement stays `pending` (written before the upstream call), the failure is
+    logged at ERROR and pushed to the delivery-outcome dead-letter list, and `pending` is never credited."""
+    import app.proxy as proxy_module
+
+    async def broken(*args: Any, **kwargs: Any) -> None:
+        raise proxy_module.DeliveryOutcomeError('{"settlementId": "x"}')
+
+    monkeypatch.setattr(proxy_module, "_write_delivery_outcome", broken)
+    _fail_upstream(upstream, 503)
+    with caplog.at_level("ERROR", logger="kasgate.proxy"):
+        responses = await _exhaust(client)
+    assert all(r.status_code == 503 for r in responses)
+    assert HEADER_FAILED_DELIVERY_CREDIT not in responses[-1].headers
+    assert any("unrecorded delivery outcome" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    assert await redis.llen(proxy_module.DELIVERY_OUTCOME_DEAD_LETTER_KEY) == 3
+    monkeypatch.undo()
+    settlement = await _settlement(sessionmaker)
+    assert (settlement.delivery_outcome, settlement.delivery_failure) == ("pending", None)
+    await _age(sessionmaker, WINDOW_PAST)
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
+    assert await _credits(sessionmaker) == []
+
+
+# ---------------------------------------------------------------- stale pending alert (crash / lost outcome write)
+
+
+async def test_a_settlement_still_pending_after_the_window_is_alerted_once(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A settlement left `pending` past the redelivery window plus grace (crash mid-call or a lost outcome write)
+    is logged at ERROR once; it is never credited. A second pass is a no-op."""
+    served = await client.get("/p/weather", headers=await paid_headers(client, TX))
+    assert served.status_code == 200
+    async with sessionmaker() as session:
+        await session.execute(
+            update(Settlement).values(delivery_outcome="pending", delivery_failure=None, upstream_status_code=None)
+        )
+        await session.commit()
+    # Still inside the window: no alert, no credit.
+    assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    await _age(sessionmaker, WINDOW_PAST)
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 1
+    settlement = await _settlement(sessionmaker)
+    assert settlement.delivery_outcome == "pending"
+    assert settlement.pending_alerted_at is not None
+    assert any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage()
+        and str(settlement.id) in rec.getMessage()
+        and TX in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelname == "ERROR"
+    )
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    assert not any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage() for rec in caplog.records
+    )
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
+    assert await _credits(sessionmaker) == []
+
+
+async def test_delivered_and_failed_settlements_are_not_pending_alerts(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX))).status_code == 200
+    _fail_upstream(upstream, 503)
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX2))).status_code == 503
+    await _age(sessionmaker, WINDOW_PAST)
+    assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    async with sessionmaker() as session:
+        outcomes = {
+            row[0]: (row[1], row[2])
+            for row in (
+                await session.execute(
+                    select(Settlement.tx_id, Settlement.delivery_outcome, Settlement.pending_alerted_at)
+                )
+            ).all()
+        }
+    assert outcomes[TX] == ("delivered", None)
+    assert outcomes[TX2] == ("failed", None)
+
+
+async def test_ledger_worker_pass_alerts_stale_pending_and_credits_failures(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    stub_engine: StubEngine,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    served = await client.get("/p/weather", headers=await paid_headers(client, TX))
+    assert served.status_code == 200
+    async with sessionmaker() as session:
+        await session.execute(
+            update(Settlement).where(Settlement.tx_id == TX).values(delivery_outcome="pending", delivery_failure=None)
+        )
+        await session.commit()
+    _fail_upstream(upstream, 503)
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX2))).status_code == 503
+    await _age(sessionmaker, WINDOW_PAST)
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await run_ledger_pass(sessionmaker, stub_engine, [sweep_pass]) == 2
+    assert any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage() for rec in caplog.records
+    )
+    async with sessionmaker() as session:
+        pending = (await session.execute(select(Settlement).where(Settlement.tx_id == TX))).scalar_one()
+        failed = (await session.execute(select(Settlement).where(Settlement.tx_id == TX2))).scalar_one()
+    assert pending.delivery_outcome == "pending" and pending.pending_alerted_at is not None
+    assert failed.delivery_outcome == "credited"
+    assert len(await _credits(sessionmaker)) == 1

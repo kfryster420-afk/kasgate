@@ -573,6 +573,10 @@ def build_server(
             "payout_address": refund.payout_address,
             "tx_id": refund.tx_id,
             "reason": refund.reason,
+            "late_paid_from": refund.late_paid_from,
+            "shortfall_sompi": int(refund.shortfall_sompi),
+            "claim_expires_at": refund.claim_expires_at.isoformat() if refund.claim_expires_at else None,
+            "hold_until": refund.hold_until.isoformat() if refund.hold_until else None,
             "created_at": refund.created_at.isoformat(),
             "paid_at": refund.paid_at.isoformat() if refund.paid_at else None,
         }
@@ -612,11 +616,14 @@ def build_server(
         return _describe_refund(refund)
 
     @server.tool()
-    async def prepaid_refunds(slug: str) -> dict[str, Any]:
-        """This buyer key's refund requests at the merchant behind `slug`, newest first (reads only, signs nothing)."""
+    async def prepaid_refunds(slug: str, include_reasons: bool = False) -> dict[str, Any]:
+        """This buyer key's refund requests at the merchant behind `slug`, newest first.
+
+        By default a public read that signs nothing (the merchant's reject reasons are withheld). With
+        include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
         slug = validate_slug(slug)
         try:
-            refunds = await paying_client().prepaid_refunds(cfg.gateway_url, slug)
+            refunds = await paying_client().prepaid_refunds(cfg.gateway_url, slug, signed=include_reasons)
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:

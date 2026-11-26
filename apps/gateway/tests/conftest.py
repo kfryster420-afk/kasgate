@@ -55,6 +55,7 @@ from app.kaspa_engine import PaymentVerificationError, VerifiedPayment  # noqa: 
 from app.main import create_app  # noqa: E402
 from app.models import Endpoint, Merchant, PriceCurrency  # noqa: E402
 from app.oracle import OracleUnavailableError  # noqa: E402
+from app.payments import PayoutSighting  # noqa: E402
 from app.schemas import (  # noqa: E402
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_SIGNATURE,
@@ -184,9 +185,14 @@ class StubEngine:
         # CONTRACT v2.13 refund payouts: (tx_id, to_address, amount) seen by verify_payout / submit_payout.
         self.payout_checks: list[tuple[str, str, int]] = []
         self.payout_submits: list[tuple[str, bytes, str, int]] = []
+        self.payout_refund_ids: list[uuid.UUID] = []
         self.payout_error: Exception | None = None
-        self.payout_tx_id = "e" * 64
+        self.payout_tx_id_value = "e" * 64
         self.payout_accepted = True
+        # What find_refund_payouts reports (the cancel-time node check), the calls it got, and an error to raise.
+        self.payout_sightings: list[PayoutSighting] = []
+        self.payout_scans: list[tuple[str, int, uuid.UUID]] = []
+        self.payout_scan_error: Exception | None = None
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
         return VerifiedPayment(
@@ -280,11 +286,26 @@ class StubEngine:
             raise self.error
         return verification.payment
 
-    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None:
+    async def verify_payout(
+        self, tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None:
         self.payout_checks.append((tx_id, to_address, amount_sompi))
+        self.payout_refund_ids.append(refund_id)
         self.events.append("verify_payout")
         if self.payout_error is not None:
             raise self.payout_error
+
+    def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
+        return self.payout_tx_id_value
+
+    async def find_refund_payouts(
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+    ) -> list[PayoutSighting]:
+        self.payout_scans.append((to_address, amount_sompi, refund_id))
+        self.events.append("find_refund_payouts")
+        if self.payout_scan_error is not None:
+            raise self.payout_scan_error
+        return list(self.payout_sightings)
 
     async def submit_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
@@ -293,7 +314,7 @@ class StubEngine:
         self.events.append("submit_payout")
         if self.payout_error is not None:
             raise self.payout_error
-        return self.payout_tx_id, self.payout_accepted
+        return self.payout_tx_id_value, self.payout_accepted
 
     def fail(self, code: str, message: str = "rejected") -> None:
         """Make the submission step (`settle`) fail with a verification error."""

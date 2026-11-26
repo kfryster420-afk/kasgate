@@ -786,12 +786,21 @@ class KasGateClient:
         """Withdraw a refund the merchant has not paid yet; the held credit becomes spendable again."""
         return await self._signed_refund(gateway_url, slug, "cancel", None, uuid.UUID(str(refund_id)))
 
-    async def prepaid_refunds(self, gateway_url: str | httpx.URL, slug: str) -> list[PrepaidRefund]:
-        """This key's refunds at the merchant behind `slug`, newest first (public read; never signs)."""
-        origin = self._origin(self._absolute(gateway_url))
-        response = await self._http.get(
-            origin + REFUND_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
-        )
+    async def prepaid_refunds(
+        self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = False
+    ) -> list[PrepaidRefund]:
+        """This key's refunds at the merchant behind `slug`, newest first.
+
+        Unsigned (default) it is the public read: the merchant's reject `reason` and payout errors are withheld.
+        With `signed=True` it signs a `status` challenge (moves nothing) and the rows include them."""
+        if signed:
+            origin, (_, signed_body) = await self._sign_refund_challenge(gateway_url, slug, "status", None, None)
+            response = await self._http.post(origin + REFUND_STATUS_PATH, json=signed_body)
+        else:
+            origin = self._origin(self._absolute(gateway_url))
+            response = await self._http.get(
+                origin + REFUND_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
+            )
         if response.status_code != 200:
             code, message = error_details(response)
             raise PaymentRejectedError(response.status_code, code, message, response)
@@ -808,6 +817,34 @@ class KasGateClient:
         amount_sompi: int | None,
         refund_id: uuid.UUID | None,
     ) -> PrepaidRefund:
+        origin, (challenge, signed) = await self._sign_refund_challenge(
+            gateway_url, slug, action, amount_sompi, refund_id
+        )
+        target = REFUNDS_PATH if refund_id is None else f"{REFUNDS_PATH}/{refund_id}/cancel"
+        response = await self._http.post(origin + target, json=signed)
+        if response.status_code not in (200, 201):
+            code, message = error_details(response)
+            if response.status_code == 409 and code == "challenge_replayed":
+                raise PaymentReplayedError(409, code, message, response)
+            raise PaymentRejectedError(response.status_code, code, message, response)
+        try:
+            refund = PrepaidRefund.model_validate(response.json())
+        except ValueError as exc:
+            raise PaymentReceiptError(f"refund cannot be decoded: {exc}", response) from exc
+        if refund.payer_address != self.address or int(refund.amount_sompi) != int(challenge.amount_sompi):
+            raise PaymentReceiptError("refund does not match the signed request", response)
+        return refund
+
+    async def _sign_refund_challenge(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        action: RefundAction,
+        amount_sompi: int | None,
+        refund_id: uuid.UUID | None,
+    ) -> tuple[str, tuple[PrepaidRefundChallenge, dict[str, str]]]:
+        """Fetch, check (validate_refund_challenge) and sign one refund challenge; returns (origin, (challenge,
+        {nonce, signature}))."""
         url = self._absolute(gateway_url)
         origin = self._origin(url)
         body: dict[str, Any] = {"slug": slug, "payer_address": self.address, "action": action}
@@ -835,20 +872,7 @@ class KasGateClient:
             refund_id=refund_id,
         )
         signed = {"nonce": challenge.nonce, "signature": kaspa.sign_message(challenge.message, self._private_key)}
-        target = REFUNDS_PATH if refund_id is None else f"{REFUNDS_PATH}/{refund_id}/cancel"
-        response = await self._http.post(origin + target, json=signed)
-        if response.status_code not in (200, 201):
-            code, message = error_details(response)
-            if response.status_code == 409 and code == "challenge_replayed":
-                raise PaymentReplayedError(409, code, message, response)
-            raise PaymentRejectedError(response.status_code, code, message, response)
-        try:
-            refund = PrepaidRefund.model_validate(response.json())
-        except ValueError as exc:
-            raise PaymentReceiptError(f"refund cannot be decoded: {exc}", response) from exc
-        if refund.payer_address != self.address or int(refund.amount_sompi) != int(challenge.amount_sompi):
-            raise PaymentReceiptError("refund does not match the signed request", response)
-        return refund
+        return origin, (challenge, signed)
 
     # ------------------------------------------------------------------ free trial calls (CONTRACT v2.12)
 

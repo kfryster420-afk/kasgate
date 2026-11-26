@@ -596,8 +596,39 @@ RATE_LIMIT_UNPAID_PROXY = RateLimit("proxy_unpaid", "rl_unpaid_proxy_per_minute"
 RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hour", 3600)
 
 
+RATE_LIMIT_PREPAID_REFUND = RateLimit("prepaid_refund", "rl_prepaid_refund_per_minute", 60)
+# Per merchant (not per IP): POST /v1/prepaid/refunds/{id}/payout.
+RATE_LIMIT_REFUND_PAYOUT = RateLimit("refund_payout", "rl_refund_payout_per_merchant_per_minute", 60)
+
+
+def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+
+
 def client_ip(request: Request) -> str:
-    return request.client.host if request.client is not None else "unknown"
+    """The client IP for rate limits: the TCP peer, or, when the peer is a configured trusted proxy
+    (`TRUSTED_PROXY_IPS`), the right-most X-Forwarded-For hop that is not itself a trusted proxy.
+
+    X-Forwarded-For from any other peer is ignored, so a buyer cannot pick their own rate-limit bucket.
+    """
+    peer = request.client.host if request.client is not None else "unknown"
+    networks = get_settings().trusted_proxy_networks
+    peer_ip = _parse_ip(peer)
+    if not networks or peer_ip is None or not any(peer_ip in net for net in networks):
+        return peer
+    forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
+    client = peer
+    for hop in reversed([part for part in forwarded.split(",") if part.strip()]):
+        hop_ip = _parse_ip(hop)
+        if hop_ip is None:
+            break
+        client = str(hop_ip)
+        if not any(hop_ip in net for net in networks):
+            break
+    return client
 
 
 async def enforce_rate_limit(redis: Redis, rule: RateLimit, subject: str) -> None:

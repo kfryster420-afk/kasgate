@@ -116,8 +116,10 @@ class KasGateSyncClient:
     ) -> PrepaidRefund:
         return self._call(self._client.prepaid_refund_cancel(gateway_url, slug, refund_id))
 
-    def prepaid_refunds(self, gateway_url: str | httpx.URL, slug: str) -> list[PrepaidRefund]:
-        return self._call(self._client.prepaid_refunds(gateway_url, slug))
+    def prepaid_refunds(
+        self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = False
+    ) -> list[PrepaidRefund]:
+        return self._call(self._client.prepaid_refunds(gateway_url, slug, signed=signed))
 
     def trial_status(self, gateway_url: str | httpx.URL, slug: str) -> TrialStatus:
         return self._call(self._client.trial_status(gateway_url, slug))

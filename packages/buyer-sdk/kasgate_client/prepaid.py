@@ -105,8 +105,8 @@ class PrepaidBalance(_Model):
     credited_sompi: BalanceStr | None = None
 
 
-RefundAction = Literal["request", "cancel"]
-RefundStatus = Literal["requested", "payout_submitted", "paid", "rejected", "cancelled"]
+RefundAction = Literal["request", "cancel", "status"]
+RefundStatus = Literal["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"]
 
 
 class PrepaidRefundChallenge(_Model):
@@ -116,14 +116,21 @@ class PrepaidRefundChallenge(_Model):
     slug: str
     merchant_id: uuid.UUID
     payer_address: str
-    amount_sompi: PositiveSompiStr
+    amount_sompi: BalanceStr
+    """The refund amount; "0" for a `status` challenge."""
     refund_id: uuid.UUID | None = None
     spendable_sompi: BalanceStr
     expires_at: datetime
 
 
 class PrepaidRefund(_Model):
-    """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was seen on-chain."""
+    """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was accepted on-chain.
+
+    `paying`: the merchant claimed it and is paying (it can no longer be cancelled until `claim_expires_at`). The
+    public list hides `reason`, `last_error` and the claim (`paying` reads as `requested`, claim times null);
+    `prepaid_refunds(..., signed=True)` returns them. `hold_until`: a refund cancelled after a claim keeps its
+    amount set aside until then (a payout may still land). `late_paid_from` is set when the payout landed after the
+    refund was cancelled or rejected (`shortfall_sompi`: credit already gone by then)."""
 
     id: uuid.UUID
     merchant_id: uuid.UUID
@@ -140,6 +147,12 @@ class PrepaidRefund(_Model):
     resolved_at: datetime | None = None
     payout_address: str
     payout_payload_hex: str
+    claimed_at: datetime | None = None
+    first_claimed_at: datetime | None = None
+    claim_expires_at: datetime | None = None
+    hold_until: datetime | None = None
+    late_paid_from: Literal["cancelled", "rejected"] | None = None
+    shortfall_sompi: BalanceStr = "0"
 
 
 class PrepaidDebitHeader(X402Header):
@@ -203,7 +216,8 @@ def build_prepaid_refund_message(
     nonce: str,
     expires_at: datetime,
 ) -> str:
-    """The exact text signed to open or cancel one refund; identical to the gateway's builder (CONTRACT v2.13)."""
+    """The exact text signed to open or cancel one refund, or to read one's own refunds (`status`, amount 0);
+    identical to the gateway's builder (CONTRACT v2.13)."""
     return (
         "KasGate\n"
         f"Domain: {domain}\n"
@@ -248,6 +262,12 @@ def validate_refund_challenge(
             raise InvalidChallengeError(f"refund challenge names {amount} sompi, not the {amount_sompi} requested")
         if amount_sompi is None and amount > int(challenge.spendable_sompi):
             raise InvalidChallengeError("refund challenge asks for more than the spendable credit")
+        if amount <= 0:
+            raise InvalidChallengeError("refund challenge names no amount")
+    if action == "status" and amount != 0:
+        raise InvalidChallengeError("a status challenge must name amount 0")
+    if action == "cancel" and amount <= 0:
+        raise InvalidChallengeError("refund challenge names no amount")
     if challenge.expires_at.tzinfo is None or challenge.expires_at <= (now or datetime.now(UTC)):
         raise InvalidChallengeError("refund challenge has already expired")
     expected = build_prepaid_refund_message(

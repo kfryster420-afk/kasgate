@@ -8,9 +8,11 @@ Create Date: 2026-11-26 00:00:00
 * `prepaid_balances`: `refunded_sompi`, `expired_sompi`, `refund_hold_sompi`, `expires_at`; the balance identity
   becomes `balance = deposited - debited - refunded - expired` and the hold stays within the balance.
 * `prepaid_refunds`: one row per signed buyer refund request (unique request nonce, unique payout tx_id, at most one
-  open request per balance).
+  open request per balance; `paying` = claimed by the merchant; late payouts of closed refunds are recorded).
+* `prepaid_refund_payouts`: every attempted payout transaction (explicit unique index on tx_id, index on refund_id,
+  partial index of pending re-checks).
 * `prepaid_ledger_entries`: paid refunds and expiries (explicit index on tx_id, unique refund_id).
-* The webhook event type CHECK gains the five v2.13 event types.
+* The webhook event type CHECK gains the six v2.13 event types.
 
 Existing balances keep `expires_at` NULL (never expire): a policy is never applied retroactively.
 Downgrade refuses while any refund, ledger entry, expiring balance or expiry policy exists.
@@ -34,9 +36,9 @@ OLD_EVENT_TYPES_SQL = (
 NEW_EVENT_TYPES_SQL = (
     "'payment.settled', 'prepaid.deposit', 'prepaid.debit', 'trial.used', 'endpoint.created', "
     "'endpoint.updated', 'prepaid.refund.requested', 'prepaid.refund.paid', 'prepaid.refund.rejected', "
-    "'prepaid.refund.cancelled', 'prepaid.credit.expired', 'webhook.test'"
+    "'prepaid.refund.cancelled', 'prepaid.refund.payout_reverted', 'prepaid.credit.expired', 'webhook.test'"
 )
-OPEN_STATUSES_SQL = "status IN ('requested', 'payout_submitted')"
+OPEN_STATUSES_SQL = "status IN ('requested', 'paying', 'payout_submitted')"
 
 
 def upgrade() -> None:
@@ -87,6 +89,11 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=16), server_default="requested", nullable=False),
         sa.Column("request_nonce", sa.String(length=32), nullable=False),
         sa.Column("tx_id", sa.String(length=64), nullable=True),
+        sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("first_claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("hold_until", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("late_paid_from", sa.String(length=16), nullable=True),
+        sa.Column("shortfall_sompi", sa.BigInteger(), server_default="0", nullable=False),
         sa.Column("reason", sa.String(length=300), nullable=True),
         sa.Column("last_error", sa.String(length=300), nullable=True),
         sa.Column("payout_submitted_at", sa.DateTime(timezone=True), nullable=True),
@@ -96,7 +103,28 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint("amount_sompi > 0", name=op.f("ck_prepaid_refunds_amount_positive")),
         sa.CheckConstraint(
-            "status IN ('requested', 'payout_submitted', 'paid', 'rejected', 'cancelled')",
+            "shortfall_sompi BETWEEN 0 AND amount_sompi", name=op.f("ck_prepaid_refunds_shortfall_within_amount")
+        ),
+        sa.CheckConstraint(
+            "late_paid_from IS NULL OR (late_paid_from IN ('cancelled', 'rejected') AND status = 'paid')",
+            name=op.f("ck_prepaid_refunds_late_paid_from_known"),
+        ),
+        sa.CheckConstraint(
+            "late_paid_from IS NOT NULL OR shortfall_sompi = 0",
+            name=op.f("ck_prepaid_refunds_shortfall_only_when_late"),
+        ),
+        sa.CheckConstraint(
+            "status <> 'paying' OR claimed_at IS NOT NULL", name=op.f("ck_prepaid_refunds_paying_is_claimed")
+        ),
+        sa.CheckConstraint(
+            "claimed_at IS NULL OR first_claimed_at IS NOT NULL",
+            name=op.f("ck_prepaid_refunds_claimed_has_first_claim"),
+        ),
+        sa.CheckConstraint(
+            "hold_until IS NULL OR status = 'cancelled'", name=op.f("ck_prepaid_refunds_hold_until_only_cancelled")
+        ),
+        sa.CheckConstraint(
+            "status IN ('requested', 'paying', 'payout_submitted', 'paid', 'rejected', 'cancelled')",
             name=op.f("ck_prepaid_refunds_status_known"),
         ),
         sa.CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name=op.f("ck_prepaid_refunds_tx_id_hex64")),
@@ -149,11 +177,69 @@ def upgrade() -> None:
         postgresql_where=sa.text(OPEN_STATUSES_SQL),
     )
     op.create_index(
-        "ix_prepaid_refunds_payout_submitted",
+        "ix_prepaid_refunds_hold_until",
         "prepaid_refunds",
-        ["payout_submitted_at"],
+        ["hold_until"],
         unique=False,
-        postgresql_where=sa.text("status = 'payout_submitted'"),
+        postgresql_where=sa.text("hold_until IS NOT NULL"),
+    )
+
+    op.create_table(
+        "prepaid_refund_payouts",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("refund_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("merchant_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("tx_id", sa.String(length=64), nullable=False),
+        sa.Column("method", sa.String(length=16), nullable=False),
+        sa.Column("status", sa.String(length=16), server_default="pending", nullable=False),
+        sa.Column("payload_verified", sa.Boolean(), server_default="false", nullable=False),
+        sa.Column("check_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("error_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("next_check_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("last_error", sa.String(length=300), nullable=True),
+        sa.Column("confirmed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name=op.f("ck_prepaid_refund_payouts_tx_id_hex64")),
+        sa.CheckConstraint(
+            "status IN ('pending', 'confirmed', 'invalid', 'duplicate', 'abandoned')",
+            name=op.f("ck_prepaid_refund_payouts_status_known"),
+        ),
+        sa.CheckConstraint("method IN ('tx_id', 'transaction', 'scan')", name=op.f("ck_prepaid_refund_payouts_method_known")),
+        sa.CheckConstraint(
+            "check_count >= 0 AND error_count >= 0", name=op.f("ck_prepaid_refund_payouts_counts_not_negative")
+        ),
+        sa.CheckConstraint(
+            "(status = 'pending') = (resolved_at IS NULL)",
+            name=op.f("ck_prepaid_refund_payouts_resolved_at_iff_resolved"),
+        ),
+        sa.CheckConstraint(
+            "(status IN ('confirmed', 'duplicate')) = (confirmed_at IS NOT NULL)",
+            name=op.f("ck_prepaid_refund_payouts_confirmed_at_iff_confirmed"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["refund_id"],
+            ["prepaid_refunds.id"],
+            name=op.f("fk_prepaid_refund_payouts_refund_id_prepaid_refunds"),
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["merchant_id"],
+            ["merchants.id"],
+            name=op.f("fk_prepaid_refund_payouts_merchant_id_merchants"),
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_prepaid_refund_payouts")),
+    )
+    op.create_index("ix_prepaid_refund_payouts_tx_id", "prepaid_refund_payouts", ["tx_id"], unique=True)
+    op.create_index("ix_prepaid_refund_payouts_refund_id", "prepaid_refund_payouts", ["refund_id"], unique=False)
+    op.create_index(
+        "ix_prepaid_refund_payouts_pending_next_check",
+        "prepaid_refund_payouts",
+        ["next_check_at"],
+        unique=False,
+        postgresql_where=sa.text("status = 'pending'"),
     )
 
     op.create_table(
@@ -170,7 +256,10 @@ def upgrade() -> None:
         sa.Column("refund_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("note", sa.String(length=300), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("amount_sompi > 0", name=op.f("ck_prepaid_ledger_entries_amount_positive")),
+        sa.CheckConstraint(
+            "amount_sompi > 0 OR (kind = 'refund' AND amount_sompi = 0)",
+            name=op.f("ck_prepaid_ledger_entries_amount_valid"),
+        ),
         sa.CheckConstraint(
             "balance_after_sompi >= 0", name=op.f("ck_prepaid_ledger_entries_balance_after_not_negative")
         ),
@@ -218,8 +307,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Also works from the first draft of this revision (15d7bd4: no `prepaid_refund_payouts`, an extra
+    `ix_prepaid_refunds_payout_submitted`), so such a database can be taken back to 0007 and upgraded again."""
     op.execute(
-        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM prepaid_refunds) OR EXISTS (SELECT 1 FROM prepaid_ledger_entries) "
+        "DO $$ DECLARE has_payouts boolean := false; BEGIN "
+        "IF to_regclass('prepaid_refund_payouts') IS NOT NULL THEN "
+        "EXECUTE 'SELECT EXISTS (SELECT 1 FROM prepaid_refund_payouts)' INTO has_payouts; END IF; "
+        "IF has_payouts OR EXISTS (SELECT 1 FROM prepaid_refunds) OR EXISTS (SELECT 1 FROM prepaid_ledger_entries) "
         "OR EXISTS (SELECT 1 FROM prepaid_balances WHERE expires_at IS NOT NULL OR refunded_sompi > 0 "
         "OR expired_sompi > 0 OR refund_hold_sompi > 0) "
         "OR EXISTS (SELECT 1 FROM merchants WHERE prepaid_expiry_days IS NOT NULL) "
@@ -238,7 +332,12 @@ def downgrade() -> None:
     op.drop_index("ix_prepaid_ledger_entries_balance_id", table_name="prepaid_ledger_entries")
     op.drop_index("ix_prepaid_ledger_entries_tx_id", table_name="prepaid_ledger_entries")
     op.drop_table("prepaid_ledger_entries")
-    op.drop_index("ix_prepaid_refunds_payout_submitted", table_name="prepaid_refunds")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_pending_next_check")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_refund_id")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_tx_id")
+    op.execute("DROP TABLE IF EXISTS prepaid_refund_payouts")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refunds_hold_until")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refunds_payout_submitted")
     op.drop_index("ix_prepaid_refunds_open_balance_id", table_name="prepaid_refunds")
     op.drop_index("ix_prepaid_refunds_merchant_status_created", table_name="prepaid_refunds")
     op.drop_index("ix_prepaid_refunds_request_nonce", table_name="prepaid_refunds")
