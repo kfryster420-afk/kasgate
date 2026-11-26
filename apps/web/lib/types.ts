@@ -41,10 +41,27 @@ export const X402_ERROR_CODES = [
   "rpc_unavailable",
   "service_unavailable",
   "rate_limited",
+  "price_unavailable",
   "endpoint_not_found",
   "method_not_allowed",
   "upstream_error",
+  "invalid_exact_payment",
   "insufficient_balance",
+  "trial_exhausted",
+  "invalid_payer",
+  "invalid_signature",
+  "invalid_status",
+  "challenge_expired",
+  "challenge_replayed",
+  "refund_too_small",
+  "refund_already_open",
+  "refund_not_found",
+  "refund_not_cancellable",
+  "refund_not_claimable",
+  "refund_not_rejectable",
+  "refund_closed",
+  "invalid_payout",
+  "payout_replayed",
 ] as const;
 export type X402ErrorCode = (typeof X402_ERROR_CODES)[number];
 
@@ -197,11 +214,18 @@ export const PREPAID_REFUND_PURPOSE = "kasgate:v1:prepaid-refund";
 /** schemas.PREPAID_REFUND_PAYLOAD_PREFIX: payload of a merchant-built payout (`kasgate:v1:refund:<refund id hex>`). */
 export const PREPAID_REFUND_PAYLOAD_PREFIX = "kasgate:v1:refund:";
 export const PREPAID_REFUND_REASON_MAX_LENGTH = 300;
-export const PREPAID_REFUND_STATUSES = ["requested", "payout_submitted", "paid", "rejected", "cancelled"] as const;
+export const PREPAID_REFUND_STATUSES = ["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"] as const;
 export type PrepaidRefundStatus = (typeof PREPAID_REFUND_STATUSES)[number];
-export type PrepaidRefundAction = "request" | "cancel";
+export type PrepaidRefundAction = "request" | "cancel" | "status";
+/** config.prepaid_refund_claim_ttl_seconds default: a merchant claim (`paying`) lapses after this without a payout. */
+export const PREPAID_REFUND_CLAIM_TTL_SECONDS = 900;
+export const PREPAID_REFUND_PAYOUT_STATUSES = ["pending", "confirmed", "invalid", "duplicate", "abandoned"] as const;
+export type PrepaidRefundPayoutStatus = (typeof PREPAID_REFUND_PAYOUT_STATUSES)[number];
 
-/** POST /v1/prepaid/refunds/challenge. `request`: optional amount (omit = all spendable), no refund_id. `cancel`: refund_id, no amount. */
+/**
+ * POST /v1/prepaid/refunds/challenge. `request`: optional amount (omit = all spendable), no refund_id. `cancel`:
+ * refund_id, no amount. `status`: neither (reads this key's refunds with the merchant's reasons).
+ */
 export interface PrepaidRefundChallengeRequest {
   slug: string;
   payer_address: string;
@@ -219,13 +243,14 @@ export interface PrepaidRefundChallenge {
   slug: string;
   merchant_id: Uuid;
   payer_address: string;
+  /** The refund amount; "0" for a status challenge. */
   amount_sompi: Sompi;
   refund_id: Uuid | null;
   spendable_sompi: Sompi;
   expires_at: IsoDateTime;
 }
 
-/** POST /v1/prepaid/refunds and /v1/prepaid/refunds/{id}/cancel. */
+/** POST /v1/prepaid/refunds, /v1/prepaid/refunds/{id}/cancel and /v1/prepaid/refunds/status (signed). */
 export interface PrepaidRefundSigned {
   nonce: string;
   /** Sent as the wallet returned it (128 hex or Base64 of 64/65 bytes); the gateway normalises. */
@@ -238,18 +263,45 @@ export interface PrepaidRefundRead {
   payer_address: string;
   amount_sompi: Sompi;
   status: PrepaidRefundStatus;
+  /** The latest attempt while `payout_submitted`; the confirmed payout once `paid`. */
   tx_id: string | null;
+  /** The merchant's reject reason. Null in the public GET /refunds/status view (read it with a signed status). */
   reason: string | null;
+  /** The latest payout problem. Null in the public GET /refunds/status view. */
   last_error: string | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
+  /** When the merchant claimed it (`paying`); the claim lapses PREPAID_REFUND_CLAIM_TTL_SECONDS later without a payout. */
+  claimed_at: IsoDateTime | null;
   payout_submitted_at: IsoDateTime | null;
   paid_at: IsoDateTime | null;
   resolved_at: IsoDateTime | null;
+  /** Late payout backstop: the payout confirmed after the refund had been cancelled or rejected. */
+  late_paid_from: "cancelled" | "rejected" | null;
+  /** For a late payout: the part of amount_sompi the balance no longer held (already spent or expired). */
+  shortfall_sompi: Sompi;
   /** computed_field: pay exactly `amount_sompi` here (the depositing address). No platform fee. */
   payout_address: string;
-  /** computed_field: hex of `kasgate:v1:refund:<id hex>`, required on a signed `transaction` payout. */
+  /** computed_field: hex of `payout_payload`; every payout (both modes) must carry it. */
   payout_payload_hex: string;
+  /** computed_field: `kasgate:v1:refund:<refund id hex>` as text, for KasWare `sendKaspa(..., {payload})`. */
+  payout_payload: string;
+}
+
+/** GET /v1/prepaid/refunds/{id}/payouts [Bearer]: every attempted payout transaction, oldest first. */
+export interface PrepaidRefundPayoutRead {
+  id: Uuid;
+  refund_id: Uuid;
+  tx_id: string;
+  method: "tx_id" | "transaction";
+  status: PrepaidRefundPayoutStatus;
+  payload_verified: boolean;
+  check_count: number;
+  last_error: string | null;
+  next_check_at: IsoDateTime;
+  confirmed_at: IsoDateTime | null;
+  resolved_at: IsoDateTime | null;
+  created_at: IsoDateTime;
 }
 
 /** POST /v1/prepaid/refunds/{id}/payout [Bearer]: exactly one of the two. */
@@ -729,6 +781,7 @@ export const WEBHOOK_EVENT_TYPES = [
   "prepaid.refund.paid",
   "prepaid.refund.rejected",
   "prepaid.refund.cancelled",
+  "prepaid.refund.payout_reverted",
   "prepaid.credit.expired",
 ] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];

@@ -13,7 +13,8 @@ export const dynamic = "force-dynamic";
 const ALLOWED = new Set(["slug", "payer_address", "action", "amount_sompi", "refund_id"]);
 
 /**
- * Buyer step 1 (public): the text to sign to open (`request`) or withdraw (`cancel`) a refund. Mirrors
+ * Buyer step 1 (public): the text to sign to open (`request`) or withdraw (`cancel`) a refund, or to read this
+ * key's refunds with the merchant's reasons (`status`). Mirrors
  * schemas.PrepaidRefundChallengeRequest and refuses to pass on a challenge whose lines do not match the request.
  */
 export async function POST(request: NextRequest): Promise<NextResponse> {
@@ -28,7 +29,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const address = checkKaspaAddress(body.payer_address);
   if (!address.ok) return jsonError(address.error, 422);
   const action = body.action === undefined ? "request" : body.action;
-  if (action !== "request" && action !== "cancel") return jsonError('action must be "request" or "cancel"', 422);
+  if (action !== "request" && action !== "cancel" && action !== "status") return jsonError('action must be "request", "cancel" or "status"', 422);
 
   const payload: Record<string, unknown> = { slug: slug.value, payer_address: address.value, action };
   let amount: string | undefined;
@@ -41,6 +42,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       amount = checked.value;
       payload.amount_sompi = amount;
     }
+  } else if (action === "status") {
+    const hasAmount = body.amount_sompi !== undefined && body.amount_sompi !== null;
+    const hasRefund = body.refund_id !== undefined && body.refund_id !== null;
+    if (hasAmount || hasRefund) return jsonError("a status challenge takes neither amount_sompi nor refund_id", 422);
   } else {
     if (body.amount_sompi !== undefined && body.amount_sompi !== null) return jsonError("amount_sompi must be omitted when cancelling a refund", 422);
     if (typeof body.refund_id !== "string" || !isUuid(body.refund_id)) return jsonError("refund_id is required to cancel a refund", 422);

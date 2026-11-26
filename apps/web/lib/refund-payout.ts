@@ -12,7 +12,7 @@ import {
 } from "./kasware";
 import { KASPA_NETWORK } from "./config";
 import { formatKas, formatSompi } from "./sompi";
-import { PREPAID_REFUND_PAYLOAD_PREFIX, type PrepaidRefundRead } from "./types";
+import { PREPAID_REFUND_CLAIM_TTL_SECONDS, PREPAID_REFUND_PAYLOAD_PREFIX, type PrepaidRefundRead } from "./types";
 
 /** How long the dashboard waits for the KasWare approval dialog before telling the merchant what to check. */
 export const SEND_TIMEOUT_MS = 180_000;
@@ -21,20 +21,39 @@ const STORAGE_PREFIX = "kasgate:refund-payout:";
 export const UNKNOWN_TXID = "unknown";
 
 /**
- * The txid of a payout this browser already broadcast for a refund, kept in sessionStorage (a public txid, never a key)
- * so a failed submission or a reload cannot lead to paying the same refund twice.
+ * A payout this browser already broadcast for a refund, kept in sessionStorage so a failed submission, a reload or a
+ * lapsed claim cannot lead to paying the same refund twice. `transaction` is KasWare's signed transaction JSON (public
+ * data, no key material), kept so it can be posted if the node cannot show the payload (`payload_unverified`).
  */
-export function recordedPayout(refundId: string): string | null {
+export interface RecordedPayout {
+  txId: string;
+  transaction: string | null;
+}
+
+export function recordedPayout(refundId: string): RecordedPayout | null {
+  let raw: string | null;
   try {
-    return window.sessionStorage.getItem(STORAGE_PREFIX + refundId);
+    raw = window.sessionStorage.getItem(STORAGE_PREFIX + refundId);
   } catch {
     return null;
   }
+  if (!raw) return null;
+  if (!raw.startsWith("{")) return { txId: raw, transaction: null };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof (parsed as { txId?: unknown }).txId === "string") {
+      const transaction = (parsed as { transaction?: unknown }).transaction;
+      return { txId: (parsed as { txId: string }).txId, transaction: typeof transaction === "string" ? transaction : null };
+    }
+  } catch {
+    /* unreadable entry: keep blocking a second payment */
+  }
+  return { txId: UNKNOWN_TXID, transaction: null };
 }
 
-export function rememberPayout(refundId: string, txId: string): void {
+export function rememberPayout(refundId: string, payout: RecordedPayout): void {
   try {
-    window.sessionStorage.setItem(STORAGE_PREFIX + refundId, txId);
+    window.sessionStorage.setItem(STORAGE_PREFIX + refundId, JSON.stringify(payout));
   } catch {
     /* storage unavailable: the txid stays on screen instead */
   }
@@ -48,20 +67,51 @@ export function forgetPayout(refundId: string): void {
   }
 }
 
-/** `kasgate:v1:refund:<refund id hex>`; checked against the gateway's `payout_payload_hex` before use. */
+/** The gateway's `payout_payload`, used only if it is exactly `kasgate:v1:refund:<this refund's id hex>` and matches its hex. */
 export function payoutPayloadText(refund: PrepaidRefundRead): string | null {
-  const text = `${PREPAID_REFUND_PAYLOAD_PREFIX}${refund.id.replace(/-/g, "").toLowerCase()}`;
-  const hex = Array.from(new TextEncoder().encode(text), (b) => b.toString(16).padStart(2, "0")).join("");
-  return hex === refund.payout_payload_hex.toLowerCase() ? text : null;
+  const expected = `${PREPAID_REFUND_PAYLOAD_PREFIX}${refund.id.replace(/-/g, "").toLowerCase()}`;
+  const hex = Array.from(new TextEncoder().encode(expected), (b) => b.toString(16).padStart(2, "0")).join("");
+  return refund.payout_payload === expected && hex === refund.payout_payload_hex.toLowerCase() ? expected : null;
 }
 
-export type PayoutOutcome = { kind: "sent"; txId: string } | { kind: "sent_no_txid" } | { kind: "error"; message: string };
+/** When a `paying` claim lapses (the buyer may cancel again after it), or null when the refund isn't claimed. */
+export function claimExpiresAt(refund: PrepaidRefundRead): number | null {
+  if (refund.status !== "paying" || !refund.claimed_at) return null;
+  const at = Date.parse(refund.claimed_at);
+  return Number.isNaN(at) ? null : at + PREPAID_REFUND_CLAIM_TTL_SECONDS * 1000;
+}
+
+export type PayoutOutcome =
+  | { kind: "sent"; txId: string; transaction: string | null; refund: PrepaidRefundRead }
+  | { kind: "sent_no_txid"; refund: PrepaidRefundRead }
+  | { kind: "error"; message: string; refund?: PrepaidRefundRead };
+
+/** The signed transaction JSON KasWare returned, when it is one (an object with an `id`); null otherwise. */
+export function signedTransactionText(result: unknown): string | null {
+  const text = typeof result === "string" ? result : result && typeof result === "object" ? JSON.stringify(result) : null;
+  if (!text || !text.trimStart().startsWith("{") || text.length > 24_000) return null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? text : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Builds the payout in the merchant's own KasWare wallet: `sendKaspa(payout_address, amount_sompi, {payload})`. KasWare
  * selects the merchant's UTXOs, shows its approval dialog, signs and broadcasts. The dashboard never sees a key.
+ *
+ * Right before broadcasting it calls `claim` (POST /claim: `requested`/`paying` -> `paying`, renewing the 15-minute
+ * claim) so the buyer cannot cancel while the payment is in flight; a refund that can no longer be claimed is never paid.
  */
-export async function sendRefundPayout(refund: PrepaidRefundRead, merchantAddress: string, confirm: (text: string) => boolean): Promise<PayoutOutcome> {
+export async function sendRefundPayout(
+  refund: PrepaidRefundRead,
+  merchantAddress: string,
+  confirm: (text: string) => boolean,
+  claim: () => Promise<PrepaidRefundRead>,
+  claimFailure: (error: unknown) => string,
+): Promise<PayoutOutcome> {
   const wallet = getKasware();
   if (!wallet) return { kind: "error", message: "KasWare was not detected in this browser. Pay from any wallet, then use “Enter txid”." };
   if (typeof wallet.sendKaspa !== "function") {
@@ -98,6 +148,16 @@ export async function sendRefundPayout(refund: PrepaidRefundRead, merchantAddres
   const text = lines.join("\n");
   if (!confirm(text)) return { kind: "error", message: "Payout cancelled. Nothing was sent." };
 
+  let claimed: PrepaidRefundRead;
+  try {
+    claimed = await claim();
+  } catch (e) {
+    return { kind: "error", message: `Could not claim the refund for payment, so nothing was sent: ${claimFailure(e)}` };
+  }
+  if (claimed.status !== "paying" || claimed.amount_sompi !== refund.amount_sompi || claimed.payout_address !== refund.payout_address) {
+    return { kind: "error", message: "The refund changed while claiming it. Nothing was sent. Reload and check it again.", refund: claimed };
+  }
+
   let result: string;
   try {
     result = await withWalletTimeout(
@@ -106,10 +166,10 @@ export async function sendRefundPayout(refund: PrepaidRefundRead, merchantAddres
       "KasWare did not answer within 3 minutes. If you approved the payment, look up its txid in KasWare's activity and use “Enter txid”. Don't pay again.",
     );
   } catch (e) {
-    if (e instanceof WalletTimeoutError) return { kind: "error", message: e.message };
-    if (isWalletRejection(e)) return { kind: "error", message: "You rejected the payment in KasWare. Nothing was sent." };
-    return { kind: "error", message: `KasWare could not send the payout: ${walletErrorText(e)}. Nothing was recorded.` };
+    if (e instanceof WalletTimeoutError) return { kind: "error", message: e.message, refund: claimed };
+    if (isWalletRejection(e)) return { kind: "error", message: "You rejected the payment in KasWare. Nothing was sent. The claim lapses on its own after 15 minutes.", refund: claimed };
+    return { kind: "error", message: `KasWare could not send the payout: ${walletErrorText(e)}. Nothing was recorded.`, refund: claimed };
   }
   const txId = txIdFromSendResult(result);
-  return txId ? { kind: "sent", txId } : { kind: "sent_no_txid" };
+  return txId ? { kind: "sent", txId, transaction: signedTransactionText(result), refund: claimed } : { kind: "sent_no_txid", refund: claimed };
 }

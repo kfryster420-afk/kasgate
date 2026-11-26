@@ -1,8 +1,12 @@
 import "server-only";
+import { headers } from "next/headers";
 import { parseGatewayJson } from "../safe-json";
+import { clientIpFromForwardedFor, parseTrustedProxyHops } from "./client-ip";
 import type { DirectoryManifest } from "../types";
 
 export const GATEWAY_INTERNAL_URL = (process.env.GATEWAY_INTERNAL_URL ?? "http://gateway:8000").replace(/\/+$/, "");
+/** Reverse proxies in front of this server whose X-Forwarded-For is trusted (README "Client IP"); 0 = none. */
+const TRUSTED_PROXY_HOPS = parseTrustedProxyHops(process.env.TRUSTED_PROXY_HOPS);
 
 export type GatewayResult<T> =
   | { ok: true; status: number; data: T }
@@ -19,6 +23,20 @@ interface GatewayRequest {
   revalidate?: number;
 }
 
+/**
+ * The browser's IP for the gateway's per-IP rate limits, derived from the inbound request (never the browser's own
+ * X-Forwarded-For unless TRUSTED_PROXY_HOPS says a proxy we run set it). Undefined outside a request (build, cached
+ * fetches) or when nothing can be trusted; the gateway then sees this server's address.
+ */
+async function forwardedClientIp(req: GatewayRequest): Promise<string | undefined> {
+  if (TRUSTED_PROXY_HOPS === 0 || req.revalidate !== undefined) return undefined;
+  try {
+    return clientIpFromForwardedFor((await headers()).get("x-forwarded-for"), TRUSTED_PROXY_HOPS);
+  } catch {
+    return undefined;
+  }
+}
+
 function buildUrl(path: string, query?: GatewayRequest["query"]): string {
   const url = new URL(`${GATEWAY_INTERNAL_URL}${path}`);
   if (query) {
@@ -29,13 +47,18 @@ function buildUrl(path: string, query?: GatewayRequest["query"]): string {
   return url.toString();
 }
 
-function buildInit(req: GatewayRequest): RequestInit & { next?: { revalidate: number } } {
-  const headers: Record<string, string> = { Accept: req.accept ?? "application/json" };
-  if (req.bearer) headers.Authorization = `Bearer ${req.bearer}`;
-  if (req.body !== undefined) headers["Content-Type"] = "application/json";
+/**
+ * Every call carries an `X-Forwarded-For` WE set: exactly the derived client IP, or none. The gateway honours it only
+ * when this server's address is in its TRUSTED_PROXY_IPS (CONTRACT v2.13 "Client IP behind a proxy").
+ */
+function buildInit(req: GatewayRequest, clientIp: string | undefined): RequestInit & { next?: { revalidate: number } } {
+  const outbound: Record<string, string> = { Accept: req.accept ?? "application/json" };
+  if (req.bearer) outbound.Authorization = `Bearer ${req.bearer}`;
+  if (req.body !== undefined) outbound["Content-Type"] = "application/json";
+  if (clientIp) outbound["X-Forwarded-For"] = clientIp;
   const init: RequestInit & { next?: { revalidate: number } } = {
     method: req.method ?? "GET",
-    headers,
+    headers: outbound,
     body: req.body,
     signal: AbortSignal.timeout(15_000),
   };
@@ -89,7 +112,7 @@ export function extractErrorCode(text: string): string | undefined {
 export async function gatewayRequest<T>(path: string, req: GatewayRequest = {}): Promise<GatewayResult<T>> {
   let response: Response;
   try {
-    response = await fetch(buildUrl(path, req.query), buildInit(req));
+    response = await fetch(buildUrl(path, req.query), buildInit(req, await forwardedClientIp(req)));
   } catch {
     return { ok: false, status: 502, message: "The KasGate gateway is unreachable. Try again shortly." };
   }
@@ -108,7 +131,7 @@ export async function gatewayRequest<T>(path: string, req: GatewayRequest = {}):
 /** Raw upstream response (used for CSV streaming and the unchanged directory manifest). */
 export async function gatewayRaw(path: string, req: GatewayRequest = {}): Promise<Response | null> {
   try {
-    return await fetch(buildUrl(path, req.query), buildInit(req));
+    return await fetch(buildUrl(path, req.query), buildInit(req, await forwardedClientIp(req)));
   } catch {
     return null;
   }

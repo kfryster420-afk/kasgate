@@ -13,9 +13,10 @@ type Context = { params: Promise<{ id: string }> };
 const MAX_TRANSACTION_CHARS = 24_000;
 
 /**
- * Merchant [session]: records the payout of an open refund, EITHER the `tx_id` of a payment the merchant already
- * broadcast from their own wallet (the dashboard uses KasWare sendKaspa) OR a signed `transaction` for the gateway to
- * broadcast. 200 = seen on-chain (`paid`); 202 = recorded as `payout_submitted`, re-checked by the ledger worker.
+ * Merchant [session]: records the payout of a refund, EITHER the `tx_id` of a payment the merchant already broadcast
+ * from their own wallet (the dashboard uses KasWare sendKaspa; also accepted for a cancelled or rejected refund as a
+ * late payout) OR the signed `transaction` (open refunds only; how a `payload_unverified` attempt is proven). Both must
+ * carry the refund's payload. 200 = seen on-chain (`paid`); 202 = recorded, re-checked by the ledger worker.
  */
 export async function POST(request: NextRequest, context: Context): Promise<NextResponse> {
   const auth = await requireSession(request);

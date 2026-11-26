@@ -22,6 +22,7 @@ const EVENT_LABELS: Record<WebhookEventType, string> = {
   "prepaid.refund.paid": "Prepaid refund paid",
   "prepaid.refund.rejected": "Prepaid refund rejected",
   "prepaid.refund.cancelled": "Prepaid refund cancelled",
+  "prepaid.refund.payout_reverted": "Prepaid refund payout reverted",
   "prepaid.credit.expired": "Prepaid credit expired",
 };
 

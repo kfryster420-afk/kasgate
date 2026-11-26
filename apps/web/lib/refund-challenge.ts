@@ -2,7 +2,7 @@ import { PREPAID_REFUND_PURPOSE, type PrepaidRefundAction, type PrepaidRefundCha
 
 /**
  * Prepaid refund challenge (schemas.build_prepaid_refund_message, CONTRACT v2.13):
- *   KasGate\nDomain: {host}\nPurpose: kasgate:v1:prepaid-refund\nAction: request|cancel\nAddress: {addr}\n
+ *   KasGate\nDomain: {host}\nPurpose: kasgate:v1:prepaid-refund\nAction: request|cancel|status\nAddress: {addr}\n
  *   Merchant: {uuid}\nAmount: {sompi}\nRefund: {uuid|-}\nNonce: {32 hex}\nExpires: {iso}
  * The app checks every line against what the buyer asked for BEFORE the wallet is asked to sign.
  */
@@ -73,13 +73,20 @@ export function checkRefundChallenge(challenge: PrepaidRefundChallenge, expected
     return "Refusing to sign: the challenge is for a different address.";
   }
   if (parsed.merchant !== challenge.merchant_id) return "Refusing to sign: the challenge names a different merchant.";
-  if (!/^[1-9][0-9]{0,17}$/.test(parsed.amount) || parsed.amount !== challenge.amount_sompi) {
+  if (parsed.amount !== challenge.amount_sompi) return "Refusing to sign: the refund amount in the challenge is inconsistent.";
+  if (expected.action === "status") {
+    if (parsed.amount !== "0" || parsed.refund !== "-" || challenge.refund_id !== null) {
+      return "Refusing to sign: a status challenge must not name an amount or a refund.";
+    }
+  } else if (!/^[1-9][0-9]{0,17}$/.test(parsed.amount)) {
     return "Refusing to sign: the refund amount in the challenge is inconsistent.";
   }
   if (expected.amountSompi !== undefined && parsed.amount !== expected.amountSompi) {
     return "Refusing to sign: the challenge amount is not the amount you asked for.";
   }
-  if (expected.action === "request") {
+  if (expected.action === "status") {
+    /* checked above */
+  } else if (expected.action === "request") {
     if (parsed.refund !== "-" || challenge.refund_id !== null) return "Refusing to sign: a new refund request must not name an existing refund.";
   } else if (!expected.refundId || parsed.refund !== expected.refundId || challenge.refund_id !== expected.refundId) {
     return "Refusing to sign: the challenge cancels a different refund.";

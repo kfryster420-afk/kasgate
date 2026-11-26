@@ -16,3 +16,23 @@ Pricing (CONTRACT v2.1 + v2.3): never hardcoded. `GET /api/pricing` reads `min_o
 ## Sign-out (CONTRACT v2.4)
 
 `DELETE /api/session` first calls the gateway's `DELETE /v1/auth/session` with the `kgs_` session token as Bearer (revokes that session only), then always clears the `kg_session` cookie and answers 204, even if the gateway returns 401/404/400/5xx or is unreachable. `rotate-key` revokes every session of the merchant; the response sets a fresh `kgs_` cookie.
+
+## Client IP behind a proxy
+
+The gateway rate-limits public calls (auth challenge/verify, prepaid balance, refund challenge/request/cancel/status)
+per client IP. Calls from this dashboard reach it from the Next.js server, so every gateway call carries an
+`X-Forwarded-For` header that this server sets itself (`lib/server/gateway.ts`), holding exactly one IP or nothing:
+
+- `TRUSTED_PROXY_HOPS` (default `0`): how many reverse proxies you run in front of this server, each of which sets or
+  appends `X-Forwarded-For`. With `N >= 1` the client IP is the `N`-th entry from the right of the inbound header (the
+  address your outermost proxy saw); entries further left came from the browser and are ignored. With `0`, or when
+  the header has fewer than `N` entries or the entry is not an IP, nothing is forwarded. Valid values are 0 to 5;
+  anything else counts as 0.
+- Behind the RUNBOOK nginx (`proxy_set_header X-Forwarded-For $remote_addr;`) set `TRUSTED_PROXY_HOPS=1`. Never set it
+  when browsers can reach this server directly: Next.js keeps a browser-supplied `X-Forwarded-For` as is, so a non-zero
+  value without a proxy in front would let anyone choose their rate-limit identity.
+- On the gateway, list this server's address (as the gateway sees it) in `TRUSTED_PROXY_IPS`, for example the compose
+  network CIDR. The gateway uses `X-Forwarded-For` only from those peers, so the header is inert until then; without
+  it every dashboard user shares the web server's bucket. If uvicorn's `FORWARDED_ALLOW_IPS` covers this server too,
+  uvicorn applies the same single value before the gateway's own check, with the same result.
+- Check the derivation with `npm run test:unit` (Node 22.18 or newer).
