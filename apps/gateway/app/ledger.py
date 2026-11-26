@@ -81,8 +81,9 @@ def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None
     """CONTRACT v2.14: what a refund request may take: spendable sompi minus unspent failed-delivery credit.
 
     Spendable already excludes the refund hold and a cancel cooldown hold (both live in `refund_hold_sompi` until
-    the ledger worker releases the cooldown). Failed-delivery credit is call-only: a refund never pays it out
-    on-chain. The result is never negative.
+    the ledger worker releases the cooldown, including after `hold_until` while a payout attempt is still
+    pending). Failed-delivery credit is call-only: a refund never pays it out on-chain. The result is never
+    negative.
     """
     if balance is None:
         return 0
@@ -315,8 +316,8 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
     if refund.status in PREPAID_REFUND_OPEN_STATUSES:
         debit, hold_release = amount, amount
         note = "refund paid on-chain by the merchant"
-    elif refund.hold_until is not None:
-        # Cancelled after a claim and still in its cooldown: its own hold still covers the amount.
+    elif refund.hold_until is not None and balance_row.refund_hold_sompi >= amount:
+        # Cancelled after a claim and the cooldown hold is still on the balance (not yet released): debit in full.
         late_from = refund.status
         debit, hold_release = amount, amount
         note = clip(f"late payout of a {late_from} refund within its cooldown hold: debited {amount} sompi")
@@ -749,8 +750,10 @@ async def recheck_payout_attempts(maker: async_sessionmaker[AsyncSession], engin
 
 
 async def release_cooldown_holds(session: AsyncSession, limit: int) -> int:
-    """Release the hold of cancelled refunds whose cooldown (`hold_until`) has passed: the amount becomes spendable
-    again. Commits; safe on several replicas (SKIP LOCKED). Returns how many holds were released."""
+    """Release the hold of cancelled refunds whose cooldown (`hold_until`) has passed and that have no pending
+    payout attempt: the amount becomes spendable again. A payout posted inside the cooldown keeps the hold until
+    that attempt is confirmed (finalize debits it) or resolved invalid/abandoned. Commits; safe on several replicas
+    (SKIP LOCKED). Returns how many holds were released."""
     due = list(
         (
             await session.execute(
@@ -759,6 +762,12 @@ async def release_cooldown_holds(session: AsyncSession, limit: int) -> int:
                     PrepaidRefund.status == PREPAID_REFUND_CANCELLED,
                     PrepaidRefund.hold_until.is_not(None),
                     PrepaidRefund.hold_until <= func.now(),
+                    ~select(PrepaidRefundPayout.id)
+                    .where(
+                        PrepaidRefundPayout.refund_id == PrepaidRefund.id,
+                        PrepaidRefundPayout.status == PAYOUT_ATTEMPT_PENDING,
+                    )
+                    .exists(),
                 )
                 .order_by(PrepaidRefund.hold_until)
                 .limit(limit)
@@ -783,14 +792,15 @@ async def release_cooldown_holds(session: AsyncSession, limit: int) -> int:
 async def run_ledger_pass(
     maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier, extra_passes: Sequence[LedgerPass] = ()
 ) -> int:
-    """One worker pass: expire due balances, release due cooldown holds, re-check submitted payouts, then any extra
+    """One worker pass: expire due balances, re-check submitted payouts, then release due cooldown holds (so a hold
+    whose last pending attempt was just abandoned or confirmed is released in the same pass), then any extra
     passes (failed-delivery credits and stale-pending alerts). Returns the rows it changed."""
     limit = get_settings().ledger_batch_size
     async with maker() as session:
         changed = await expire_due_balances(session, limit)
+    changed += await recheck_payout_attempts(maker, engine, limit)
     async with maker() as session:
         changed += await release_cooldown_holds(session, limit)
-    changed += await recheck_payout_attempts(maker, engine, limit)
     for extra in extra_passes:
         changed += await extra(maker, limit)
     return changed

@@ -638,14 +638,14 @@ async def _payout_in_flight(
         if refund is None or refund.first_claimed_at is None or await _cancel_blocker(session, refund) is not None:
             await session.commit()
             return None
-        address, amount = refund.payer_address, refund.amount_sompi
+        address, amount, min_daa = refund.payer_address, refund.amount_sompi, refund.first_claimed_daa_score or 0
         await session.commit()
     except SQLAlchemyError:
         await session.rollback()
         logger.exception("refund cancel lookup failed")
         return _store_unavailable()
     try:
-        sightings = await engine.find_refund_payouts(address, amount, refund_id)
+        sightings = await engine.find_refund_payouts(address, amount, refund_id, min_daa_score=min_daa)
     except PaymentVerificationError as exc:
         logger.warning("refund %s: cannot check the node for a payout before a cancel: %s", refund_id, exc.message)
         return _error(
@@ -959,13 +959,22 @@ async def _is_kasgate_payment(session: AsyncSession, tx_id: str) -> bool:
     return settled is not None or deposited is not None
 
 
-async def _pending_attempt_count(session: AsyncSession, refund_id: uuid.UUID) -> int:
+async def _pending_tx_id_attempts(session: AsyncSession, refund_id: uuid.UUID) -> int:
+    """Pending attempts that count toward the per-refund cap: bare `tx_id` posts only.
+
+    A signed `transaction` is checked locally (payload and outputs) so it cannot be used to flood the worker, and a
+    `scan` attempt is recorded by the gateway itself; neither counts toward the cap (or is refused by it).
+    """
     return int(
         (
             await session.execute(
                 select(func.count())
                 .select_from(PrepaidRefundPayout)
-                .where(PrepaidRefundPayout.refund_id == refund_id, PrepaidRefundPayout.status == PAYOUT_ATTEMPT_PENDING)
+                .where(
+                    PrepaidRefundPayout.refund_id == refund_id,
+                    PrepaidRefundPayout.status == PAYOUT_ATTEMPT_PENDING,
+                    PrepaidRefundPayout.method == "tx_id",
+                )
             )
         ).scalar_one()
     )
@@ -976,7 +985,8 @@ def _too_many_attempts() -> JSONResponse:
     return _error(
         409,
         "too_many_attempts",
-        f"this refund already has {limit} unconfirmed payout attempts; wait until they are confirmed or given up",
+        f"this refund already has {limit} unconfirmed tx_id payout attempts; post a signed transaction "
+        "(`transaction`) or wait until they are confirmed or given up",
     )
 
 
@@ -990,8 +1000,8 @@ async def _record_attempt(
     attempts reuses it (an earlier attempt is never overwritten: a corrected tx_id is a new attempt and both are
     re-checked). An `abandoned` attempt is never revived by a bare tx_id (409 `payout_abandoned`); only a signed
     `transaction` proof may revive it (or an `invalid` one), and it keeps its original `created_at`, so the
-    abandonment clock is never reset. A refund holds at most `prepaid_payout_max_pending_attempts` pending attempts
-    (409 `too_many_attempts`).
+    abandonment clock is never reset. At most `prepaid_payout_max_pending_attempts` pending `tx_id` attempts
+    (409 `too_many_attempts`); signed `transaction` proofs and `scan` attempts do not count toward that cap.
     """
     refund_id, merchant_id = refund.id, refund.merchant_id
     # Lock order attempt -> refund, as in finalize_payout and the worker helpers; the refund lock serializes the
@@ -1022,16 +1032,16 @@ async def _record_attempt(
                 "(`transaction`) to prove and re-broadcast it",
             )
         if existing.status in (PAYOUT_ATTEMPT_INVALID, PAYOUT_ATTEMPT_ABANDONED):
-            if await _pending_attempt_count(session, refund_id) >= get_settings().prepaid_payout_max_pending_attempts:
-                await session.rollback()
-                return None, _too_many_attempts()
+            # Only a signed `transaction` reaches here; it is exempt from the tx_id cap.
             existing.status, existing.resolved_at = PAYOUT_ATTEMPT_PENDING, None
         if payload_verified:
             existing.payload_verified = True
         existing.next_check_at = existing.updated_at = datetime.now(UTC)
         attempt = existing
     else:
-        if await _pending_attempt_count(session, refund_id) >= get_settings().prepaid_payout_max_pending_attempts:
+        if method == "tx_id" and (
+            await _pending_tx_id_attempts(session, refund_id) >= get_settings().prepaid_payout_max_pending_attempts
+        ):
             await session.rollback()
             return None, _too_many_attempts()
         attempt = PrepaidRefundPayout(
@@ -1095,7 +1105,9 @@ async def _paid_or_conflict(
     "/refunds/{refund_id}/claim",
     response_model=PrepaidRefundRead,
 )
-async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession) -> Response:
+async def claim_refund(
+    refund_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession, engine: EngineDep
+) -> Response:
     """The merchant is about to pay: `requested` -> `paying`, which the buyer can no longer cancel.
 
     Call it BEFORE broadcasting (e.g. right before KasWare `sendKaspa`) and broadcast only well before the returned
@@ -1105,6 +1117,11 @@ async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session:
     """
     merchant_id = merchant.id
     window_start = datetime.now(UTC) - timedelta(seconds=get_settings().prepaid_refund_claim_max_seconds)
+    daa: int | None = None
+    try:
+        daa = await engine.virtual_daa_score()
+    except PaymentVerificationError as exc:
+        logger.warning("refund %s: could not read the virtual DAA at claim: %s", refund_id, exc.message)
     refund = (
         await session.execute(
             update(PrepaidRefund)
@@ -1118,6 +1135,7 @@ async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session:
                 status=PREPAID_REFUND_PAYING,
                 claimed_at=func.now(),
                 first_claimed_at=func.coalesce(PrepaidRefund.first_claimed_at, func.now()),
+                first_claimed_daa_score=func.coalesce(PrepaidRefund.first_claimed_daa_score, daa),
                 updated_at=func.now(),
             )
             .returning(PrepaidRefund)

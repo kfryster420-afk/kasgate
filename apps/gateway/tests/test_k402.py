@@ -99,6 +99,8 @@ class FakeNode:
     accept_on_poll: bool = True
     connected: bool = False
     calls: list[str] = field(default_factory=list)
+    utxo_daa: dict[str, int] = field(default_factory=dict)  # txid -> blockDaaScore (default 1)
+    dag_daa_score: int = 1
 
     @property
     def is_connected(self) -> bool:
@@ -145,13 +147,21 @@ class FakeNode:
             {
                 "address": by_script[script],
                 "outpoint": {"transactionId": tx, "index": index},
-                "utxoEntry": {"amount": value, "scriptPublicKey": "0000" + script, "blockDaaScore": 1},
+                "utxoEntry": {
+                    "amount": value,
+                    "scriptPublicKey": "0000" + script,
+                    "blockDaaScore": self.utxo_daa.get(tx, 1),
+                },
             }
             for tx, outs in self.utxos.items()
             for index, value, script in outs
             if script in by_script
         ]
         return {"entries": entries}
+
+    async def get_block_dag_info(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.calls.append("dag")
+        return {"virtualDaaScore": self.dag_daa_score}
 
     def add_to_mempool(self, tx: Transaction) -> None:
         self.mempool[tx.id] = tx.to_dict()["outputs"]

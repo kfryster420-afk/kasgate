@@ -26,7 +26,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Failure credit is call-only and non-refundable: tracked in `credit_balance_sompi`, spent before deposited sompi
   (`prepaid_debits.credit_sompi`), excluded from refunds, refund holds and cancel cooldown holds
   (`refundable = max(0, balance - hold - credit_balance)`); a late v2.13 payout re-debits deposited sompi first.
-  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown).
+  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown, including a
+  cooldown that outlasts `hold_until` while a payout attempt is still pending).
 - Credits are clamped to `PREPAID_MAX_BALANCE_SOMPI`; the cut part is `shortfall_sompi` on the ledger row and a
   signed `prepaid.credit.failed_delivery_shortfall` webhook.
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`
@@ -122,6 +123,17 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   of `0008_prepaid_refunds` and say how to fix it (downgrade to 0007, upgrade again); 0008's downgrade now works from
   the first draft too. See RUNBOOK "Migration 0008 revised in place".
 - Webhook data of refund events gains `hold_until`. `prepaid_refund_payouts.method` gains `scan`.
+
+### Security: refund red-team fixes, round 3 (CONTRACT v2.13, before release)
+
+- The cooldown hold is not released while any payout attempt for that refund is still pending (it stays until the
+  attempt is confirmed — debited in full from the hold — or resolved invalid/abandoned).
+- The pending-attempt cap applies only to bare `tx_id` posts. A signed `{transaction}` proof is exempt (it is checked
+  locally) and `scan` attempts do not count toward it.
+- The pre-cancel UTXO scan ignores outputs with `blockDaaScore` at or below the virtual DAA stored at the first claim
+  (`first_claimed_daa_score`).
+- CONTRACTS Limits now names the remaining shortfall cases accurately, including a merchant who posts a `tx_id`
+  without ever claiming (no scan, no cooldown).
 
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.

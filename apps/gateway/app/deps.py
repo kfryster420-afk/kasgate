@@ -71,8 +71,10 @@ class PaymentVerifier(Protocol):
 
     def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str: ...
 
+    async def virtual_daa_score(self) -> int: ...
+
     async def find_refund_payouts(
-        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, min_daa_score: int = 0
     ) -> list[PayoutSighting]: ...
 
     async def submit_payout(
