@@ -103,8 +103,9 @@ TRIAL_CALL_PURPOSE = "kasgate:v1:trial-call"
 PREPAID_REFUND_PURPOSE = "kasgate:v1:prepaid-refund"
 PREPAID_REFUND_PAYLOAD_PREFIX = "kasgate:v1:refund:"
 PREPAID_REFUND_REASON_MAX_LENGTH = 300
-PrepaidRefundAction = Literal["request", "cancel"]
-PrepaidRefundStatus = Literal["requested", "payout_submitted", "paid", "rejected", "cancelled"]
+PrepaidRefundAction = Literal["request", "cancel", "status"]
+PrepaidRefundStatus = Literal["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"]
+PrepaidRefundPayoutStatus = Literal["pending", "confirmed", "invalid", "duplicate", "abandoned"]
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 USD_MICROS_PER_DOLLAR = 1_000_000
@@ -315,7 +316,8 @@ def build_prepaid_refund_message(
     nonce: str,
     expires_at: datetime,
 ) -> str:
-    """The exact text a buyer signs (kaspa sign_message, the depositing P2PK key) to open or cancel ONE refund.
+    """The exact text a buyer signs (kaspa sign_message, the depositing P2PK key) to open or cancel ONE refund, or
+    to read their own refunds with the merchant's reasons (`status`, Amount 0, Refund `-`).
 
     Its Purpose differs from a prepaid debit, a trial call, a payerProof and a login, so no other signature can stand
     in for it. A refund signature moves no coins: it only asks the merchant to pay `amount_sompi` back on-chain to
@@ -336,7 +338,10 @@ def build_prepaid_refund_message(
 
 
 def refund_payout_payload(refund_id: uuid.UUID) -> bytes:
-    """Payload a merchant-built payout transaction carries (`kasgate:v1:refund:<refund id hex>`), raw-tx mode only."""
+    """Payload every refund payout transaction must carry (`kasgate:v1:refund:<refund id hex>`), in both modes.
+
+    KasWare: `sendKaspa(payout_address, amount_sompi, {payload: "kasgate:v1:refund:<hex>"})` (the wallet hex-encodes
+    the UTF-8 string, which gives exactly these bytes)."""
     return f"{PREPAID_REFUND_PAYLOAD_PREFIX}{refund_id.hex}".encode("ascii")
 
 
@@ -852,6 +857,21 @@ class X402ErrorBody(StrictModel):
         "invalid_exact_payment",
         "insufficient_balance",
         "trial_exhausted",
+        # CONTRACT v2.13 prepaid refunds
+        "invalid_payer",
+        "invalid_signature",
+        "invalid_status",
+        "challenge_expired",
+        "challenge_replayed",
+        "refund_too_small",
+        "refund_already_open",
+        "refund_not_found",
+        "refund_not_cancellable",
+        "refund_not_claimable",
+        "refund_not_rejectable",
+        "refund_closed",
+        "invalid_payout",
+        "payout_replayed",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -1663,10 +1683,12 @@ class PrepaidDepositRead(ReadModel):
 
 
 class PrepaidRefundChallengeRequest(StrictModel):
-    """Ask for the text to sign to open (`request`) or cancel (`cancel`) a refund of unused prepaid credit.
+    """Ask for the text to sign to open (`request`) or cancel (`cancel`) a refund of unused prepaid credit, or to
+    read this key's refunds including the merchant's reject reasons (`status`).
 
     `request`: `amount_sompi` is how much to get back (omit it for all spendable credit); `refund_id` must be absent.
     `cancel`: `refund_id` names the open request; `amount_sompi` must be absent.
+    `status`: neither `amount_sompi` nor `refund_id`.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
@@ -1691,6 +1713,8 @@ class PrepaidRefundChallengeRequest(StrictModel):
                 raise ValueError("refund_id is required to cancel a refund")
             if self.amount_sompi is not None:
                 raise ValueError("amount_sompi must be omitted when cancelling a refund")
+        if self.action == "status" and (self.amount_sompi is not None or self.refund_id is not None):
+            raise ValueError("a status challenge takes neither amount_sompi nor refund_id")
         return self
 
 
@@ -1698,12 +1722,14 @@ class PrepaidRefundChallenge(BaseModel):
     nonce: str
     message: str
     """Sign exactly this text with the depositing key (kaspa sign_message) and POST {nonce, signature} to
-    /v1/prepaid/refunds (request) or /v1/prepaid/refunds/{refund_id}/cancel (cancel)."""
+    /v1/prepaid/refunds (request), /v1/prepaid/refunds/{refund_id}/cancel (cancel) or /v1/prepaid/refunds/status
+    (status)."""
     action: PrepaidRefundAction
     slug: str
     merchant_id: uuid.UUID
     payer_address: str
-    amount_sompi: SompiStr
+    amount_sompi: BalanceSompiStr
+    """The refund amount; "0" for a status challenge."""
     refund_id: uuid.UUID | None
     spendable_sompi: BalanceSompiStr
     expires_at: datetime
@@ -1729,17 +1755,28 @@ class PrepaidRefundRead(ReadModel):
     status: PrepaidRefundStatus
     tx_id: str | None
     reason: str | None
+    """The merchant's reject reason. Null in the public GET /refunds/status view; read it with a signed status."""
     last_error: str | None
+    """The latest payout problem the gateway saw. Null in the public GET /refunds/status view."""
     created_at: datetime
     updated_at: datetime
+    claimed_at: datetime | None
     payout_submitted_at: datetime | None
     paid_at: datetime | None
     resolved_at: datetime | None
+    late_paid_from: Literal["cancelled", "rejected"] | None
+    """Set when the payout was confirmed after the refund had been cancelled or rejected (it is still recorded)."""
+    shortfall_sompi: BalanceSompiStr
+    """For a late payout: the part of amount_sompi the balance no longer held (already spent or expired)."""
 
-    @field_validator("amount_sompi", mode="before")
+    @field_validator("amount_sompi", "shortfall_sompi", mode="before")
     @classmethod
     def _sompi(cls, v: object) -> object:
         return str(v) if isinstance(v, int) else v
+
+    def public(self) -> "PrepaidRefundRead":
+        """The unsigned public view: no merchant reason and no payout error text."""
+        return self.model_copy(update={"reason": None, "last_error": None})
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1750,13 +1787,37 @@ class PrepaidRefundRead(ReadModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def payout_payload_hex(self) -> str:
-        """Payload a merchant-built signed payout transaction must carry (raw-transaction mode)."""
+        """Payload every payout transaction must carry (both modes), hex-encoded."""
         return refund_payout_payload(self.id).hex()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def payout_payload(self) -> str:
+        """The same payload as text: pass it as KasWare `sendKaspa(..., {payload})`."""
+        return refund_payout_payload(self.id).decode("ascii")
+
+
+class PrepaidRefundPayoutRead(ReadModel):
+    """One attempted payout transaction of a refund (every tx_id a merchant posted or the gateway broadcast)."""
+
+    id: uuid.UUID
+    refund_id: uuid.UUID
+    tx_id: str
+    method: Literal["tx_id", "transaction"]
+    status: PrepaidRefundPayoutStatus
+    payload_verified: bool
+    check_count: int
+    last_error: str | None
+    next_check_at: datetime
+    confirmed_at: datetime | None
+    resolved_at: datetime | None
+    created_at: datetime
 
 
 class PrepaidRefundPayout(StrictModel):
-    """The merchant's payout of an open refund: EITHER the `tx_id` of a payment already broadcast (e.g. KasWare
-    `sendKaspa`), OR a signed `transaction` (kaspa Transaction JSON) for the gateway to broadcast."""
+    """The merchant's payout of a refund: EITHER the `tx_id` of a payment already broadcast (e.g. KasWare
+    `sendKaspa` with the refund payload), OR a signed `transaction` (kaspa Transaction JSON) for the gateway to
+    broadcast. Both must carry the payload `kasgate:v1:refund:<refund id hex>`."""
 
     tx_id: str | None = None
     transaction: str | None = Field(default=None, min_length=2, max_length=MAX_RAW_TX_CHARS)
@@ -1958,6 +2019,7 @@ WebhookEventType = Literal[
     "prepaid.refund.paid",
     "prepaid.refund.rejected",
     "prepaid.refund.cancelled",
+    "prepaid.refund.payout_reverted",
     "prepaid.credit.expired",
     "prepaid.credit.failed_delivery",
 ]

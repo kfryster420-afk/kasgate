@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.ledger import expire_due_balances, finalize_refund_paid, run_ledger_pass, spendable_sompi
+from app.ledger import expire_due_balances, finalize_payout, run_ledger_pass, spendable_sompi
 from app.models import (
     Endpoint,
     Merchant,
@@ -20,6 +20,7 @@ from app.models import (
     PrepaidDeposit,
     PrepaidLedgerEntry,
     PrepaidRefund,
+    PrepaidRefundPayout,
     WebhookEvent,
 )
 from app.payments import PaymentVerificationError, RpcUnavailableError
@@ -45,6 +46,7 @@ REFUND_EVENTS = [
     "prepaid.refund.paid",
     "prepaid.refund.rejected",
     "prepaid.refund.cancelled",
+    "prepaid.refund.payout_reverted",
     "prepaid.credit.expired",
 ]
 
@@ -91,6 +93,28 @@ async def open_refund(client: httpx.AsyncClient, amount: int | None = None) -> P
     response = await client.post("/v1/prepaid/refunds", json=signed(challenge))
     assert response.status_code == 201, response.text
     return PrepaidRefundRead.model_validate(response.json())
+
+
+async def add_attempt(
+    maker: async_sessionmaker[AsyncSession], refund_id: uuid.UUID, merchant_id: uuid.UUID, tx_id: str
+) -> uuid.UUID:
+    attempt_id = uuid.uuid4()
+    async with maker() as session:
+        session.add(
+            PrepaidRefundPayout(
+                id=attempt_id,
+                refund_id=refund_id,
+                merchant_id=merchant_id,
+                tx_id=tx_id,
+                method="tx_id",
+                status="pending",
+                payload_verified=True,
+                check_count=0,
+                error_count=0,
+            )
+        )
+        await session.commit()
+    return attempt_id
 
 
 async def balance_of(maker: async_sessionmaker[AsyncSession], merchant_id: uuid.UUID) -> PrepaidBalance:
@@ -181,6 +205,7 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     assert paid.status_code == 200, paid.text
     assert paid.json()["status"] == "paid" and paid.json()["tx_id"] == PAYOUT_TX
     assert stub_engine.payout_checks == [(PAYOUT_TX, PAYER_ADDRESS, CREDIT_SOMPI)]
+    assert stub_engine.payout_refund_ids == [refund.id]  # verify_payout is bound to this refund's payload
     after = await balance_of(sessionmaker, shop.merchant_id)
     assert (after.balance_sompi, after.refund_hold_sompi, after.refunded_sompi) == (0, 0, CREDIT_SOMPI)
     assert_identity(after)
@@ -196,7 +221,9 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     assert await event_types(sessionmaker) == ["prepaid.refund.requested", "prepaid.refund.paid"]
 
     again = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
-    assert again.status_code == 409 and again.json()["error"] == "refund_closed"
+    assert again.status_code == 200 and again.json()["status"] == "paid"  # same tx_id: idempotent
+    other_tx = await payout(client, shop, refund.id, tx_id="cd" * 32)
+    assert other_tx.status_code == 409 and other_tx.json()["error"] == "refund_closed"
     ledger = await client.get("/v1/prepaid/ledger", headers=bearer(shop.api_key))
     assert ledger.status_code == 200 and [row["kind"] for row in ledger.json()] == ["refund"]
 
@@ -305,9 +332,24 @@ async def test_buyer_cancels_and_the_hold_is_released(
     gone = await refund_challenge(client, action="cancel", refund_id=refund.id)
     assert gone.status_code == 404
     # A new request is possible once the old one is closed.
-    assert (await open_refund(client)).status == "requested"
-    closed = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
-    assert closed.status_code == 409
+    newer = await open_refund(client)
+    assert newer.status == "requested"
+    # The merchant's payout of the cancelled refund lands anyway: it is recorded (backstop), the credit is taken
+    # back, and the newer request that held it is closed so the buyer is not refunded twice.
+    late = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
+    assert late.status_code == 200, late.text
+    assert (late.json()["status"], late.json()["late_paid_from"], late.json()["shortfall_sompi"]) == (
+        "paid",
+        "cancelled",
+        "0",
+    )
+    row = await balance_of(sessionmaker, shop.merchant_id)
+    assert (row.balance_sompi, row.refund_hold_sompi, row.refunded_sompi) == (0, 0, CREDIT_SOMPI)
+    assert_identity(row)
+    superseded = await refund_row(sessionmaker, uuid.UUID(str(newer.id)))
+    assert superseded.status == "rejected" and superseded.reason is not None and str(refund.id) in superseded.reason
+    [entry] = await ledger_rows(sessionmaker)
+    assert (entry.amount_sompi, entry.refund_id) == (CREDIT_SOMPI, refund.id)
 
 
 async def test_merchant_rejects_with_a_reason(
@@ -332,7 +374,16 @@ async def test_merchant_rejects_with_a_reason(
     assert await event_types(sessionmaker) == ["prepaid.refund.requested", "prepaid.refund.rejected"]
     public = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
     assert public.status_code == 200 and [r["status"] for r in public.json()] == ["rejected"]
-    assert public.json()[0]["reason"] == "credit was promotional"
+    assert public.json()[0]["reason"] is None  # reasons are not public
+    status_challenge = await challenge_of(client, action="status")
+    assert status_challenge.amount_sompi == "0" and "Action: status" in status_challenge.message
+    mine = await client.post("/v1/prepaid/refunds/status", json=signed(status_challenge))
+    assert mine.status_code == 200 and mine.json()[0]["reason"] == "credit was promotional"
+    replay = await client.post("/v1/prepaid/refunds/status", json=signed(status_challenge))
+    assert replay.status_code in (409, 410)
+    forged_challenge = await challenge_of(client, action="status")
+    forged = await client.post("/v1/prepaid/refunds/status", json=signed(forged_challenge, OTHER_KEY))
+    assert forged.status_code == 400
 
 
 async def test_merchant_listing_is_scoped_and_filterable(
@@ -450,15 +501,16 @@ async def test_finalize_is_idempotent_and_tx_ids_are_unique(
 ) -> None:
     await fund(client)
     first = await open_refund(client, MIN_REFUND)
+    attempt_id = await add_attempt(sessionmaker, first.id, shop.merchant_id, PAYOUT_TX)
     async with sessionmaker() as session:
-        assert await finalize_refund_paid(session, first.id, PAYOUT_TX) is not None
+        paid = await finalize_payout(session, attempt_id)
+        assert paid is not None and paid.debited_sompi == MIN_REFUND
     async with sessionmaker() as session:
-        assert await finalize_refund_paid(session, first.id, PAYOUT_TX) is None
+        again = await finalize_payout(session, attempt_id)
+        assert again is not None and again.debited_sompi == 0  # idempotent: nothing moves twice
     second = await open_refund(client, MIN_REFUND)
-    async with sessionmaker() as session:
-        with pytest.raises(IntegrityError):
-            await finalize_refund_paid(session, second.id, PAYOUT_TX)
-        await session.rollback()
+    with pytest.raises(IntegrityError):
+        await add_attempt(sessionmaker, second.id, shop.merchant_id, PAYOUT_TX)
     row = await balance_of(sessionmaker, shop.merchant_id)
     assert (row.refunded_sompi, row.refund_hold_sompi) == (MIN_REFUND, MIN_REFUND)
     assert_identity(row)
@@ -469,7 +521,7 @@ async def test_raw_signed_transaction_mode(
 ) -> None:
     await fund(client)
     refund = await open_refund(client, MIN_REFUND)
-    stub_engine.payout_tx_id = "cd" * 32
+    stub_engine.payout_tx_id_value = "cd" * 32
     stub_engine.payout_accepted = False
     pending = await payout(client, shop, refund.id, transaction='{"version": 0}')
     assert pending.status_code == 202 and pending.json()["tx_id"] == "cd" * 32
@@ -485,7 +537,7 @@ async def test_raw_signed_transaction_mode(
     assert (await refund_row(sessionmaker, refund.id)).status == "paid"
 
     second = await open_refund(client, MIN_REFUND)
-    stub_engine.payout_tx_id, stub_engine.payout_accepted = "ef" * 32, True
+    stub_engine.payout_tx_id_value, stub_engine.payout_accepted = "ef" * 32, True
     paid = await payout(client, shop, second.id, transaction='{"version": 0}')
     assert paid.status_code == 200 and paid.json()["status"] == "paid"
     emptied = await balance_of(sessionmaker, shop.merchant_id)
@@ -500,7 +552,8 @@ async def test_raw_transaction_errors_are_reported(
     refund = await open_refund(client, MIN_REFUND)
     stub_engine.payout_error = RpcUnavailableError("broadcast failed")
     down = await payout(client, shop, refund.id, transaction='{"version": 0}')
-    assert down.status_code == 503
+    # Unknown whether the broadcast reached the network: kept as submitted and re-checked, never dropped.
+    assert down.status_code == 202 and down.json()["status"] == "payout_submitted"
     stub_engine.payout_error = PaymentVerificationError("invalid_payout", "payload mismatch")
     bad = await payout(client, shop, refund.id, transaction='{"version": 0}')
     assert bad.status_code == 422

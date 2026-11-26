@@ -780,6 +780,15 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         == 0
     )
     assert await _scalar(url, "SELECT count(*) FROM merchants WHERE prepaid_expiry_days IS NULL") == 1
+    # Explicit tx_id indexes: unique per attempted payout, unique per paid refund, and on the ledger.
+    tx_id_indexes = (
+        "SELECT count(*) FROM pg_indexes WHERE indexname IN "
+        "('ix_prepaid_refund_payouts_tx_id', 'ix_prepaid_refunds_tx_id', 'ix_prepaid_ledger_entries_tx_id')"
+    )
+    assert await _scalar(url, tx_id_indexes) == 3
+    assert "UNIQUE" in str(
+        await _scalar(url, "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_prepaid_refund_payouts_tx_id'")
+    )
 
     refund = (
         "INSERT INTO prepaid_refunds (id, balance_id, merchant_id, payer_address, payer_public_key, amount_sompi, "
@@ -823,6 +832,37 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         entry.format(kind="refund", direction="debit", amount=10, after=60, tx=tx, refund=paid_refund),
         entry.format(kind="expiry", direction="debit", amount=5, after=55, tx="NULL", refund="NULL"),
     )
+    attempt = (
+        "INSERT INTO prepaid_refund_payouts (id, refund_id, merchant_id, tx_id, method, status, confirmed_at, "
+        "resolved_at) SELECT gen_random_uuid(), r.id, r.merchant_id, {tx}, '{method}', '{status}', {confirmed}, "
+        "{resolved} FROM prepaid_refunds r WHERE r.status = '{of}' LIMIT 1"
+    )
+
+    def attempt_of(**overrides: object) -> str:
+        values: dict[str, object] = {
+            "tx": f"'{'e' * 64}'",
+            "method": "tx_id",
+            "status": "pending",
+            "confirmed": "NULL",
+            "resolved": "NULL",
+            "of": "requested",
+        }
+        values.update(overrides)
+        return attempt.format(**values)
+
+    await _execute(
+        url,
+        attempt_of(tx=tx, status="confirmed", confirmed="now()", resolved="now()", of="paid"),
+        attempt_of(),  # a pending attempt of the requested refund (e.g. after a revert)
+        "UPDATE prepaid_refunds SET late_paid_from = 'cancelled', shortfall_sompi = 4 WHERE status = 'paid'",
+        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now() WHERE status = 'requested'",
+    )
+    # A late payout that found nothing left to debit is recorded with a 0 sompi refund ledger row.
+    await _execute(
+        url,
+        "UPDATE prepaid_ledger_entries SET amount_sompi = 0 WHERE kind = 'refund'",
+        "UPDATE prepaid_ledger_entries SET amount_sompi = 10 WHERE kind = 'refund'",
+    )
 
     def requested(**overrides: object) -> str:
         values: dict[str, object] = {
@@ -862,6 +902,17 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         entry.format(kind="expiry", direction="debit", amount=1, after=-1, tx="NULL", refund="NULL"),  # after >= 0
         entry.format(kind="gift", direction="debit", amount=1, after=1, tx="NULL", refund="NULL"),  # kind_known
         entry.format(kind="expiry", direction="up", amount=1, after=1, tx="NULL", refund="NULL"),  # direction
+        "UPDATE prepaid_refunds SET shortfall_sompi = 11 WHERE status = 'paid'",  # shortfall_within_amount
+        "UPDATE prepaid_refunds SET late_paid_from = 'expired' WHERE status = 'paid'",  # late_paid_from_known
+        "UPDATE prepaid_refunds SET late_paid_from = 'cancelled' WHERE status = 'paying'",  # only when paid
+        "UPDATE prepaid_refunds SET late_paid_from = NULL WHERE status = 'paid'",  # shortfall_only_when_late
+        "UPDATE prepaid_refunds SET claimed_at = NULL WHERE status = 'paying'",  # paying_is_claimed
+        attempt_of(of="paying"),  # ix_prepaid_refund_payouts_tx_id: one refund per tx_id
+        attempt_of(tx=f"'{'f' * 64}'", status="lost", of="paying"),  # status_known
+        attempt_of(tx=f"'{'f' * 64}'", method="wallet", of="paying"),  # method_known
+        attempt_of(tx="'xyz'", of="paying"),  # tx_id_hex64
+        attempt_of(tx=f"'{'f' * 64}'", status="invalid", of="paying"),  # resolved_at_iff_resolved
+        attempt_of(tx=f"'{'f' * 64}'", status="confirmed", resolved="now()", of="paying"),  # confirmed_at iff
         "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
         "'evt_' || repeat('f', 32), id, 'prepaid.refund.lost', '{}'::jsonb FROM merchants LIMIT 1",
     ):
@@ -879,6 +930,7 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
     await _execute(
         url,
         "DELETE FROM prepaid_ledger_entries",
+        "DELETE FROM prepaid_refund_payouts",
         "DELETE FROM prepaid_refunds",
         "DELETE FROM webhook_events",
         "UPDATE prepaid_balances SET refund_hold_sompi = 0, refunded_sompi = 0, balance_sompi = 70, expires_at = NULL",

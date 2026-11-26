@@ -34,12 +34,13 @@ NEW_EVENT_TYPE = "prepaid.credit.failed_delivery"
 OLD_EVENT_TYPES_SQL = (
     "'payment.settled', 'prepaid.deposit', 'prepaid.debit', 'trial.used', 'endpoint.created', "
     "'endpoint.updated', 'prepaid.refund.requested', 'prepaid.refund.paid', 'prepaid.refund.rejected', "
-    "'prepaid.refund.cancelled', 'prepaid.credit.expired', 'webhook.test'"
+    "'prepaid.refund.cancelled', 'prepaid.refund.payout_reverted', 'prepaid.credit.expired', 'webhook.test'"
 )
 NEW_EVENT_TYPES_SQL = (
     "'payment.settled', 'prepaid.deposit', 'prepaid.debit', 'trial.used', 'endpoint.created', "
     "'endpoint.updated', 'prepaid.refund.requested', 'prepaid.refund.paid', 'prepaid.refund.rejected', "
-    "'prepaid.refund.cancelled', 'prepaid.credit.expired', 'prepaid.credit.failed_delivery', 'webhook.test'"
+    "'prepaid.refund.cancelled', 'prepaid.refund.payout_reverted', 'prepaid.credit.expired', "
+    "'prepaid.credit.failed_delivery', 'webhook.test'"
 )
 OLD_BALANCE_IDENTITY = "balance_sompi = deposited_sompi - debited_sompi - refunded_sompi - expired_sompi"
 NEW_BALANCE_IDENTITY = (
