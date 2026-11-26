@@ -511,7 +511,8 @@ PAYOUT_ATTEMPT_STATUSES: tuple[str, ...] = (
     PAYOUT_ATTEMPT_DUPLICATE,
     PAYOUT_ATTEMPT_ABANDONED,
 )
-PAYOUT_METHODS: tuple[str, ...] = ("tx_id", "transaction")
+# `scan`: found by the gateway itself on the node (mempool or UTXO index) when the buyer tried to cancel.
+PAYOUT_METHODS: tuple[str, ...] = ("tx_id", "transaction", "scan")
 
 
 class PrepaidRefund(TimestampMixin, Base):
@@ -548,6 +549,11 @@ class PrepaidRefund(TimestampMixin, Base):
     # The merchant's payout transaction (latest attempt while payout_submitted, the confirmed one once paid).
     tx_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The first claim: claims cannot be renewed past first_claimed_at + prepaid_refund_claim_max_seconds. Kept after
+    # the claim ends, so a cancel knows the merchant may have broadcast a payout.
+    first_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A cancelled refund the merchant had claimed keeps its amount in the balance's refund hold until this time.
+    hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Set when a payout was confirmed after the refund had been cancelled or rejected.
     late_paid_from: Mapped[str | None] = mapped_column(String(16), nullable=True)
     shortfall_sompi: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
@@ -561,6 +567,7 @@ class PrepaidRefund(TimestampMixin, Base):
         Index("ix_prepaid_refunds_tx_id", "tx_id", unique=True),
         Index("ix_prepaid_refunds_request_nonce", "request_nonce", unique=True),
         Index("ix_prepaid_refunds_merchant_status_created", "merchant_id", "status", "created_at"),
+        Index("ix_prepaid_refunds_hold_until", "hold_until", postgresql_where="hold_until IS NOT NULL"),
         Index(
             "ix_prepaid_refunds_open_balance_id",
             "balance_id",
@@ -575,6 +582,11 @@ class PrepaidRefund(TimestampMixin, Base):
         ),
         CheckConstraint("late_paid_from IS NOT NULL OR shortfall_sompi = 0", name="shortfall_only_when_late"),
         CheckConstraint("status <> 'paying' OR claimed_at IS NOT NULL", name="paying_is_claimed"),
+        CheckConstraint(
+            "claimed_at IS NULL OR first_claimed_at IS NOT NULL",
+            name="claimed_has_first_claim",
+        ),
+        CheckConstraint("hold_until IS NULL OR status = 'cancelled'", name="hold_until_only_cancelled"),
         CheckConstraint(f"status IN ({_sql_list(PREPAID_REFUND_STATUSES)})", name="status_known"),
         CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
         CheckConstraint("request_nonce ~ '^[0-9a-f]{32}$'", name="request_nonce_hex32"),

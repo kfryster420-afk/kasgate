@@ -9,7 +9,10 @@
   invalid; node errors are retried with backoff; an unseen attempt is re-checked until it is abandoned.
 * Expiry: a balance whose `expires_at` has passed loses its spendable credit (balance minus any open refund hold,
   which stays payable). `expired_sompi` grows, a ledger row and a `prepaid.credit.expired` event are written.
-* `LedgerWorker` runs both on a timer: it expires due balances and re-checks pending payout attempts.
+* Cooldown holds: a refund the merchant had claimed and the buyer then cancelled keeps its amount held until
+  `hold_until` (`prepaid_refund_cancel_cooldown_seconds`); `release_cooldown_holds` then makes it spendable.
+* `LedgerWorker` runs all of these on a timer: it expires due balances, releases due cooldown holds and re-checks
+  pending payout attempts.
 
 KasGate holds no coins in any of these steps; they only change the off-chain record of what the merchant owes.
 """
@@ -35,8 +38,10 @@ from app.models import (
     PAYOUT_ATTEMPT_DUPLICATE,
     PAYOUT_ATTEMPT_INVALID,
     PAYOUT_ATTEMPT_PENDING,
+    PREPAID_REFUND_CANCELLED,
     PREPAID_REFUND_OPEN_STATUSES,
     PREPAID_REFUND_PAID,
+    PREPAID_REFUND_PAYING,
     PREPAID_REFUND_PAYOUT_SUBMITTED,
     PREPAID_REFUND_REJECTED,
     PREPAID_REFUND_REQUESTED,
@@ -72,9 +77,11 @@ def spendable_sompi(balance: PrepaidBalance | None, now: datetime | None = None)
 
 
 def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None) -> int:
-    """CONTRACT v2.14: what a refund request may take: spendable credit minus the unspent failed-delivery credit.
+    """CONTRACT v2.14: what a refund request may take: spendable sompi minus unspent failed-delivery credit.
 
-    Failed-delivery credit is call-only: debits spend it first and a refund never pays it out on-chain.
+    Spendable already excludes the refund hold and a cancel cooldown hold (both live in `refund_hold_sompi` until
+    the ledger worker releases the cooldown). Failed-delivery credit is call-only: a refund never pays it out
+    on-chain. The result is never negative.
     """
     if balance is None:
         return 0
@@ -82,10 +89,39 @@ def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None
 
 
 def refundable_covers(amount: int | ColumnElement[int]) -> ColumnElement[bool]:
-    """SQL guard for a refund hold of `amount`: deposited, unspent and unexpired credit covers it (v2.13 + v2.14)."""
+    """SQL guard for a refund hold of `amount`: deposited, unspent and unexpired credit covers it (v2.13 + v2.14).
+
+    `refund_hold_sompi` includes both an open refund and a cancel cooldown hold.
+    """
     return and_(
-        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi >= amount,
+        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi
+        >= amount,
         or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
+    )
+
+
+def claim_live(now: datetime | None = None) -> ColumnElement[bool]:
+    """SQL: the refund is `paying` and its claim has not lapsed (claimed less than the claim TTL ago, and within the
+    total claim window counted from `first_claimed_at`)."""
+    settings = get_settings()
+    moment = now or datetime.now(UTC)
+    return and_(
+        PrepaidRefund.status == PREPAID_REFUND_PAYING,
+        PrepaidRefund.claimed_at > moment - timedelta(seconds=settings.prepaid_refund_claim_ttl_seconds),
+        PrepaidRefund.first_claimed_at > moment - timedelta(seconds=settings.prepaid_refund_claim_max_seconds),
+    )
+
+
+def claim_lapsed(now: datetime | None = None) -> ColumnElement[bool]:
+    """SQL: the refund is `paying` but its claim lapsed (TTL since the last claim, or the total claim window)."""
+    settings = get_settings()
+    moment = now or datetime.now(UTC)
+    return and_(
+        PrepaidRefund.status == PREPAID_REFUND_PAYING,
+        or_(
+            PrepaidRefund.claimed_at <= moment - timedelta(seconds=settings.prepaid_refund_claim_ttl_seconds),
+            PrepaidRefund.first_claimed_at <= moment - timedelta(seconds=settings.prepaid_refund_claim_max_seconds),
+        ),
     )
 
 
@@ -99,6 +135,7 @@ def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -
         "reason": refund.reason,
         "late_paid_from": refund.late_paid_from,
         "shortfall_sompi": str(refund.shortfall_sompi or 0),
+        "hold_until": refund.hold_until.isoformat() if refund.hold_until is not None else None,
     }
     if balance_sompi is not None:
         data["balance_sompi"] = str(balance_sompi)
@@ -181,7 +218,9 @@ async def _supersede_open_refund(
 ) -> int:
     """A late payout needs credit that a NEWER open refund of the same balance is holding: that refund (if the
     merchant has not started paying it) is closed as `rejected` with a reason and its hold released, so the buyer is
-    not refunded twice. Returns the hold released (0 when nothing had to be closed or it could not be)."""
+    not refunded twice. A newer refund the merchant is paying (`payout_submitted`, any pending attempt, or a `paying`
+    claim that has not lapsed) is never touched: the difference becomes the late payout's shortfall instead.
+    Returns the hold released (0 when nothing had to be closed or it could not be)."""
     if balance_row.balance_sompi - balance_row.refund_hold_sompi >= amount or balance_row.refund_hold_sompi == 0:
         return 0
     newer = (
@@ -192,6 +231,7 @@ async def _supersede_open_refund(
                 PrepaidRefund.id != paid_late.id,
                 PrepaidRefund.status.in_(PREPAID_REFUND_OPEN_STATUSES),
                 PrepaidRefund.status != PREPAID_REFUND_PAYOUT_SUBMITTED,
+                ~claim_live(now),
                 ~select(PrepaidRefundPayout.id)
                 .where(
                     PrepaidRefundPayout.refund_id == PrepaidRefund.id,
@@ -275,6 +315,11 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
     if refund.status in PREPAID_REFUND_OPEN_STATUSES:
         debit, hold_release = amount, amount
         note = "refund paid on-chain by the merchant"
+    elif refund.hold_until is not None:
+        # Cancelled after a claim and still in its cooldown: its own hold still covers the amount.
+        late_from = refund.status
+        debit, hold_release = amount, amount
+        note = clip(f"late payout of a {late_from} refund within its cooldown hold: debited {amount} sompi")
     else:
         late_from = refund.status
         hold_release = await _supersede_open_refund(session, refund, attempt.tx_id, balance_row, amount, now)
@@ -316,6 +361,7 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
     refund.last_error = None
     refund.late_paid_from = late_from
     refund.shortfall_sompi = amount - debit
+    refund.hold_until = None
     refund.updated_at = now
     attempt.status, attempt.confirmed_at, attempt.resolved_at = PAYOUT_ATTEMPT_CONFIRMED, now, now
     attempt.last_error = None
@@ -542,15 +588,25 @@ async def mark_attempt_invalid(session: AsyncSession, attempt_id: uuid.UUID, err
     return reverted
 
 
+def unseen_backoff(created_at: datetime, now: datetime) -> timedelta:
+    """Delay before re-checking an attempt that is not visible/accepted yet, growing with the attempt's age."""
+    settings = get_settings()
+    age = max(0.0, (now - created_at).total_seconds())
+    return timedelta(
+        seconds=min(age * settings.prepaid_payout_unseen_backoff_fraction, settings.prepaid_payout_backoff_max_seconds)
+    )
+
+
 async def note_attempt_unseen(
     session: AsyncSession, attempt_id: uuid.UUID, error: str, *, payload_seen: bool, may_revert: bool
 ) -> str:
     """The attempt is not confirmed yet (not visible, not accepted, or payload not proven). Commits.
 
-    Re-checked on the next pass (no backoff: this is the expected state of a fresh payout). With `may_revert` (the
-    ledger worker): an attempt older than `prepaid_payout_attempt_max_seconds` is `abandoned`, and a refund
-    `payout_submitted` for longer than `prepaid_payout_pending_max_seconds` reverts to `requested` while this
-    attempt stays pending. Returns "pending", "reverted" or "abandoned".
+    Re-checked after an age-based backoff: attempt age x `prepaid_payout_unseen_backoff_fraction`, capped at
+    `prepaid_payout_backoff_max_seconds` (a fresh payout is re-checked at once, a days-old one rarely). With
+    `may_revert` (the ledger worker): an attempt older than `prepaid_payout_attempt_max_seconds` is `abandoned`,
+    and a refund `payout_submitted` for longer than `prepaid_payout_pending_max_seconds` reverts to `requested`
+    while this attempt stays pending. Returns "pending", "reverted" or "abandoned".
     """
     settings = get_settings()
     now = datetime.now(UTC)
@@ -561,7 +617,7 @@ async def note_attempt_unseen(
     attempt.check_count += 1
     attempt.error_count = 0
     attempt.last_error = clip(error)
-    attempt.next_check_at = now
+    attempt.next_check_at = now + unseen_backoff(attempt.created_at, now)
     attempt.updated_at = now
     if payload_seen:
         attempt.payload_verified = True
@@ -692,14 +748,48 @@ async def recheck_payout_attempts(maker: async_sessionmaker[AsyncSession], engin
     return paid
 
 
+async def release_cooldown_holds(session: AsyncSession, limit: int) -> int:
+    """Release the hold of cancelled refunds whose cooldown (`hold_until`) has passed: the amount becomes spendable
+    again. Commits; safe on several replicas (SKIP LOCKED). Returns how many holds were released."""
+    due = list(
+        (
+            await session.execute(
+                select(PrepaidRefund)
+                .where(
+                    PrepaidRefund.status == PREPAID_REFUND_CANCELLED,
+                    PrepaidRefund.hold_until.is_not(None),
+                    PrepaidRefund.hold_until <= func.now(),
+                )
+                .order_by(PrepaidRefund.hold_until)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    now = datetime.now(UTC)
+    for refund in due:
+        await session.execute(
+            update(PrepaidBalance)
+            .where(PrepaidBalance.id == refund.balance_id)
+            .values(refund_hold_sompi=PrepaidBalance.refund_hold_sompi - refund.amount_sompi, updated_at=func.now())
+        )
+        refund.hold_until = None
+        refund.updated_at = now
+    await session.commit()
+    return len(due)
+
+
 async def run_ledger_pass(
     maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier, extra_passes: Sequence[LedgerPass] = ()
 ) -> int:
-    """One worker pass: expire due balances, re-check submitted payouts, then any extra passes (failed-delivery
-    credits). Returns the rows it changed."""
+    """One worker pass: expire due balances, release due cooldown holds, re-check submitted payouts, then any extra
+    passes (failed-delivery credits and stale-pending alerts). Returns the rows it changed."""
     limit = get_settings().ledger_batch_size
     async with maker() as session:
         changed = await expire_due_balances(session, limit)
+    async with maker() as session:
+        changed += await release_cooldown_holds(session, limit)
     changed += await recheck_payout_attempts(maker, engine, limit)
     for extra in extra_passes:
         changed += await extra(maker, limit)

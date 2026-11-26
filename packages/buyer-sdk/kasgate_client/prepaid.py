@@ -124,9 +124,11 @@ class PrepaidRefundChallenge(_Model):
 class PrepaidRefund(_Model):
     """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was accepted on-chain.
 
-    `paying`: the merchant claimed it and is paying (it can no longer be cancelled). `reason` and `last_error` are
-    null in the public list; `prepaid_refunds(..., signed=True)` returns them. `late_paid_from` is set when the
-    payout landed after the refund was cancelled or rejected (`shortfall_sompi`: credit already gone by then)."""
+    `paying`: the merchant claimed it and is paying (it can no longer be cancelled until `claim_expires_at`). The
+    public list hides `reason`, `last_error` and the claim (`paying` reads as `requested`, claim times null);
+    `prepaid_refunds(..., signed=True)` returns them. `hold_until`: a refund cancelled after a claim keeps its
+    amount set aside until then (a payout may still land). `late_paid_from` is set when the payout landed after the
+    refund was cancelled or rejected (`shortfall_sompi`: credit already gone by then)."""
 
     id: uuid.UUID
     merchant_id: uuid.UUID
@@ -144,6 +146,9 @@ class PrepaidRefund(_Model):
     payout_address: str
     payout_payload_hex: str
     claimed_at: datetime | None = None
+    first_claimed_at: datetime | None = None
+    claim_expires_at: datetime | None = None
+    hold_until: datetime | None = None
     late_paid_from: Literal["cancelled", "rejected"] | None = None
     shortfall_sompi: BalanceStr = "0"
 

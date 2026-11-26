@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final
@@ -37,7 +38,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +48,7 @@ from app.kaspa_types import validate_kaspa_address
 from app.ledger import (
     PaidRefund,
     check_attempt,
+    claim_lapsed,
     finalize_payout,
     mark_attempt_invalid,
     note_attempt_transient,
@@ -80,7 +82,7 @@ from app.models import (
     PrepaidRefundPayout,
     Settlement,
 )
-from app.payments import PaymentVerificationError, RpcUnavailableError
+from app.payments import PaymentVerificationError, PayoutSighting, RpcUnavailableError
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
     HEADER_CREDIT_SUMMARY,
@@ -104,8 +106,10 @@ from app.schemas import (
 )
 from app.security import (
     RATE_LIMIT_PREPAID_REFUND,
+    RATE_LIMIT_REFUND_PAYOUT,
     RATE_LIMIT_UNPAID_PROXY,
     auth_domain,
+    enforce_rate_limit,
     get_current_merchant,
     limit_by_ip,
 )
@@ -245,8 +249,16 @@ async def _open_refund(session: AsyncSession, balance_id: uuid.UUID) -> PrepaidR
     ).scalar_one_or_none()
 
 
-def _claim_expired_before() -> datetime:
-    return datetime.now(UTC) - timedelta(seconds=get_settings().prepaid_refund_claim_ttl_seconds)
+def _claim_has_lapsed(refund: PrepaidRefund, now: datetime | None = None) -> bool:
+    """Python twin of `ledger.claim_lapsed`: TTL since the last claim, or the total window since the first."""
+    settings = get_settings()
+    moment = now or datetime.now(UTC)
+    claimed, first = refund.claimed_at, refund.first_claimed_at
+    if claimed is None or first is None:
+        return True
+    return claimed <= moment - timedelta(seconds=settings.prepaid_refund_claim_ttl_seconds) or first <= moment - (
+        timedelta(seconds=settings.prepaid_refund_claim_max_seconds)
+    )
 
 
 def _pending_attempt_exists() -> ColumnElement[bool]:
@@ -260,10 +272,7 @@ def _pending_attempt_exists() -> ColumnElement[bool]:
 def _cancellable() -> ColumnElement[bool]:
     """SQL condition: the buyer may cancel (not claimed, or the claim lapsed; no attempted payout pending)."""
     return and_(
-        or_(
-            PrepaidRefund.status == PREPAID_REFUND_REQUESTED,
-            and_(PrepaidRefund.status == PREPAID_REFUND_PAYING, PrepaidRefund.claimed_at <= _claim_expired_before()),
-        ),
+        or_(PrepaidRefund.status == PREPAID_REFUND_REQUESTED, claim_lapsed()),
         ~_pending_attempt_exists(),
     )
 
@@ -280,8 +289,7 @@ async def _cancel_blocker(session: AsyncSession, refund: PrepaidRefund) -> str |
     if pending:
         return "a payout the merchant sent for this refund is still being confirmed on-chain"
     if refund.status == PREPAID_REFUND_PAYING:
-        claimed = refund.claimed_at
-        if claimed is not None and claimed <= _claim_expired_before():
+        if _claim_has_lapsed(refund):
             return None
         return "the merchant is paying this refund right now"
     if refund.status != PREPAID_REFUND_REQUESTED:
@@ -302,12 +310,17 @@ async def _load_challenge(redis: Redis, nonce: str) -> StoredRefundChallenge | N
 
 
 async def _claim_signed(
-    redis: Redis, signed: PrepaidRefundSigned, action: str, refund_id: uuid.UUID | None = None
+    redis: Redis,
+    signed: PrepaidRefundSigned,
+    action: str,
+    refund_id: uuid.UUID | None = None,
+    precheck: Callable[[StoredRefundChallenge], Awaitable[JSONResponse | None]] | None = None,
 ) -> tuple[StoredRefundChallenge | None, JSONResponse | None]:
     """Load, verify and claim (single use) a signed refund challenge. Returns (challenge, None) or (None, error).
 
-    Everything that can be checked without spending the nonce (action, the refund it names, the signature) is
-    checked BEFORE the nonce lock is taken, so a request to the wrong refund does not burn a valid challenge.
+    Everything that can be checked without spending the nonce (action, the refund it names, the signature, and
+    `precheck` once the signature is valid) is checked BEFORE the nonce lock is taken, so a request to the wrong
+    refund, or one refused by `precheck`, does not burn a valid challenge.
     """
     try:
         stored = await _load_challenge(redis, signed.nonce)
@@ -326,6 +339,10 @@ async def _claim_signed(
         stored.message(signed.nonce), signed.signature, stored.payer_public_key
     ):
         return None, _error(400, "invalid_signature", "signature is not by the depositing key over this challenge")
+    if precheck is not None:
+        refused = await precheck(stored)
+        if refused is not None:
+            return None, refused
     try:
         claimed = bool(await redis.set(refund_nonce_lock_key(signed.nonce), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
     except RedisError:
@@ -516,17 +533,27 @@ async def create_refund(signed: PrepaidRefundSigned, session: DbSession, redis: 
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_PREPAID_REFUND))],
 )
 async def cancel_refund(
-    refund_id: uuid.UUID, signed: PrepaidRefundSigned, session: DbSession, redis: RedisDep
+    refund_id: uuid.UUID, signed: PrepaidRefundSigned, session: DbSession, redis: RedisDep, engine: EngineDep
 ) -> Response:
     """The buyer withdraws a `requested` refund (signed `cancel` challenge); the hold goes back to spendable.
 
     Refused (409 `refund_not_cancellable`) once the merchant claimed it (`paying`, until the claim lapses), submitted
-    a payout, or while any attempted payout is still pending.
+    a payout, or while any attempted payout is still pending. For a refund the merchant ever claimed, the node is
+    asked first (mempool and UTXO index of the payout address) for a transaction that may be its payout: if one is
+    found it is recorded as an attempt (method `scan`) and the cancel is refused; if the node cannot be asked, 503.
+    Such a cancel keeps the amount held for `prepaid_refund_cancel_cooldown_seconds` (`hold_until`) before it is
+    spendable again, so a payout broadcast just before the claim lapsed is still covered.
     """
-    stored, failure = await _claim_signed(redis, signed, "cancel", refund_id)
+
+    async def payout_in_flight(stored: StoredRefundChallenge) -> JSONResponse | None:
+        return await _payout_in_flight(session, engine, stored, refund_id)
+
+    stored, failure = await _claim_signed(redis, signed, "cancel", refund_id, payout_in_flight)
     if failure is not None or stored is None:
         return failure or _store_unavailable()
+    settings = get_settings()
     now = datetime.now(UTC)
+    cooldown_until = now + timedelta(seconds=settings.prepaid_refund_cancel_cooldown_seconds)
     try:
         refund = (
             await session.execute(
@@ -536,7 +563,17 @@ async def cancel_refund(
                     PrepaidRefund.payer_public_key == stored.payer_public_key,
                     _cancellable(),
                 )
-                .values(status=PREPAID_REFUND_CANCELLED, resolved_at=now, claimed_at=None, updated_at=func.now())
+                .values(
+                    status=PREPAID_REFUND_CANCELLED,
+                    resolved_at=now,
+                    claimed_at=None,
+                    hold_until=(
+                        case((PrepaidRefund.first_claimed_at.is_not(None), cooldown_until), else_=None)
+                        if settings.prepaid_refund_cancel_cooldown_seconds > 0
+                        else None
+                    ),
+                    updated_at=func.now(),
+                )
                 .returning(PrepaidRefund)
                 .execution_options(populate_existing=True)
             )
@@ -553,7 +590,16 @@ async def cancel_refund(
             ).scalar_one_or_none()
             blocker = None if current is None else await _cancel_blocker(session, current)
             return _error(409, "refund_not_cancellable", blocker or "this refund is no longer waiting for a payout")
-        balance = await _release_hold(session, refund)
+        if refund.hold_until is None:
+            balance = await _release_hold(session, refund)
+        else:
+            balance = int(
+                (
+                    await session.execute(
+                        select(PrepaidBalance.balance_sompi).where(PrepaidBalance.id == refund.balance_id)
+                    )
+                ).scalar_one()
+            )
         await enqueue_event(
             session,
             merchant_id=refund.merchant_id,
@@ -568,6 +614,76 @@ async def cancel_refund(
         return _store_unavailable()
     await _consume_challenge(redis, signed.nonce)
     return _refund_json(refund)
+
+
+async def _payout_in_flight(
+    session: AsyncSession, engine: PaymentVerifier, stored: StoredRefundChallenge, refund_id: uuid.UUID
+) -> JSONResponse | None:
+    """Before cancelling a refund the merchant ever claimed: refuse (409) when the node shows a transaction that
+    may be its payout, recording each new one as a `scan` attempt; 503 when the node cannot be asked. None to go on.
+    Never claimed, already blocked or not found: None (the cancel UPDATE decides)."""
+    try:
+        refund = (
+            await session.execute(
+                select(PrepaidRefund).where(
+                    PrepaidRefund.id == refund_id, PrepaidRefund.payer_public_key == stored.payer_public_key
+                )
+            )
+        ).scalar_one_or_none()
+        if refund is None or refund.first_claimed_at is None or await _cancel_blocker(session, refund) is not None:
+            await session.commit()
+            return None
+        address, amount = refund.payer_address, refund.amount_sompi
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("refund cancel lookup failed")
+        return _store_unavailable()
+    try:
+        sightings = await engine.find_refund_payouts(address, amount, refund_id)
+    except PaymentVerificationError as exc:
+        logger.warning("refund %s: cannot check the node for a payout before a cancel: %s", refund_id, exc.message)
+        return _error(
+            503,
+            "service_unavailable",
+            "the merchant had claimed this refund and the node cannot be checked for its payout right now; try again",
+        )
+    fresh: list[PayoutSighting] = []
+    try:
+        for sighting in sightings:
+            known = (
+                await session.execute(select(PrepaidRefundPayout.id).where(PrepaidRefundPayout.tx_id == sighting.tx_id))
+            ).first()
+            if known is None and not await _is_kasgate_payment(session, sighting.tx_id):
+                fresh.append(sighting)
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("refund cancel lookup failed")
+        return _store_unavailable()
+    recorded: list[str] = []
+    for sighting in fresh[: get_settings().prepaid_payout_max_pending_attempts]:
+        current = (
+            await session.execute(
+                select(PrepaidRefund).where(PrepaidRefund.id == refund_id).execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        attempt, failure = await _record_attempt(
+            session, current, sighting.tx_id, "scan", payload_verified=sighting.payload_seen
+        )
+        if failure is not None or attempt is None:
+            break
+        recorded.append(sighting.tx_id)
+    if not recorded:
+        return None
+    logger.warning("refund %s: cancel refused, possible payout(s) on-chain: %s", refund_id, ", ".join(recorded))
+    return _error(
+        409,
+        "refund_not_cancellable",
+        "a payout of this refund may already be on its way to you (transaction "
+        + ", ".join(recorded)
+        + "); it is being confirmed and will be recorded as paid if it is this refund's payout",
+    )
 
 
 async def _release_hold(session: AsyncSession, refund: PrepaidRefund) -> int:
@@ -750,6 +866,27 @@ async def _is_kasgate_payment(session: AsyncSession, tx_id: str) -> bool:
     return settled is not None or deposited is not None
 
 
+async def _pending_attempt_count(session: AsyncSession, refund_id: uuid.UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(PrepaidRefundPayout)
+                .where(PrepaidRefundPayout.refund_id == refund_id, PrepaidRefundPayout.status == PAYOUT_ATTEMPT_PENDING)
+            )
+        ).scalar_one()
+    )
+
+
+def _too_many_attempts() -> JSONResponse:
+    limit = get_settings().prepaid_payout_max_pending_attempts
+    return _error(
+        409,
+        "too_many_attempts",
+        f"this refund already has {limit} unconfirmed payout attempts; wait until they are confirmed or given up",
+    )
+
+
 async def _record_attempt(
     session: AsyncSession, refund: PrepaidRefund, tx_id: str, method: str, *, payload_verified: bool
 ) -> tuple[PrepaidRefundPayout | None, JSONResponse | None]:
@@ -758,9 +895,14 @@ async def _record_attempt(
 
     A tx_id already attempted for ANOTHER refund is refused (`payout_replayed`); re-posting one of this refund's
     attempts reuses it (an earlier attempt is never overwritten: a corrected tx_id is a new attempt and both are
-    re-checked).
+    re-checked). An `abandoned` attempt is never revived by a bare tx_id (409 `payout_abandoned`); only a signed
+    `transaction` proof may revive it (or an `invalid` one), and it keeps its original `created_at`, so the
+    abandonment clock is never reset. A refund holds at most `prepaid_payout_max_pending_attempts` pending attempts
+    (409 `too_many_attempts`).
     """
     refund_id, merchant_id = refund.id, refund.merchant_id
+    # Lock order attempt -> refund, as in finalize_payout and the worker helpers; the refund lock serializes the
+    # pending-attempt cap.
     existing = (
         await session.execute(
             select(PrepaidRefundPayout)
@@ -769,6 +911,7 @@ async def _record_attempt(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
+    await session.execute(select(PrepaidRefund.id).where(PrepaidRefund.id == refund_id).with_for_update())
     if existing is not None:
         if existing.refund_id != refund_id:
             await session.rollback()
@@ -777,14 +920,27 @@ async def _record_attempt(
             proven = existing.last_error or "this transaction is not a valid payout of this refund"
             await session.rollback()
             return None, _error(422, "invalid_payout", proven)
+        if existing.status == PAYOUT_ATTEMPT_ABANDONED and method != "transaction":
+            await session.rollback()
+            return None, _error(
+                409,
+                "payout_abandoned",
+                "this transaction was given up after it stayed unconfirmed too long; post the signed transaction "
+                "(`transaction`) to prove and re-broadcast it",
+            )
         if existing.status in (PAYOUT_ATTEMPT_INVALID, PAYOUT_ATTEMPT_ABANDONED):
+            if await _pending_attempt_count(session, refund_id) >= get_settings().prepaid_payout_max_pending_attempts:
+                await session.rollback()
+                return None, _too_many_attempts()
             existing.status, existing.resolved_at = PAYOUT_ATTEMPT_PENDING, None
-            existing.created_at = datetime.now(UTC)
         if payload_verified:
             existing.payload_verified = True
         existing.next_check_at = existing.updated_at = datetime.now(UTC)
         attempt = existing
     else:
+        if await _pending_attempt_count(session, refund_id) >= get_settings().prepaid_payout_max_pending_attempts:
+            await session.rollback()
+            return None, _too_many_attempts()
         attempt = PrepaidRefundPayout(
             id=uuid.uuid4(),
             refund_id=refund_id,
@@ -849,10 +1005,13 @@ async def _paid_or_conflict(
 async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession) -> Response:
     """The merchant is about to pay: `requested` -> `paying`, which the buyer can no longer cancel.
 
-    Call it BEFORE broadcasting (the dashboard does, before KasWare `sendKaspa`); repeat it to renew the claim.
-    It lapses after `prepaid_refund_claim_ttl_seconds` if no payout is posted (the buyer may cancel again).
+    Call it BEFORE broadcasting (e.g. right before KasWare `sendKaspa`) and broadcast only well before the returned
+    `claim_expires_at`; repeat it to renew the claim. It lapses after `prepaid_refund_claim_ttl_seconds` without a
+    posted payout, and renewals stop at `first_claimed_at` + `prepaid_refund_claim_max_seconds` (409
+    `refund_not_claimable`; the merchant can still pay and post the payout, or reject).
     """
     merchant_id = merchant.id
+    window_start = datetime.now(UTC) - timedelta(seconds=get_settings().prepaid_refund_claim_max_seconds)
     refund = (
         await session.execute(
             update(PrepaidRefund)
@@ -860,8 +1019,14 @@ async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session:
                 PrepaidRefund.id == refund_id,
                 PrepaidRefund.merchant_id == merchant_id,
                 PrepaidRefund.status.in_((PREPAID_REFUND_REQUESTED, PREPAID_REFUND_PAYING)),
+                or_(PrepaidRefund.first_claimed_at.is_(None), PrepaidRefund.first_claimed_at > window_start),
             )
-            .values(status=PREPAID_REFUND_PAYING, claimed_at=func.now(), updated_at=func.now())
+            .values(
+                status=PREPAID_REFUND_PAYING,
+                claimed_at=func.now(),
+                first_claimed_at=func.coalesce(PrepaidRefund.first_claimed_at, func.now()),
+                updated_at=func.now(),
+            )
             .returning(PrepaidRefund)
             .execution_options(populate_existing=True)
         )
@@ -871,6 +1036,14 @@ async def claim_refund(refund_id: uuid.UUID, merchant: CurrentMerchant, session:
         existing = await _owned_refund(session, merchant_id, refund_id)
         if existing is None:
             return _error(404, "refund_not_found", "refund not found")
+        if existing.status in (PREPAID_REFUND_REQUESTED, PREPAID_REFUND_PAYING):
+            return _error(
+                409,
+                "refund_not_claimable",
+                "the claim window of this refund is used up (first claimed at "
+                f"{existing.first_claimed_at.isoformat() if existing.first_claimed_at else 'unknown'}); pay it and "
+                "post the payout, or reject it",
+            )
         return _error(409, "refund_not_claimable", f"only a requested refund can be claimed (it is {existing.status})")
     await session.commit()
     return _refund_json(refund)
@@ -904,14 +1077,18 @@ async def submit_refund_payout(
     merchant: CurrentMerchant,
     session: DbSession,
     engine: EngineDep,
+    redis: RedisDep,
 ) -> Response:
     """Record the merchant's payout of a refund. The ledger is debited only once it is accepted on-chain.
 
     The attempt is stored and the refund moved to `payout_submitted` BEFORE the node is asked (tx_id mode) or the
     transaction is broadcast (transaction mode), so a buyer cancel cannot race the payout. In tx_id mode a payout of
-    a refund that was already cancelled or rejected is still accepted and recorded as a late payout.
+    a refund that was already cancelled or rejected is still accepted and recorded as a late payout. Rate limited
+    per merchant (`rl_refund_payout_per_merchant_per_minute`); at most `prepaid_payout_max_pending_attempts` pending
+    attempts per refund.
     """
     merchant_id = merchant.id
+    await enforce_rate_limit(redis, RATE_LIMIT_REFUND_PAYOUT, str(merchant_id))
     refund = await _owned_refund(session, merchant_id, refund_id)
     if refund is None:
         return _error(404, "refund_not_found", "refund not found")
