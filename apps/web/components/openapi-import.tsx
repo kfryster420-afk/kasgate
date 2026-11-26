@@ -16,15 +16,16 @@ import {
   rowPriceError,
   type ImportRowState,
 } from "@/lib/openapi-import";
+import { listedPrice, parseUsdToMicros } from "@/lib/format";
 import { curlImported } from "@/lib/snippets";
-import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
-import type { EndpointRead, OpenApiImportBody, OpenApiImportCreated, OpenApiImportMode, OpenApiImportPreview, OpenApiOperationPreview } from "@/lib/types";
+import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi } from "@/lib/sompi";
+import type { EndpointRead, OpenApiImportBody, OpenApiImportCreated, OpenApiImportMode, OpenApiImportPreview, OpenApiOperationPreview, PriceCurrency } from "@/lib/types";
 import { usePricing } from "@/lib/use-pricing";
 import { checkUpstreamUrl } from "@/lib/validation";
 import { CodeBlock } from "./code-block";
 import { CopyButton } from "./copy-button";
 import { FeeSplitView } from "./fee-split";
-import { ErrorBanner, Field, Toggle } from "./ui";
+import { CurrencyToggle, ErrorBanner, Field, Toggle } from "./ui";
 
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
@@ -57,7 +58,9 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   const [fileError, setFileError] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
   const [baseUrl, setBaseUrl] = useState("");
+  const [currency, setCurrency] = useState<PriceCurrency>("KAS");
   const [priceKas, setPriceKas] = useState("1");
+  const [priceUsd, setPriceUsd] = useState("1.50");
   const [category, setCategory] = useState("");
   const [listed, setListed] = useState(true);
   const [headerName, setHeaderName] = useState("");
@@ -71,6 +74,9 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   const [created, setCreated] = useState<EndpointRead[]>([]);
 
   const defaultSompi = useMemo(() => parseKasToSompi(priceKas), [priceKas]);
+  const defaultMicros = useMemo(() => parseUsdToMicros(priceUsd), [priceUsd]);
+  const defaultAmount = currency === "USD" ? defaultMicros : defaultSompi;
+  const defaultInput = currency === "USD" ? priceUsd : priceKas;
 
   const errors = useMemo(() => {
     const out: Partial<Record<"source" | "base" | "price" | "header", string>> = {};
@@ -81,7 +87,9 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
     else if (!file) out.source = "Choose a .json, .yaml or .yml OpenAPI file";
     const b = checkUpstreamUrl(baseUrl);
     if (!b.ok) out.base = b.error.replace(/^Upstream URL/, "Base upstream URL");
-    if (defaultSompi === null) out.price = "Enter a price in KAS, e.g. 1 (up to 8 decimals)";
+    if (currency === "USD") {
+      if (defaultMicros === null) out.price = "Enter a price in USD, e.g. 1.50 (up to 6 decimals)";
+    } else if (defaultSompi === null) out.price = "Enter a price in KAS, e.g. 1 (up to 8 decimals)";
     else if (pricing.status === "ready" && !meetsOutputFloor(defaultSompi, pricing.minOutput))
       out.price = `Minimum price is ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}`;
     else if (pricing.status === "error") out.price = `Cannot verify the minimum price: ${pricing.message}`;
@@ -91,7 +99,7 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
       else if (headerValue === "" || /[\r\n]/.test(headerValue)) out.header = "Enter a single-line header value";
     }
     return out;
-  }, [sourceKind, specUrl, file, fileError, baseUrl, defaultSompi, pricing, headerName, headerValue]);
+  }, [sourceKind, specUrl, file, fileError, baseUrl, currency, defaultSompi, defaultMicros, pricing, headerName, headerValue]);
   const show = (key: keyof typeof errors) => (touched ? (errors[key] ?? null) : null);
 
   const fail = useCallback(
@@ -137,14 +145,16 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   }
 
   function requestBody(mode: OpenApiImportMode, base: string): OpenApiImportBody | null {
-    if (defaultSompi === null) return null;
+    if (defaultAmount === null) return null;
     const body: OpenApiImportBody = {
       mode,
       upstream_base_url: base.trim(),
-      default_price_sompi: defaultSompi.toString(),
+      default_price_currency: currency,
       is_public_listed: listed,
       upstream_headers: headerName.trim() !== "" ? { [headerName.trim()]: headerValue } : {},
     };
+    if (currency === "USD") body.default_price_usd_micros = defaultAmount.toString();
+    else body.default_price_sompi = defaultAmount.toString();
     if (category.trim()) body.category = category.trim();
     if (sourceKind === "url") body.spec_url = specUrl.trim();
     else if (file) body.spec_text = file.text;
@@ -155,15 +165,14 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   async function runPreview(baseOverride?: string) {
     const base = baseOverride ?? baseUrl;
     const body = requestBody("preview", base);
-    if (!body || defaultSompi === null) return;
+    if (!body || defaultAmount === null) return;
     setBusy(true);
     setError(null);
     setServerRowErrors({});
     try {
       const result = await apiFetch<OpenApiImportPreview>("/api/endpoints/import", { method: "POST", body });
-      const kas = sompiToKasPlain(defaultSompi);
       const initial: Record<string, ImportRowState> = {};
-      for (const operation of result.operations) initial[operation.key] = { selected: operation.importable, priceKas: kas };
+      for (const operation of result.operations) initial[operation.key] = { selected: operation.importable, priceInput: defaultInput };
       if (baseOverride !== undefined) setBaseUrl(baseOverride);
       setPreview(result);
       setRows(initial);
@@ -186,14 +195,15 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   const selectedKeys = useMemo(() => importable.filter((operation) => rows[operation.key]?.selected).map((operation) => operation.key), [importable, rows]);
   const rowErrors = useMemo(() => {
     const out: Record<string, string> = {};
-    if (pricing.status !== "ready") return out;
+    if (currency === "KAS" && pricing.status !== "ready") return out;
+    const minOutput = pricing.status === "ready" ? pricing.minOutput : 0n;
     for (const key of selectedKeys) {
       const row = rows[key];
-      const message = row ? rowPriceError(row.priceKas, pricing.minOutput) : null;
+      const message = row ? rowPriceError(row.priceInput, currency, minOutput) : null;
       if (message) out[key] = message;
     }
     return out;
-  }, [selectedKeys, rows, pricing]);
+  }, [selectedKeys, rows, pricing, currency]);
   const allSelected = importable.length > 0 && selectedKeys.length === importable.length;
   const someSelected = selectedKeys.length > 0 && !allSelected;
 
@@ -222,8 +232,8 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
   }
 
   async function runCreate() {
-    if (!preview || defaultSompi === null || selectedKeys.length === 0 || Object.keys(rowErrors).length > 0) return;
-    const selections = buildSelections(preview.operations, rows, defaultSompi);
+    if (!preview || defaultAmount === null || selectedKeys.length === 0 || Object.keys(rowErrors).length > 0) return;
+    const selections = buildSelections(preview.operations, rows, currency, defaultAmount);
     const body = requestBody("create", baseUrl);
     if (!selections || !body) return;
     body.selections = selections;
@@ -337,19 +347,38 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
                 <input id={`${uid}-base`} className="input font-mono" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" inputMode="url" autoComplete="off" spellCheck={false} />
               </Field>
               <Field
-                label="Default price per call (KAS)"
+                label={`Default price per call (${currency})`}
                 htmlFor={`${uid}-price`}
                 error={show("price")}
-                hint={pricing.status === "ready" ? `Applied to every operation; override per row in the preview. Minimum ${formatKas(pricing.minPrice)} KAS.` : "Applied to every operation; override per row in the preview."}
+                hint={
+                  currency === "USD"
+                    ? pricing.status === "ready"
+                      ? `Applied to every operation; override per row in the preview. Buyers pay the KAS equivalent at the rate locked when they call, and never less than ${formatKas(pricing.minPrice)} KAS.`
+                      : "Applied to every operation; override per row in the preview. Buyers pay the KAS equivalent at the rate locked when they call."
+                    : pricing.status === "ready"
+                      ? `Applied to every operation; override per row in the preview. Minimum ${formatKas(pricing.minPrice)} KAS.`
+                      : "Applied to every operation; override per row in the preview."
+                }
               >
-                <div className="relative">
-                  <input id={`${uid}-price`} className="input pr-14 font-mono" value={priceKas} onChange={(e) => setPriceKas(e.target.value)} placeholder="1" inputMode="decimal" autoComplete="off" />
-                  <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center font-mono text-xs text-zinc-500">KAS</span>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <CurrencyToggle id={`${uid}-currency`} value={currency} onChange={setCurrency} />
+                  <div className="relative flex-1">
+                    <input
+                      id={`${uid}-price`}
+                      className="input pr-14 font-mono"
+                      value={currency === "USD" ? priceUsd : priceKas}
+                      onChange={(e) => (currency === "USD" ? setPriceUsd(e.target.value) : setPriceKas(e.target.value))}
+                      placeholder={currency === "USD" ? "1.50" : "1"}
+                      inputMode="decimal"
+                      autoComplete="off"
+                    />
+                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center font-mono text-xs text-zinc-500">{currency}</span>
+                  </div>
                 </div>
               </Field>
             </div>
 
-            {defaultSompi !== null && pricing.status === "ready" && meetsOutputFloor(defaultSompi, pricing.minOutput) ? <FeeSplitView totalSompi={defaultSompi} minOutput={pricing.minOutput} /> : null}
+            {currency === "KAS" && defaultSompi !== null && pricing.status === "ready" && meetsOutputFloor(defaultSompi, pricing.minOutput) ? <FeeSplitView totalSompi={defaultSompi} minOutput={pricing.minOutput} /> : null}
 
             <div className="grid gap-5 sm:grid-cols-3">
               <Field label="Secret upstream header (optional)" htmlFor={`${uid}-hn`} error={show("header")} hint="Stored encrypted on every imported endpoint.">
@@ -434,7 +463,7 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
                     <th className="px-3 py-2">Operation</th>
                     <th className="px-3 py-2">operationId · summary</th>
                     <th className="px-3 py-2">Buyer route</th>
-                    <th className="w-44 px-3 py-2">Price (KAS)</th>
+                    <th className="w-44 px-3 py-2">Price ({currency})</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800">
@@ -443,10 +472,11 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
                       key={operation.key}
                       uid={uid}
                       operation={operation}
+                      currency={currency}
                       row={rows[operation.key]}
                       error={rowErrors[operation.key] ?? serverRowErrors[operation.key] ?? null}
                       onToggle={(selected) => setRow(operation.key, { selected })}
-                      onPrice={(priceKas) => setRow(operation.key, { priceKas })}
+                      onPrice={(priceInput) => setRow(operation.key, { priceInput })}
                     />
                   ))}
                 </tbody>
@@ -499,7 +529,7 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
                         <span className="font-medium text-zinc-100">{endpoint.name}</span>
                       </div>
                       <div className="text-right font-mono text-sm text-zinc-100">
-                        {formatKas(endpoint.price_sompi)} KAS <span className="text-xs text-zinc-500">({formatSompi(endpoint.price_sompi)} sompi)</span>
+                        {listedPrice(endpoint).primary} <span className="text-xs text-zinc-500">({listedPrice(endpoint).secondary})</span>
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -536,6 +566,7 @@ export function OpenApiImport({ onClose, onImported, onUnauthorized }: Props) {
 
 function PreviewRow({
   uid,
+  currency,
   operation,
   row,
   error,
@@ -543,11 +574,12 @@ function PreviewRow({
   onPrice,
 }: {
   uid: string;
+  currency: PriceCurrency;
   operation: OpenApiOperationPreview;
   row: ImportRowState | undefined;
   error: string | null;
   onToggle: (selected: boolean) => void;
-  onPrice: (priceKas: string) => void;
+  onPrice: (priceInput: string) => void;
 }) {
   const disabled = !operation.importable;
   const selected = Boolean(row?.selected) && !disabled;
@@ -586,12 +618,12 @@ function PreviewRow({
         ) : (
           <>
             <label htmlFor={inputId} className="sr-only">
-              Price in KAS for {operation.key}
+              Price in {currency} for {operation.key}
             </label>
             <input
               id={inputId}
               className={`input py-1.5 font-mono text-xs ${error ? "border-red-700 focus:border-red-500 focus:ring-red-500" : ""}`}
-              value={row?.priceKas ?? ""}
+              value={row?.priceInput ?? ""}
               onChange={(e) => onPrice(e.target.value)}
               disabled={!selected}
               inputMode="decimal"
