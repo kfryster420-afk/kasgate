@@ -63,6 +63,7 @@ export function DirectoryExplorer({ entries }: { entries: DirectoryEntry[] }) {
               {e.description ? <p className="mt-2 line-clamp-3 text-sm text-zinc-400">{e.description}</p> : null}
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {e.category ? <span className="badge border-zinc-700 bg-zinc-900 text-zinc-400">{e.category}</span> : null}
+                {e.prepaid_only ? <span className="badge border-kas-800 bg-kas-500/10 text-kas-300">prepaid only</span> : null}
                 {e.allowed_methods.map((m) => (
                   <span key={m} className="badge border-zinc-800 bg-zinc-950 font-mono text-zinc-400">
                     {m}

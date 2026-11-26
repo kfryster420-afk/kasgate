@@ -44,6 +44,7 @@ export const X402_ERROR_CODES = [
   "endpoint_not_found",
   "method_not_allowed",
   "upstream_error",
+  "insufficient_balance",
 ] as const;
 export type X402ErrorCode = (typeof X402_ERROR_CODES)[number];
 
@@ -100,8 +101,82 @@ export interface X402ErrorBody {
   error: X402ErrorCode;
   message: string;
   k402: "0.2" | null;
-  accepts: Array<PaymentRequired | K402UtxoOffer> | null;
+  accepts: Array<PaymentRequired | K402UtxoOffer | PrepaidOffer> | null;
 }
+
+/* ------------------------------------------------------------------ prepaid credit (CONTRACT v2.11) */
+
+export const PREPAID_SCHEME = "kasgate-prepaid-v1";
+/** Request header: Base64(JSON {nonce, signature}) over the challenge message from POST /v1/prepaid/challenge. */
+export const HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid";
+/** Response header: Base64(JSON PrepaidReceipt). */
+export const HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt";
+export type PrepaidDebitStatus = "debited" | "refunded";
+
+/** The `kasgate-prepaid-v1` entry of a 402 `accepts` list; prepaid-only endpoints list nothing else. */
+export interface PrepaidOffer {
+  scheme: typeof PREPAID_SCHEME;
+  network: KaspaNetwork;
+  asset: "KAS";
+  /** Per-call debit in sompi (may be below the on-chain minimum when `prepaidOnly`). */
+  amount: Sompi;
+  payTo: string;
+  merchantId: Uuid;
+  prepaidOnly: boolean;
+  minDepositSompi: Sompi;
+  depositQuoteUrl: string;
+  depositUrl: string;
+  challengeUrl: string;
+  balanceUrl: string;
+}
+
+export interface PrepaidReceipt {
+  debitId: Uuid;
+  nonce: string;
+  amountSompi: Sompi;
+  balanceSompi: Sompi;
+  status: PrepaidDebitStatus;
+}
+
+/** GET /v1/prepaid/balances (merchant view) and the public GET /v1/prepaid/balance. */
+export interface PrepaidBalanceRead {
+  merchant_id: Uuid;
+  payer_address: string;
+  balance_sompi: Sompi;
+  deposited_sompi: Sompi;
+  debited_sompi: Sompi;
+  updated_at: IsoDateTime | null;
+}
+
+export interface PrepaidDepositRead {
+  id: Uuid;
+  tx_id: string;
+  settlement_id: Uuid;
+  payer_address: string;
+  /** Total of both outputs; `credit_sompi` (output 0, merchant) + `fee_sompi` (output 1, treasury). */
+  deposit_sompi: Sompi;
+  fee_sompi: Sompi;
+  credit_sompi: Sompi;
+  created_at: IsoDateTime;
+}
+
+export interface PrepaidDebitRead {
+  id: Uuid;
+  endpoint_id: Uuid;
+  payer_address: string;
+  nonce: string;
+  amount_sompi: Sompi;
+  kas_usd_rate: DecimalString | null;
+  usd_value: DecimalString | null;
+  status: PrepaidDebitStatus;
+  request_method: string;
+  request_path: string;
+  upstream_status_code: number | null;
+  created_at: IsoDateTime;
+  refunded_at: IsoDateTime | null;
+}
+
+export type PrepaidLedgerKind = "balances" | "deposits" | "debits";
 
 /* ------------------------------------------------------------------ fee split */
 
@@ -210,6 +285,8 @@ export interface EndpointCreate {
   price_usd_micros?: UsdMicros;
   allowed_methods?: HttpMethod[];
   is_public_listed?: boolean;
+  /** CONTRACT v2.11: payable only from prepaid balances; the price may then be below the 0.6 KAS on-chain minimum. */
+  prepaid_only?: boolean;
 }
 
 export interface EndpointUpdate {
@@ -224,6 +301,7 @@ export interface EndpointUpdate {
   allowed_methods?: HttpMethod[] | null;
   is_active?: boolean | null;
   is_public_listed?: boolean | null;
+  prepaid_only?: boolean | null;
 }
 
 export interface EndpointRead {
@@ -240,6 +318,7 @@ export interface EndpointRead {
   allowed_methods: string[];
   is_active: boolean;
   is_public_listed: boolean;
+  prepaid_only: boolean;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
   /** computed_field; null when price_currency is USD. */
@@ -433,6 +512,8 @@ export interface DirectoryEntry {
   price_usd: string | null;
   allowed_methods: string[];
   proxy_url: string;
+  /** CONTRACT v2.11: payable only from a prepaid balance (absent on gateways before v2.11). */
+  prepaid_only?: boolean;
 }
 
 export interface DirectoryManifest {

@@ -9,6 +9,7 @@ import type { EndpointRead, MerchantKeyIssued, MerchantRead } from "@/lib/types"
 import { AnalyticsPanel } from "./analytics-panel";
 import { ApiKeyReveal } from "./api-key-reveal";
 import { EndpointsPanel } from "./endpoints-panel";
+import { PrepaidPanel } from "./prepaid-panel";
 import { SettlementsPanel } from "./settlements-panel";
 import { TaxExport } from "./tax-export";
 import { ErrorBanner, Spinner } from "./ui";
@@ -111,6 +112,7 @@ export function DashboardClient() {
           <AnalyticsPanel range={range} reloadKey={reloadKey} />
           <EndpointsPanel endpoints={endpoints} onChanged={() => setReloadKey((k) => k + 1)} onUnauthorized={toLogin} />
           <SettlementsPanel endpoints={endpoints} reloadKey={reloadKey} />
+          <PrepaidPanel endpoints={endpoints} reloadKey={reloadKey} />
         </>
       ) : null}
     </div>

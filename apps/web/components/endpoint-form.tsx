@@ -44,6 +44,7 @@ export function EndpointForm(props: Props) {
   const [category, setCategory] = useState(initial?.category ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [listed, setListed] = useState(initial?.is_public_listed ?? true);
+  const [prepaidOnly, setPrepaidOnly] = useState(initial?.prepaid_only ?? false);
   const [slug, setSlug] = useState("");
   const [headerName, setHeaderName] = useState("");
   const [headerValue, setHeaderValue] = useState("");
@@ -61,7 +62,9 @@ export function EndpointForm(props: Props) {
     if (currency === "USD") {
       if (micros === null) out.price = "Enter a price in USD, e.g. 1.50 (up to 6 decimals)";
     } else if (sompi === null) out.price = "Enter a price in KAS, e.g. 6.67 (up to 8 decimals)";
-    else if (pricing.status === "ready" && !meetsOutputFloor(sompi, pricing.minOutput))
+    else if (prepaidOnly) {
+      if (sompi <= 0n) out.price = "Enter a price above 0 KAS";
+    } else if (pricing.status === "ready" && !meetsOutputFloor(sompi, pricing.minOutput))
       out.price = `Minimum price is ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}`;
     else if (pricing.status === "error") out.price = `Cannot verify the minimum price: ${pricing.message}`;
     else if (pricing.status === "loading") out.price = "Loading the minimum price from the gateway…";
@@ -75,10 +78,13 @@ export function EndpointForm(props: Props) {
       else if (headerValue === "" || /[\r\n]/.test(headerValue)) out.header = "Enter a single-line header value";
     }
     return out;
-  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing]);
+  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing, prepaidOnly]);
 
-  const minPriceHint =
-    currency === "USD"
+  const minPriceHint = prepaidOnly
+    ? currency === "USD"
+      ? "Entered in dollars and debited from the buyer's prepaid balance at the KAS amount locked when they ask for the call; no on-chain minimum."
+      : "Debited from the buyer's prepaid balance per call; any positive amount (no on-chain minimum)."
+    : currency === "USD"
       ? pricing.status === "ready"
         ? `Entered in dollars. Buyers pay the KAS equivalent at the rate locked when they call, and never less than ${formatKas(pricing.minPrice)} KAS.`
         : "Entered in dollars. Buyers pay the KAS equivalent at the rate locked when they call, with a 0.60 KAS minimum."
@@ -109,6 +115,7 @@ export function EndpointForm(props: Props) {
         ...priceFields,
         allowed_methods: methods,
         is_public_listed: listed,
+        prepaid_only: prepaidOnly,
         upstream_headers: headers ?? {},
       };
       if (category.trim()) payload.category = category.trim();
@@ -122,6 +129,7 @@ export function EndpointForm(props: Props) {
         ...priceFields,
         allowed_methods: methods,
         is_public_listed: listed,
+        prepaid_only: prepaidOnly,
         category: category.trim() === "" ? null : category.trim(),
         description: description.trim() === "" ? null : description.trim(),
       };
@@ -182,7 +190,7 @@ export function EndpointForm(props: Props) {
         </div>
       </Field>
 
-      {currency === "KAS" && sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} minOutput={pricing.minOutput} /> : null}
+      {currency === "KAS" && !prepaidOnly && sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} minOutput={pricing.minOutput} /> : null}
 
       <fieldset>
         <legend className="label">Allowed methods</legend>
@@ -216,6 +224,13 @@ export function EndpointForm(props: Props) {
       ) : null}
 
       <Toggle id={`${uid}-listed`} checked={listed} onChange={setListed} label="List in the public AI-agent directory and manifest" />
+      <div>
+        <Toggle id={`${uid}-prepaid`} checked={prepaidOnly} onChange={setPrepaidOnly} label="Prepaid only (micro-pricing below the on-chain minimum)" />
+        <p className="mt-1.5 text-xs text-zinc-500">
+          Buyers deposit once on-chain (at least 0.6 KAS; you receive the deposit minus the platform fee) and each call is a signed debit from
+          that balance. Without this, the endpoint accepts both per-call payments and prepaid debits.
+        </p>
+      </div>
 
       <ErrorBanner message={props.error} />
 

@@ -4,6 +4,7 @@ import {
   checkMethods,
   checkOptionalSlug,
   checkOptionalText,
+  checkPrepaidPriceSompi,
   checkPriceCurrency,
   checkPriceSompi,
   checkPriceUsdMicros,
@@ -26,8 +27,10 @@ export type PayloadResult = { ok: true; payload: Payload } | { ok: false; error:
 const FLOOR_UNAVAILABLE = "Cannot verify the minimum price right now: the gateway directory is unreachable. Try again shortly.";
 
 export async function buildCreatePayload(body: Payload): Promise<PayloadResult> {
-  const floor = await getMinOutputSompi();
-  if (floor === null) return { ok: false, error: FLOOR_UNAVAILABLE };
+  const prepaidOnly = body.prepaid_only === undefined ? false : body.prepaid_only;
+  if (typeof prepaidOnly !== "boolean") return { ok: false, error: "prepaid_only must be a boolean" };
+  const floor = prepaidOnly ? null : await getMinOutputSompi();
+  if (!prepaidOnly && floor === null) return { ok: false, error: FLOOR_UNAVAILABLE };
   const errors: string[] = [];
   const name = collect(checkEndpointName(body.name), errors);
   const slug = collect(checkOptionalSlug(body.slug), errors);
@@ -47,7 +50,7 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
       errors.push("price_sompi must be omitted when price_currency is USD");
     }
   } else if (currency === "KAS") {
-    priceSompi = collect(checkPriceSompi(body.price_sompi, floor), errors);
+    priceSompi = collect(floor === null ? checkPrepaidPriceSompi(body.price_sompi) : checkPriceSompi(body.price_sompi, floor), errors);
     if (body.price_usd_micros !== undefined && body.price_usd_micros !== null) {
       errors.push("price_usd_micros must be omitted when price_currency is KAS");
     }
@@ -60,6 +63,7 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
     price_currency: currency,
     allowed_methods: methods,
     is_public_listed: listed,
+    prepaid_only: prepaidOnly,
     upstream_headers: headers ?? {},
   };
   if (currency === "USD") payload.price_usd_micros = priceUsdMicros;
@@ -120,9 +124,15 @@ export async function buildUpdatePayload(body: Payload): Promise<PayloadResult> 
         if (body.price_usd_micros !== undefined && body.price_usd_micros !== null) {
           errors.push("price_usd_micros must be omitted when price_currency is KAS");
         }
-        const floor = await getMinOutputSompi();
-        if (floor === null) return { ok: false, error: FLOOR_UNAVAILABLE };
-        const v = collect(checkPriceSompi(body.price_sompi, floor), errors);
+        // A prepaid-only endpoint has no on-chain floor; the gateway re-checks the merged row either way.
+        let v: string | undefined;
+        if (body.prepaid_only === true) {
+          v = collect(checkPrepaidPriceSompi(body.price_sompi), errors);
+        } else {
+          const floor = await getMinOutputSompi();
+          if (floor === null) return { ok: false, error: FLOOR_UNAVAILABLE };
+          v = collect(checkPriceSompi(body.price_sompi, floor), errors);
+        }
         if (v !== undefined) {
           payload.price_currency = "KAS";
           payload.price_sompi = v;
@@ -134,7 +144,7 @@ export async function buildUpdatePayload(body: Payload): Promise<PayloadResult> 
     const v = collect(checkMethods(body.allowed_methods), errors);
     if (v !== undefined) payload.allowed_methods = v;
   }
-  for (const flag of ["is_active", "is_public_listed"] as const) {
+  for (const flag of ["is_active", "is_public_listed", "prepaid_only"] as const) {
     const v = body[flag];
     if (v === undefined || v === null) continue;
     if (typeof v !== "boolean") errors.push(`${flag} must be a boolean`);

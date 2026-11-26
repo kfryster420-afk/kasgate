@@ -132,6 +132,14 @@ export function checkUpstreamHeaders(input: unknown): Check<Record<string, strin
  * Validates a decimal-string sompi price (max 18 digits, SompiStr) against the minimum price 3 * F derived from the
  * gateway's min_output_sompi `minOutput` (CONTRACT v2.3: merchant output >= 2 * F, fee output >= F).
  */
+/** Price of a prepaid-only endpoint (CONTRACT v2.11): any positive sompi amount; no on-chain floor applies. */
+export function checkPrepaidPriceSompi(input: unknown): Check<string> {
+  if (typeof input !== "string" || !/^[1-9][0-9]{0,17}$/.test(input.trim())) return fail("Price must be a positive whole number of sompi (at most 18 digits)");
+  const value = BigInt(input.trim());
+  if (value > MAX_SOMPI) return fail("Price exceeds the maximum supported amount");
+  return ok(value.toString());
+}
+
 export function checkPriceSompi(input: unknown, minOutput: bigint): Check<string> {
   if (typeof input !== "string" || !/^[1-9][0-9]{0,17}$/.test(input.trim())) return fail("Price must be a positive whole number of sompi (at most 18 digits)");
   const value = BigInt(input.trim());

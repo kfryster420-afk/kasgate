@@ -110,6 +110,7 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
                     <h3 className="font-medium text-zinc-100">{endpoint.name}</h3>
                     <StatusBadge status={endpoint.is_active ? "active" : "inactive"} />
                     {endpoint.is_public_listed ? <span className="badge border-zinc-700 bg-zinc-900 text-zinc-400">listed</span> : null}
+                    {endpoint.prepaid_only ? <span className="badge border-kas-800 bg-kas-500/10 text-kas-300">prepaid only</span> : null}
                     {endpoint.category ? <span className="badge border-zinc-700 bg-zinc-900 text-zinc-400">{endpoint.category}</span> : null}
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
