@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import SessionLocal
 from app.exact_v2 import ExactV2Verification
+from app.payments import PayoutSighting
 from app.schemas import K402UtxoOffer, PaymentRequired, PaymentSignature
 from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements
 
@@ -69,6 +70,10 @@ class PaymentVerifier(Protocol):
     ) -> None: ...
 
     def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str: ...
+
+    async def find_refund_payouts(
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+    ) -> list[PayoutSighting]: ...
 
     async def submit_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int

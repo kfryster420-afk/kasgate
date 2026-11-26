@@ -90,6 +90,8 @@ def upgrade() -> None:
         sa.Column("request_nonce", sa.String(length=32), nullable=False),
         sa.Column("tx_id", sa.String(length=64), nullable=True),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("first_claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("hold_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("late_paid_from", sa.String(length=16), nullable=True),
         sa.Column("shortfall_sompi", sa.BigInteger(), server_default="0", nullable=False),
         sa.Column("reason", sa.String(length=300), nullable=True),
@@ -113,6 +115,13 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "status <> 'paying' OR claimed_at IS NOT NULL", name=op.f("ck_prepaid_refunds_paying_is_claimed")
+        ),
+        sa.CheckConstraint(
+            "claimed_at IS NULL OR first_claimed_at IS NOT NULL",
+            name=op.f("ck_prepaid_refunds_claimed_has_first_claim"),
+        ),
+        sa.CheckConstraint(
+            "hold_until IS NULL OR status = 'cancelled'", name=op.f("ck_prepaid_refunds_hold_until_only_cancelled")
         ),
         sa.CheckConstraint(
             "status IN ('requested', 'paying', 'payout_submitted', 'paid', 'rejected', 'cancelled')",
@@ -167,6 +176,13 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text(OPEN_STATUSES_SQL),
     )
+    op.create_index(
+        "ix_prepaid_refunds_hold_until",
+        "prepaid_refunds",
+        ["hold_until"],
+        unique=False,
+        postgresql_where=sa.text("hold_until IS NOT NULL"),
+    )
 
     op.create_table(
         "prepaid_refund_payouts",
@@ -190,7 +206,7 @@ def upgrade() -> None:
             "status IN ('pending', 'confirmed', 'invalid', 'duplicate', 'abandoned')",
             name=op.f("ck_prepaid_refund_payouts_status_known"),
         ),
-        sa.CheckConstraint("method IN ('tx_id', 'transaction')", name=op.f("ck_prepaid_refund_payouts_method_known")),
+        sa.CheckConstraint("method IN ('tx_id', 'transaction', 'scan')", name=op.f("ck_prepaid_refund_payouts_method_known")),
         sa.CheckConstraint(
             "check_count >= 0 AND error_count >= 0", name=op.f("ck_prepaid_refund_payouts_counts_not_negative")
         ),
@@ -291,9 +307,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Also works from the first draft of this revision (15d7bd4: no `prepaid_refund_payouts`, an extra
+    `ix_prepaid_refunds_payout_submitted`), so such a database can be taken back to 0007 and upgraded again."""
     op.execute(
-        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM prepaid_refunds) OR EXISTS (SELECT 1 FROM prepaid_ledger_entries) "
-        "OR EXISTS (SELECT 1 FROM prepaid_refund_payouts) "
+        "DO $$ DECLARE has_payouts boolean := false; BEGIN "
+        "IF to_regclass('prepaid_refund_payouts') IS NOT NULL THEN "
+        "EXECUTE 'SELECT EXISTS (SELECT 1 FROM prepaid_refund_payouts)' INTO has_payouts; END IF; "
+        "IF has_payouts OR EXISTS (SELECT 1 FROM prepaid_refunds) OR EXISTS (SELECT 1 FROM prepaid_ledger_entries) "
         "OR EXISTS (SELECT 1 FROM prepaid_balances WHERE expires_at IS NOT NULL OR refunded_sompi > 0 "
         "OR expired_sompi > 0 OR refund_hold_sompi > 0) "
         "OR EXISTS (SELECT 1 FROM merchants WHERE prepaid_expiry_days IS NOT NULL) "
@@ -312,10 +332,12 @@ def downgrade() -> None:
     op.drop_index("ix_prepaid_ledger_entries_balance_id", table_name="prepaid_ledger_entries")
     op.drop_index("ix_prepaid_ledger_entries_tx_id", table_name="prepaid_ledger_entries")
     op.drop_table("prepaid_ledger_entries")
-    op.drop_index("ix_prepaid_refund_payouts_pending_next_check", table_name="prepaid_refund_payouts")
-    op.drop_index("ix_prepaid_refund_payouts_refund_id", table_name="prepaid_refund_payouts")
-    op.drop_index("ix_prepaid_refund_payouts_tx_id", table_name="prepaid_refund_payouts")
-    op.drop_table("prepaid_refund_payouts")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_pending_next_check")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_refund_id")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refund_payouts_tx_id")
+    op.execute("DROP TABLE IF EXISTS prepaid_refund_payouts")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refunds_hold_until")
+    op.execute("DROP INDEX IF EXISTS ix_prepaid_refunds_payout_submitted")
     op.drop_index("ix_prepaid_refunds_open_balance_id", table_name="prepaid_refunds")
     op.drop_index("ix_prepaid_refunds_merchant_status_created", table_name="prepaid_refunds")
     op.drop_index("ix_prepaid_refunds_request_nonce", table_name="prepaid_refunds")

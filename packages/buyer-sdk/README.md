@@ -86,7 +86,9 @@ await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  
 - The request signs a refund text (purpose `kasgate:v1:prepaid-refund`) that the SDK rebuilds itself; it refuses to sign
   for another payer, endpoint, action, refund or amount, or for more than the spendable credit the gateway reported.
   The signature moves no coins: the merchant pays the amount back on-chain to this key's address, with no platform fee.
-- The public list hides the merchant's reject reason; `signed=True` signs a `status` text (amount 0) to read it.
+- The public list hides the merchant's reject reason and claim (`paying` reads as `requested`); `signed=True` signs a
+  `status` text (amount 0) to read them (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
+  claimed it keeps its amount set aside until `hold_until`; a cancel is refused while a payout of it is on-chain.
   `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
 - `prepaid_balance` now also reports `refunded_sompi`, `expired_sompi`, `refund_hold_sompi` (set aside by an open
   refund), `spendable_sompi` and `expires_at` (when the merchant set a credit expiry).

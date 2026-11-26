@@ -29,6 +29,16 @@ class RpcUnavailableError(PaymentVerificationError):
 
 
 @dataclass(frozen=True)
+class PayoutSighting:
+    """A transaction the node shows paying a refund's payout address that may be that refund's payout (CONTRACT
+    v2.13 cancel check). `payload_seen`: seen in the mempool carrying the refund payload (proven); False for an
+    accepted output of exactly the refund amount whose payload the UTXO index cannot show (possible payout)."""
+
+    tx_id: str
+    payload_seen: bool
+
+
+@dataclass(frozen=True)
 class VerifiedPayment:
     tx_id: str
     payer_address: str | None  # None only for k402 kaspa-utxo, which proves no payer
