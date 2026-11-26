@@ -14,6 +14,8 @@ Stdio MCP server for KasGate. Tools:
 | `prepaid_deposit(slug, amount_kas)` | CONTRACT v2.11: funds a prepaid balance at the endpoint's merchant with one on-chain payment (>= 0.6 KAS; merchant share = credit, fee max(1.5 %, 0.2 KAS) to the treasury). Reserved against the session cap and per-call max before signing, committed on success. |
 | `prepaid_balance(slug)` | this key's prepaid balance at that merchant (read only). |
 | `call_prepaid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` paid by one signed debit from the prepaid balance (no transaction). Refuses to sign unless the debit text matches the request and the amount is within the cap; returns the debit receipt (`debited` or `refunded`). Does not draw the session cap again. |
+| `trial_status(slug)` | CONTRACT v2.12: how many free trial calls this buyer key has left on the endpoint. Signs nothing. |
+| `call_free_trial(slug, method, path, body)` | makes ONE call from the endpoint's free trial and never pays (fails with `trial_exhausted` when none is left). The signed trial text is checked against the request and carries no amount. A failed upstream gives the trial back (`refunded`). The paying tools also use a free trial automatically before paying: see `trial` in their result. |
 
 ## Environment
 
@@ -28,6 +30,7 @@ Stdio MCP server for KasGate. Tools:
 | `KASGATE_MAX_PRICE_KAS` | Hard ceiling per call, default `20`; the `max_price_kas` tool argument can only lower it. |
 | `KASGATE_SESSION_BUDGET_KAS` | Session spend cap for `call_with_budget`, default `20`. Concurrent calls reserve the quoted price atomically and cannot together exceed this cap. |
 | `KASGATE_REQUEST_TIMEOUT` | Seconds the server waits for a gateway response (including the payment settlement), default `60`. Must be a positive number or the server exits at startup. |
+| `KASGATE_USE_FREE_TRIALS` | `1` (default) lets the paying tools answer a 402 that offers a free trial with a signed trial call before paying; `0` always pays. Trial calls never count against the session budget. |
 
 The key's contents are never logged, never part of an error message and not shown in `repr(Config)`. A missing, malformed
 (not exactly 64 hex characters), binary or non-regular key file makes the server exit with a message that names the path

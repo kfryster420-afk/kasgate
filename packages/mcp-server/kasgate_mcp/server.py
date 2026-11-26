@@ -19,10 +19,12 @@ from kasgate_client import (
     KasGateError,
     PaymentReceipt,
     PrepaidReceipt,
+    TrialReceipt,
     kas_to_sompi,
     prepaid_receipt_of,
     receipt_of,
     sompi_to_kas,
+    trial_receipt_of,
 )
 
 from kasgate_mcp.budget import BudgetError, SpendBudget
@@ -89,6 +91,7 @@ class Config:
     max_price_sompi: int = DEFAULT_MAX_PRICE_SOMPI
     session_budget_sompi: int = DEFAULT_MAX_PRICE_SOMPI
     timeout_seconds: float = 60.0
+    use_free_trials: bool = True
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -125,6 +128,7 @@ class Config:
             max_price_sompi=max_price,
             session_budget_sompi=session_budget,
             timeout_seconds=timeout,
+            use_free_trials=env.get("KASGATE_USE_FREE_TRIALS", "1").strip().lower() in TRUTHY,
         )
 
 
@@ -192,6 +196,17 @@ def _describe_prepaid_receipt(receipt: PrepaidReceipt) -> dict[str, Any]:
     }
 
 
+def _describe_trial_receipt(receipt: TrialReceipt) -> dict[str, Any]:
+    return {
+        "trial_call_id": str(receipt.trialCallId),
+        "nonce": receipt.nonce,
+        "status": receipt.status,
+        "limit": receipt.limit,
+        "remaining": receipt.remaining,
+        "paid_kas": "0",
+    }
+
+
 def build_server(
     config: Config | None = None,
     *,
@@ -207,7 +222,9 @@ def build_server(
             "quote_endpoint for a live price. Pay with call_with_budget (session spend cap + per-call max) "
             "or call_paid_endpoint. Check remaining funds with get_budget. For many small calls, fund a prepaid "
             "balance once with prepaid_deposit (counts against the session budget), then use call_prepaid_endpoint "
-            "(signed debits, no transaction per call) and prepaid_balance. A tighter max_price_kas can only "
+            "(signed debits, no transaction per call) and prepaid_balance. Endpoints may offer free trial calls: "
+            "the paying tools use them automatically before paying (see `trial` in the result), trial_status shows "
+            "what is left and call_free_trial makes a call that can never pay. A tighter max_price_kas can only "
             "lower the configured ceiling, never raise it. Keys are never logged."
         ),
     )
@@ -234,6 +251,7 @@ def build_server(
                     max_price_sompi=cfg.max_price_sompi,
                     timeout=cfg.timeout_seconds,
                     follow_redirects=False,
+                    use_free_trials=cfg.use_free_trials,
                 )
             except KasGateError as exc:
                 raise ToolError(f"cannot start the payment client: {exc}") from exc
@@ -300,6 +318,8 @@ def build_server(
         result = _describe_response(response)
         receipt = receipt_of(response)
         result["payment"] = _describe_receipt(receipt) if receipt else None
+        trial = trial_receipt_of(response)
+        result["trial"] = _describe_trial_receipt(trial) if trial else None
         return result
 
     @server.tool()
@@ -500,6 +520,55 @@ def build_server(
         result = _describe_response(response)
         receipt = prepaid_receipt_of(response)
         result["prepaid"] = _describe_prepaid_receipt(receipt) if receipt else None
+        return result
+
+    @server.tool()
+    async def trial_status(slug: str) -> dict[str, Any]:
+        """How many free trial calls this buyer key has left on `slug` (CONTRACT v2.12; reads only, signs nothing)."""
+        slug = validate_slug(slug)
+        try:
+            status = await paying_client().trial_status(cfg.gateway_url, slug)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return {
+            "slug": status.slug,
+            "merchant_id": str(status.merchant_id),
+            "payer_address": status.payer_address,
+            "free_trial_calls": status.free_trial_calls,
+            "calls_used": status.calls_used,
+            "remaining": status.remaining,
+        }
+
+    @server.tool()
+    async def call_free_trial(
+        slug: str,
+        method: str = "GET",
+        path: str = "",
+        body: Any = None,
+    ) -> dict[str, Any]:
+        """Call an endpoint with ONE of its free trial calls and never pay (CONTRACT v2.12).
+
+        The buyer key signs a trial text that is checked against this exact request and carries no amount, so it
+        cannot move coins. Fails with `trial_exhausted` when no trial call is left; then use a paying tool. A failed
+        upstream (no response or 5xx) gives the trial call back (`trial.status` "refunded").
+        """
+        slug, _, url = _paid_url(slug, path)
+        method = (method or "GET").upper()
+        if method not in ALLOWED_METHODS:
+            raise ToolError(f"method must be one of {sorted(ALLOWED_METHODS)}")
+        kwargs = _request_kwargs(method, body)
+        try:
+            response = await paying_client().trial_request(method, url, **kwargs)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        result = _describe_response(response)
+        trial = trial_receipt_of(response)
+        result["trial"] = _describe_trial_receipt(trial) if trial else None
+        result["payment"] = None
         return result
 
     server.kasgate_config = cfg  # type: ignore[attr-defined]
