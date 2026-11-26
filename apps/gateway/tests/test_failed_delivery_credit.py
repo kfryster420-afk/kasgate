@@ -5,6 +5,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -229,6 +230,31 @@ async def test_last_failed_delivery_credits_the_merchant_share(
     replay = await client.get("/p/weather", headers=await paid_headers(client, TX))
     assert replay.status_code == 409
     assert len(await _credits(sessionmaker)) == 1
+
+
+async def test_a_failed_delivery_credit_is_stamped_with_the_database_clock(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """created_at is server-side now(), not the app clock, so credits/status keyset order follows commit order."""
+    fake = datetime(1999, 6, 1, 12, 0, tzinfo=UTC)
+
+    class _AppClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return fake
+
+    _fail_upstream(upstream)
+    with patch("app.failed_delivery.datetime", _AppClock):
+        third = (await _exhaust(client))[-1]
+    assert third.status_code == 502, third.text
+    [entry] = await _credits(sessionmaker)
+    async with sessionmaker() as session:
+        db_now = (await session.execute(select(func.now()))).scalar_one()
+    assert entry.created_at.year != 1999
+    assert abs((entry.created_at - db_now).total_seconds()) < 15
 
 
 @pytest.mark.parametrize("status", [500, 503, 504])

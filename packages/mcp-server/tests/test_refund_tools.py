@@ -62,7 +62,6 @@ class RefundGateway:
                 payer_address=body.payer_address,
                 amount_sompi=str(amount),
                 refund_id=body.refund_id,
-                spendable_sompi=str(self.spendable),
                 expires_at=expires,
             )
             return httpx.Response(201, content=challenge.model_dump_json(), headers={"content-type": "application/json"})

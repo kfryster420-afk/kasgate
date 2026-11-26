@@ -35,7 +35,7 @@ from tests.conftest import (
     seed_endpoint,
 )
 from tests.test_failed_delivery_credit import SPLIT, WINDOW_PAST, _age, _receipt
-from tests.test_prepaid import CREDIT_SOMPI, add_endpoint, fund
+from tests.test_prepaid import add_endpoint, fund
 from tests.test_refunds import signed
 
 POLICY = "/v1/prepaid/failed-delivery-policy"
@@ -605,10 +605,10 @@ async def test_held_limit_100_with_many_challenges_is_bounded_per_ip(
 async def test_hole_an_unsigned_challenge_discloses_any_buyers_credit_balance(
     client: httpx.AsyncClient, shop: Seed, upstream: Upstream
 ) -> None:
-    """credits/status is signed so only the depositing key can read its credit. But POST /credits/challenge and
-    POST /refunds/challenge are unauthenticated and return spendable_sompi and refundable_sompi for ANY
-    payer_address; spendable - refundable is exactly the unspent failed-delivery credit (no hold open). Anyone who
-    knows a buyer's address (it is on-chain) reads what the signed endpoint withholds."""
+    """POST /credits/challenge and POST /refunds/challenge are unauthenticated. They must not return
+    spendable_sompi or refundable_sompi: those would let anyone who knows a buyer's address derive unspent
+    call-only credit (spendable minus refundable, or spendable minus a default request amount_sompi). The
+    signed status is the only source for those values."""
     await fund(client)
     await _credit_n(client, upstream, 1)
     async with make_asgi_client(client, "198.51.100.7") as stranger:
@@ -619,6 +619,4 @@ async def test_hole_an_unsigned_challenge_discloses_any_buyers_credit_balance(
             await stranger.post("/v1/prepaid/refunds/challenge", json={"slug": "cheap", "payer_address": PAYER_ADDRESS})
         ).json()
     for body in (credits_challenge, refund):
-        derived = int(body["spendable_sompi"]) - int(body["refundable_sompi"])
-        assert derived != SPLIT.merchant_sompi, f"unsigned challenge reveals credit_balance {derived} ({body})"
-    assert int(refund["refundable_sompi"]) != CREDIT_SOMPI, "unsigned refund challenge reveals the deposit balance"
+        assert "spendable_sompi" not in body and "refundable_sompi" not in body, body

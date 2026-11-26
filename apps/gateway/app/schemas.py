@@ -1699,7 +1699,7 @@ class PrepaidRefundChallengeRequest(StrictModel):
     """Ask for the text to sign to open (`request`) or cancel (`cancel`) a refund of unused prepaid credit, or to
     read this key's refunds including the merchant's reject reasons (`status`).
 
-    `request`: `amount_sompi` is how much to get back (omit it for all spendable credit); `refund_id` must be absent.
+    `request`: `amount_sompi` is how much to get back (omit it for all refundable credit); `refund_id` must be absent.
     `cancel`: `refund_id` names the open request; `amount_sompi` must be absent.
     `status`: neither `amount_sompi` nor `refund_id`.
     """
@@ -1742,12 +1742,9 @@ class PrepaidRefundChallenge(BaseModel):
     merchant_id: uuid.UUID
     payer_address: str
     amount_sompi: BalanceSompiStr
-    """The refund amount; "0" for a status challenge."""
+    """The refund amount (defaults to refundable when the request omitted amount_sompi); "0" for a status challenge."""
     refund_id: uuid.UUID | None
-    spendable_sompi: BalanceSompiStr
     expires_at: datetime
-    refundable_sompi: BalanceSompiStr = "0"
-    """CONTRACT v2.14: the most a refund may take (deposited, unspent credit; failed-delivery credit is excluded)."""
 
 
 class PrepaidRefundSigned(StrictModel):
@@ -1956,10 +1953,6 @@ class PrepaidCreditStatusChallenge(BaseModel):
     amount_sompi: Literal["0"]
     """Always "0": a credits challenge never holds or refunds sompi. The signed message carries Amount: 0."""
     refund_id: None
-    spendable_sompi: BalanceSompiStr
-    """Informational only for action `credits`: not part of the signed message and not a hold."""
-    refundable_sompi: BalanceSompiStr
-    """Informational only for action `credits`. The signed status body is authoritative."""
     expires_at: datetime
 
 

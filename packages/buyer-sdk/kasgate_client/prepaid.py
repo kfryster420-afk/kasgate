@@ -115,9 +115,8 @@ class PrepaidRefundChallenge(_Model):
     merchant_id: uuid.UUID
     payer_address: str
     amount_sompi: BalanceStr
-    """The refund amount; "0" for a `status` challenge."""
+    """The refund amount; "0" for a `status` challenge. The unsigned challenge does not report spendable or refundable totals."""
     refund_id: uuid.UUID | None = None
-    spendable_sompi: BalanceStr
     expires_at: datetime
 
 
@@ -244,8 +243,10 @@ def validate_refund_challenge(
     """Check a refund challenge against what the SDK asked for; return the amount it names.
 
     A refund signature moves no coins, but the SDK still signs only text it rebuilt itself: this payer, this
-    domain, the requested action and refund, and the exact amount asked for (or, when no amount was given, no more
-    than the spendable credit the gateway reported). Raises InvalidChallengeError; nothing is signed when it raises.
+    domain, the requested action and refund, and the exact amount asked for (or, when no amount was given, the
+    amount the challenge names — the gateway's refundable default). Spendable and refundable totals are not on the
+    unsigned challenge; the gateway enforces the refundable cap when the request is submitted. Raises
+    InvalidChallengeError; nothing is signed when it raises.
     """
     amount = int(challenge.amount_sompi)
     if (challenge.payer_address, challenge.slug, challenge.action, challenge.refund_id) != (
@@ -258,8 +259,6 @@ def validate_refund_challenge(
     if action == "request":
         if amount_sompi is not None and amount != amount_sompi:
             raise InvalidChallengeError(f"refund challenge names {amount} sompi, not the {amount_sompi} requested")
-        if amount_sompi is None and amount > int(challenge.spendable_sompi):
-            raise InvalidChallengeError("refund challenge asks for more than the spendable credit")
         if amount <= 0:
             raise InvalidChallengeError("refund challenge names no amount")
     if action == "status" and amount != 0:

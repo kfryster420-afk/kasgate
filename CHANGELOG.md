@@ -33,19 +33,24 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`
   (unique partial index on `tx_id`, unique `settlement_id`, index on `slug`).
 - `GET /v1/prepaid/credits` lists credits (filters `slug`, `payer_address`, `tx_id`); `/v1/prepaid/ledger` shows them.
-- Balances and the refund challenge report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
-  identity is now `balance = deposited + credited - debited - refunded - expired`.
+- Balances report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
+  identity is now `balance = deposited + credited - debited - refunded - expired`. Unsigned
+  `POST /v1/prepaid/credits/challenge` and `POST /v1/prepaid/refunds/challenge` omit `spendable_sompi` and
+  `refundable_sompi` so unspent call-only credit cannot be derived without a signature; the signed status is
+  the only source for those values (`amount_sompi` on a refunds request challenge still defaults to refundable).
 - Signed `POST /v1/prepaid/credits/challenge` + `POST /v1/prepaid/credits/status` returns the buyer's credit
   totals and a page of credits (action `credits`; same challenge path as refunds/status). Each item includes
   `credit_id` (the ledger entry UUID, the same value as `creditId` on `X-KasGate-Credit`). The status body
   accepts optional `before` (opaque cursor) and `limit` (default 10, max 100) and returns `next_cursor` (null
-  when there are no more pages). Each page needs a fresh challenge. `GET` and signed
+  when there are no more pages). Each page needs a fresh challenge. The cursor is tamper-evident by binding to
+  merchant and key, not a secret. Credit `created_at` uses the database clock. `GET` and signed
   `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 - Signed webhook events `prepaid.credit.failed_delivery` and `prepaid.credit.failed_delivery_shortfall`.
 - A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never
   shortens a later expiry, never retroactive.
 - Alembic migration `0009_failed_delivery_credits` (down_revision `0008_prepaid_refunds`; its amount CHECK keeps
-  0008's 0-sompi refund rows; guarded downgrade).
+  0008's 0-sompi refund rows; guarded downgrade; partial index `ix_prepaid_ledger_entries_credit_balance_created`
+  on credit rows for the credits/status page).
 - Settings: `UPSTREAM_TIMEOUT_SECONDS` (was a constant), `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (now 30 s on top of
   the upstream timeout), `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
 - Out of scope: no per-endpoint policy override, no other public credit lookup. SDK/MCP parsing of
