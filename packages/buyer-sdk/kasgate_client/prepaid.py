@@ -29,6 +29,11 @@ DEPOSIT_QUOTE_PATH = "/v1/prepaid/deposits/quote"
 DEPOSIT_PATH = "/v1/prepaid/deposits"
 CHALLENGE_PATH = "/v1/prepaid/challenge"
 BALANCE_PATH = "/v1/prepaid/balance"
+# CONTRACT v2.13 refunds of unused credit (paid back on-chain by the merchant, no platform fee).
+PREPAID_REFUND_PURPOSE = "kasgate:v1:prepaid-refund"
+REFUND_CHALLENGE_PATH = "/v1/prepaid/refunds/challenge"
+REFUNDS_PATH = "/v1/prepaid/refunds"
+REFUND_STATUS_PATH = "/v1/prepaid/refunds/status"
 
 _BALANCE_RE = r"^(?:0|[1-9][0-9]{0,17})$"
 _SOMPI_RE = r"^[1-9][0-9]{0,17}$"
@@ -89,6 +94,50 @@ class PrepaidBalance(_Model):
     deposited_sompi: BalanceStr
     debited_sompi: BalanceStr
     updated_at: datetime | None = None
+    # CONTRACT v2.13 (absent from older gateways, hence the defaults)
+    refunded_sompi: BalanceStr = "0"
+    expired_sompi: BalanceStr = "0"
+    refund_hold_sompi: BalanceStr = "0"
+    spendable_sompi: BalanceStr | None = None
+    """What calls can be paid from now (balance minus an open refund's hold, 0 once expired). None = old gateway."""
+    expires_at: datetime | None = None
+
+
+RefundAction = Literal["request", "cancel"]
+RefundStatus = Literal["requested", "payout_submitted", "paid", "rejected", "cancelled"]
+
+
+class PrepaidRefundChallenge(_Model):
+    nonce: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    message: str
+    action: RefundAction
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: PositiveSompiStr
+    refund_id: uuid.UUID | None = None
+    spendable_sompi: BalanceStr
+    expires_at: datetime
+
+
+class PrepaidRefund(_Model):
+    """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was seen on-chain."""
+
+    id: uuid.UUID
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: PositiveSompiStr
+    status: RefundStatus
+    tx_id: str | None = None
+    reason: str | None = None
+    last_error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    payout_submitted_at: datetime | None = None
+    paid_at: datetime | None = None
+    resolved_at: datetime | None = None
+    payout_address: str
+    payout_payload_hex: str
 
 
 class PrepaidDebitHeader(X402Header):
@@ -139,6 +188,79 @@ def build_prepaid_debit_message(
         f"Nonce: {nonce}\n"
         f"Expires: {expires_at.isoformat()}"
     )
+
+
+def build_prepaid_refund_message(
+    *,
+    domain: str,
+    action: str,
+    address: str,
+    merchant_id: uuid.UUID,
+    amount_sompi: int,
+    refund_id: uuid.UUID | None,
+    nonce: str,
+    expires_at: datetime,
+) -> str:
+    """The exact text signed to open or cancel one refund; identical to the gateway's builder (CONTRACT v2.13)."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_REFUND_PURPOSE}\n"
+        f"Action: {action}\n"
+        f"Address: {address}\n"
+        f"Merchant: {merchant_id}\n"
+        f"Amount: {amount_sompi}\n"
+        f"Refund: {refund_id if refund_id is not None else '-'}\n"
+        f"Nonce: {nonce}\n"
+        f"Expires: {expires_at.isoformat()}"
+    )
+
+
+def validate_refund_challenge(
+    challenge: PrepaidRefundChallenge,
+    *,
+    domain: str,
+    address: str,
+    slug: str,
+    action: RefundAction,
+    amount_sompi: int | None,
+    refund_id: uuid.UUID | None,
+    now: datetime | None = None,
+) -> int:
+    """Check a refund challenge against what the SDK asked for; return the amount it names.
+
+    A refund signature moves no coins, but the SDK still signs only text it rebuilt itself: this payer, this
+    domain, the requested action and refund, and the exact amount asked for (or, when no amount was given, no more
+    than the spendable credit the gateway reported). Raises InvalidChallengeError; nothing is signed when it raises.
+    """
+    amount = int(challenge.amount_sompi)
+    if (challenge.payer_address, challenge.slug, challenge.action, challenge.refund_id) != (
+        address,
+        slug,
+        action,
+        refund_id,
+    ):
+        raise InvalidChallengeError("refund challenge is for another payer, endpoint, action or refund")
+    if action == "request":
+        if amount_sompi is not None and amount != amount_sompi:
+            raise InvalidChallengeError(f"refund challenge names {amount} sompi, not the {amount_sompi} requested")
+        if amount_sompi is None and amount > int(challenge.spendable_sompi):
+            raise InvalidChallengeError("refund challenge asks for more than the spendable credit")
+    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (now or datetime.now(UTC)):
+        raise InvalidChallengeError("refund challenge has already expired")
+    expected = build_prepaid_refund_message(
+        domain=domain,
+        action=action,
+        address=address,
+        merchant_id=challenge.merchant_id,
+        amount_sompi=amount,
+        refund_id=refund_id,
+        nonce=challenge.nonce,
+        expires_at=challenge.expires_at,
+    )
+    if challenge.message != expected:
+        raise InvalidChallengeError("refund challenge text does not match the request; refusing to sign it")
+    return amount
 
 
 def slug_of(path: str) -> str:

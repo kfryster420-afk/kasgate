@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import uuid
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
@@ -15,7 +16,7 @@ import httpx
 
 from .catalog import DiscoverResult
 from .client import KasGateClient
-from .prepaid import PrepaidBalance, PrepaidDepositReceipt
+from .prepaid import PrepaidBalance, PrepaidDepositReceipt, PrepaidRefund
 from .trials import TrialStatus
 
 T = TypeVar("T")
@@ -90,6 +91,19 @@ class KasGateSyncClient:
 
     def prepaid_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self._call(self._client.prepaid_request(method, url, **kwargs))
+
+    def prepaid_refund_request(
+        self, gateway_url: str | httpx.URL, slug: str, amount_sompi: int | None = None
+    ) -> PrepaidRefund:
+        return self._call(self._client.prepaid_refund_request(gateway_url, slug, amount_sompi))
+
+    def prepaid_refund_cancel(
+        self, gateway_url: str | httpx.URL, slug: str, refund_id: uuid.UUID | str
+    ) -> PrepaidRefund:
+        return self._call(self._client.prepaid_refund_cancel(gateway_url, slug, refund_id))
+
+    def prepaid_refunds(self, gateway_url: str | httpx.URL, slug: str) -> list[PrepaidRefund]:
+        return self._call(self._client.prepaid_refunds(gateway_url, slug))
 
     def trial_status(self, gateway_url: str | httpx.URL, slug: str) -> TrialStatus:
         return self._call(self._client.trial_status(gateway_url, slug))
