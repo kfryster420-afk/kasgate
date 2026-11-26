@@ -31,16 +31,15 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import and_, case, func, literal, select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
-from app.ledger import expire_balance_for, spendable_sompi
+from app.ledger import credit_expiry, expire_balance_for, spendable_sompi
 from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
@@ -161,17 +160,8 @@ def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBa
         refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi),
         spendable_sompi=str(spendable_sompi(balance)),
         expires_at=None if balance is None else balance.expires_at,
+        credited_sompi=str(0 if balance is None else balance.credited_sompi),
     )
-
-
-async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
-    """CONTRACT v2.13: the endpoint's credit expiry override, else the merchant default; None = never expires."""
-    if endpoint.prepaid_expiry_days is not None:
-        return endpoint.prepaid_expiry_days
-    days: int | None = (
-        await session.execute(select(Merchant.prepaid_expiry_days).where(Merchant.id == endpoint.merchant_id))
-    ).scalar_one_or_none()
-    return days
 
 
 # ---------------------------------------------------------------- deposits
@@ -401,19 +391,7 @@ async def deposit(
         await session.flush()
         # CONTRACT v2.13: overdue credit expires before new credit lands, and the new credit gets the policy expiry.
         await expire_balance_for(session, endpoint.merchant_id, public_key)
-        days = await expiry_policy_days(session, endpoint)
-        new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)
-        next_expiry: ColumnElement[datetime | None]
-        if new_expiry is None:
-            next_expiry = literal(None, PrepaidBalance.expires_at.type)
-        else:
-            promised_never = and_(
-                PrepaidBalance.expires_at.is_(None), PrepaidBalance.balance_sompi > PrepaidBalance.refund_hold_sompi
-            )
-            next_expiry = case(
-                (promised_never, literal(None, PrepaidBalance.expires_at.type)),
-                else_=func.greatest(func.coalesce(PrepaidBalance.expires_at, new_expiry), new_expiry),
-            )
+        new_expiry, next_expiry = await credit_expiry(session, endpoint)
         balance_id, balance = (
             await session.execute(
                 pg_insert(PrepaidBalance)

@@ -14,11 +14,12 @@ KasGate holds no coins in any of these steps; they only change the off-chain rec
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import ColumnElement, and_, case, func, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -30,6 +31,8 @@ from app.models import (
     PREPAID_REFUND_PAID,
     PREPAID_REFUND_PAYOUT_SUBMITTED,
     PREPAID_REFUND_REQUESTED,
+    Endpoint,
+    Merchant,
     PrepaidBalance,
     PrepaidLedgerEntry,
     PrepaidRefund,
@@ -38,6 +41,9 @@ from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.webhooks import enqueue_event
 
 logger = logging.getLogger("kasgate.ledger")
+
+# An extra worker pass (e.g. the failed-delivery credit sweep): (sessionmaker, batch size) -> rows changed.
+LedgerPass = Callable[[async_sessionmaker[AsyncSession], int], Awaitable[int]]
 
 MAX_ERROR_CHARS: Final = 300
 
@@ -67,6 +73,40 @@ def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -
     if balance_sompi is not None:
         data["balance_sompi"] = str(balance_sompi)
     return data
+
+
+async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
+    """CONTRACT v2.13: the endpoint's credit expiry override, else the merchant default; None = never expires."""
+    if endpoint.prepaid_expiry_days is not None:
+        return endpoint.prepaid_expiry_days
+    days: int | None = (
+        await session.execute(select(Merchant.prepaid_expiry_days).where(Merchant.id == endpoint.merchant_id))
+    ).scalar_one_or_none()
+    return days
+
+
+async def credit_expiry(
+    session: AsyncSession, endpoint: Endpoint
+) -> tuple[datetime | None, ColumnElement[datetime | None]]:
+    """Expiry for credit landing on a balance through `endpoint` (a deposit or a failed-delivery credit).
+
+    Returns the `expires_at` of a NEW balance and the expression for an EXISTING one: new credit gets the policy
+    expiry, an existing later expiry is kept, and a balance already promised "never expires" keeps that promise.
+    """
+    days = await expiry_policy_days(session, endpoint)
+    new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)
+    next_expiry: ColumnElement[datetime | None]
+    if new_expiry is None:
+        next_expiry = literal(None, PrepaidBalance.expires_at.type)
+    else:
+        promised_never = and_(
+            PrepaidBalance.expires_at.is_(None), PrepaidBalance.balance_sompi > PrepaidBalance.refund_hold_sompi
+        )
+        next_expiry = case(
+            (promised_never, literal(None, PrepaidBalance.expires_at.type)),
+            else_=func.greatest(func.coalesce(PrepaidBalance.expires_at, new_expiry), new_expiry),
+        )
+    return new_expiry, next_expiry
 
 
 @dataclass(frozen=True)
@@ -310,21 +350,32 @@ async def recheck_submitted_payouts(
     return paid
 
 
-async def run_ledger_pass(maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier) -> int:
-    """One worker pass: expire due balances, then re-check submitted payouts. Returns the rows it changed."""
+async def run_ledger_pass(
+    maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier, extra_passes: Sequence[LedgerPass] = ()
+) -> int:
+    """One worker pass: expire due balances, re-check submitted payouts, then any extra passes (failed-delivery
+    credits). Returns the rows it changed."""
     limit = get_settings().ledger_batch_size
     async with maker() as session:
         changed = await expire_due_balances(session, limit)
     changed += await recheck_submitted_payouts(maker, engine, limit)
+    for extra in extra_passes:
+        changed += await extra(maker, limit)
     return changed
 
 
 class LedgerWorker:
     """Background prepaid-ledger worker started by the app lifespan (safe to run on several replicas)."""
 
-    def __init__(self, maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier) -> None:
+    def __init__(
+        self,
+        maker: async_sessionmaker[AsyncSession],
+        engine: PaymentVerifier,
+        extra_passes: Sequence[LedgerPass] = (),
+    ) -> None:
         self._maker = maker
         self._engine = engine
+        self._extra_passes = tuple(extra_passes)
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -346,7 +397,7 @@ class LedgerWorker:
         interval = get_settings().ledger_poll_interval_seconds
         while not self._stopping:
             try:
-                await run_ledger_pass(self._maker, self._engine)
+                await run_ledger_pass(self._maker, self._engine, self._extra_passes)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -1,4 +1,4 @@
-"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0007 must carry existing rows over."""
+"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0009 must carry existing rows over."""
 
 import asyncio
 from typing import Any
@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0008_prepaid_refunds"
+HEAD_REVISION = "0009_failed_delivery_credits"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -891,6 +891,123 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
     await asyncio.to_thread(command.downgrade, config, "0007_trials_webhooks")
     assert await _scalar(url, "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'prepaid_re%'") == 0
     assert await _scalar(url, "SELECT balance_sompi FROM prepaid_balances") == 70
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
+
+
+async def test_0009_failed_delivery_credit_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_credits")
+    pg_server.create_database("kasgate_credits")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0008_prepaid_refunds")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100000000, '{GET}' FROM merchants LIMIT 1",
+        _settlement_insert("a" * 64, "1" * 32),
+        _settlement_insert("b" * 64, "2" * 32),
+        "INSERT INTO prepaid_balances (id, merchant_id, payer_address, payer_public_key, balance_sompi, "
+        "deposited_sompi, debited_sompi, refunded_sompi, expired_sompi) SELECT gen_random_uuid(), id, 'p', "
+        "repeat('a', 64), 60, 100, 30, 6, 4 FROM merchants LIMIT 1",
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    # existing balances carry over with nothing credited; existing merchants are opted in from the upgrade on
+    assert await _scalar(url, "SELECT credited_sompi FROM prepaid_balances") == 0
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM merchants WHERE failed_delivery_credit_enabled_at <= now() "
+            "AND failed_delivery_credit_disabled_at IS NULL",
+        )
+        == 1
+    )
+
+    tx_a, tx_b = "'" + "a" * 64 + "'", "'" + "b" * 64 + "'"
+    settlement_a = "(SELECT id FROM settlements WHERE tx_id = " + tx_a + ")"  # noqa: S608
+    settlement_b = "(SELECT id FROM settlements WHERE tx_id = " + tx_b + ")"  # noqa: S608
+    credit = (
+        "INSERT INTO prepaid_ledger_entries (id, balance_id, merchant_id, payer_address, kind, direction, "
+        "amount_sompi, balance_after_sompi, tx_id, settlement_id, slug, credit_reason) SELECT gen_random_uuid(), "
+        "b.id, b.merchant_id, 'p', '{kind}', '{direction}', 90, 150, {tx}, {settlement}, {slug}, {reason} "
+        "FROM prepaid_balances b LIMIT 1"
+    )
+
+    def row(**overrides: object) -> str:
+        values: dict[str, object] = {
+            "kind": "failed_delivery_credit",
+            "direction": "credit",
+            "tx": tx_b,
+            "settlement": settlement_b,
+            "slug": "'weather'",
+            "reason": "'window_expired'",
+        }
+        values.update(overrides)
+        return credit.format(**values)
+
+    await _execute(
+        url,
+        "UPDATE prepaid_balances SET credited_sompi = 90, balance_sompi = 150",
+        row(tx=tx_a, settlement=settlement_a),
+    )
+    for bad in (
+        "UPDATE prepaid_balances SET credited_sompi = 91",  # ck_prepaid_balances_balance_matches_totals
+        "UPDATE prepaid_balances SET credited_sompi = -1, balance_sompi = 59",  # credited_not_negative
+        row(tx=tx_a),  # ix_prepaid_ledger_entries_credit_tx_id: one credit per tx
+        row(settlement=settlement_a),  # one credit per settlement
+        row(settlement="NULL"),  # ck_prepaid_ledger_entries_credit_rows_carry_settlement
+        row(slug="NULL"),  # ck_prepaid_ledger_entries_credit_rows_carry_settlement
+        row(reason="NULL"),  # ck_prepaid_ledger_entries_credit_rows_carry_settlement
+        row(tx="NULL"),  # ck_prepaid_ledger_entries_credit_rows_carry_settlement
+        row(direction="debit"),  # ck_prepaid_ledger_entries_credit_rows_carry_settlement
+        row(reason="'lost'"),  # ck_prepaid_ledger_entries_credit_reason_known
+        row(kind="expiry", direction="debit", tx="NULL"),  # expiry rows carry no settlement
+        row(kind="gift"),  # ck_prepaid_ledger_entries_kind_known
+        "DELETE FROM settlements WHERE tx_id = " + tx_a,  # noqa: S608 (fk RESTRICT)
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
+        "'evt_' || repeat('f', 32), id, 'prepaid.credit.lost', '{}'::jsonb FROM merchants LIMIT 1",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+    # a non-credit row may still reuse a credited tx_id (the unique index is partial)
+    await _execute(
+        url,
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
+        "'evt_' || repeat('e', 32), id, 'prepaid.credit.failed_delivery', '{}'::jsonb FROM merchants LIMIT 1",
+    )
+
+    with pytest.raises(DBAPIError, match="failed-delivery credits, credited balances or credit webhooks exist"):
+        await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    await _execute(url, "DELETE FROM prepaid_ledger_entries")
+    with pytest.raises(DBAPIError, match="credited balances"):
+        await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    await _execute(url, "UPDATE prepaid_balances SET credited_sompi = 0, balance_sompi = 60")
+    with pytest.raises(DBAPIError, match="credit webhooks"):
+        await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    await _execute(url, "DELETE FROM webhook_events")
+    await asyncio.to_thread(command.downgrade, config, "0008_prepaid_refunds")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0008_prepaid_refunds"
+    assert await _scalar(url, "SELECT balance_sompi FROM prepaid_balances") == 60
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE column_name IN "
+            "('credited_sompi', 'credit_reason', 'failed_delivery_credit_enabled_at')",
+        )
+        == 0
+    )
+    with pytest.raises(IntegrityError):  # 0008's identity is back
+        await _execute(url, "UPDATE prepaid_balances SET balance_sompi = 61")
     await asyncio.to_thread(command.upgrade, config, "head")
     migrated = create_async_engine(url, poolclass=NullPool)
     try:

@@ -78,10 +78,12 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"                   
 | `REDELIVERY_WINDOW_SECONDS` | `600` | How long after settlement a buyer may re-present the same signature to get the upstream response again (0 to 3600). |
 | `REDELIVERY_MAX_ATTEMPTS` | `3` | Maximum upstream deliveries per settlement (0 to 10). |
 | `SESSION_TTL_SECONDS` | `604800` | Dashboard session lifetime (7 days). |
-| `LEDGER_WORKER_ENABLED` | `true` | CONTRACT v2.13 prepaid ledger worker: expires due credit and re-checks refund payouts that were not visible yet. Safe on several replicas. |
+| `LEDGER_WORKER_ENABLED` | `true` | CONTRACT v2.13 prepaid ledger worker: expires due credit, re-checks refund payouts that were not visible yet and credits failed deliveries after the redelivery window. Safe on several replicas. |
 | `LEDGER_POLL_INTERVAL_SECONDS` | `30` | Pause between ledger worker passes. |
 | `LEDGER_BATCH_SIZE` | `100` | Balances expired and payouts re-checked per pass. |
 | `PREPAID_PAYOUT_PENDING_MAX_SECONDS` | `86400` | A refund payout still not visible on-chain after this long goes back to `requested` (the merchant can pay again). |
+| `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` | `60` | Failed-delivery auto-credit: wait this long after `REDELIVERY_WINDOW_SECONDS` before the ledger worker credits a paid call whose upstream never answered (31 to 3600; must exceed one upstream attempt). |
+| `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS` | `604800` | The failed-delivery sweep only considers settlements this recent (1 h to 90 days). |
 
 ### Web variables
 
@@ -504,7 +506,7 @@ Do not go to mainnet until every box is ticked.
   - `was accepted by the node but its settlement could not be stored` followed by `unrecorded settlement pushed to kasgate:deadletter:settlements`: money moved on-chain but the database row is missing. The payload is in the Redis list; reconcile it by hand. Check the list length: `docker compose exec redis sh -c 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning LLEN kasgate:deadletter:settlements'` (should be 0).
   - `dead-letter queue unavailable` (the payload is only in the log line).
 - [ ] Track the rate of `503 rpc_unavailable` and `429 rate_limited` at the proxy.
-- [ ] **Redelivery.** KasGate settles on-chain first and calls the upstream second. If the upstream then fails (5xx or connection error), the buyer gets `502 upstream_error` **with** a `PAYMENT-RESPONSE`, the settlement stays `settled`, and **the payment is not refunded**. The buyer retries with the same `PAYMENT-SIGNATURE`: within `REDELIVERY_WINDOW_SECONDS` (600) and at most `REDELIVERY_MAX_ATTEMPTS` (3) deliveries, the gateway forwards the same request again without charging again (bound to the same payer, method and path). After the window or the limit, the answer is 409 and the money is simply spent. The SDK re-presents automatically for idempotent methods, `max_redeliveries` times. Non-idempotent calls (POST) are not retried automatically. Query the backlog of paid-but-undelivered calls:
+- [ ] **Redelivery.** KasGate settles on-chain first and calls the upstream second. If the upstream then fails (5xx or connection error), the buyer gets `502 upstream_error` **with** a `PAYMENT-RESPONSE`, the settlement stays `settled`, and **the payment is not refunded**. The buyer retries with the same `PAYMENT-SIGNATURE`: within `REDELIVERY_WINDOW_SECONDS` (600) and at most `REDELIVERY_MAX_ATTEMPTS` (3) deliveries, the gateway forwards the same request again without charging again (bound to the same payer, method and path). After the window or the limit, the answer is 409. If the last delivery failed, the merchant share is then credited to the buyer's prepaid balance at that merchant (failed-delivery auto-credit, below) unless the merchant opted out; otherwise the money is spent. The SDK re-presents automatically for idempotent methods, `max_redeliveries` times. Non-idempotent calls (POST) are not retried automatically. Query the backlog of paid-but-undelivered calls:
 
 ```bash
 cd infra
@@ -516,7 +518,22 @@ ORDER BY settled_at DESC LIMIT 50;
 SQL
 ```
 
-Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows, contact the affected merchant about their upstream, and decide on a manual refund policy (the gateway has no refund function). Tell merchants this behaviour in your terms.
+Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows and contact the affected merchant about their upstream. Tell merchants this behaviour in your terms.
+- [ ] **Failed-delivery auto-credit.** When redelivery is closed and the last delivery failed (5xx or no response), the merchant share (output 0) becomes prepaid credit for that buyer at that merchant: inline on the last allowed attempt (`reason=attempts_exhausted`, response header `X-KasGate-Credit`) or by the ledger worker once `REDELIVERY_WINDOW_SECONDS + FAILED_DELIVERY_CREDIT_GRACE_SECONDS` have passed (`reason=window_expired`). Nothing moves on-chain and the platform fee is not reversed. Each credit is a `prepaid_ledger_entries` row of kind `failed_delivery_credit` (unique per `tx_id` and per settlement, so it can never be paid twice) and a signed `prepaid.credit.failed_delivery` webhook. k402 `kaspa-utxo` payments, non-P2PK payers and prepaid deposits are never credited. Merchants opt out with `PUT /v1/prepaid/failed-delivery-policy {"enabled": false}` (never retroactive) and list credits with `GET /v1/prepaid/credits`. Details in [FAILED_DELIVERY_CREDITS.md](FAILED_DELIVERY_CREDITS.md). Keep `LEDGER_WORKER_ENABLED=true` on at least one replica, or only `attempts_exhausted` credits happen. Paid-but-undelivered calls that were **not** credited (policy off, no proven payer key, or older than `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`):
+
+```bash
+cd infra
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT s.tx_id, s.merchant_id, s.payment_scheme, s.upstream_status_code, s.delivery_attempts, s.settled_at
+FROM settlements s
+WHERE s.status = 'settled' AND (s.upstream_status_code IS NULL OR s.upstream_status_code >= 500)
+  AND s.settled_at < now() - interval '15 minutes'
+  AND NOT EXISTS (SELECT 1 FROM prepaid_ledger_entries e WHERE e.settlement_id = s.id)
+ORDER BY s.settled_at DESC LIMIT 50;
+SQL
+```
+
+  Credits issued in the last day: `SELECT count(*), sum(amount_sompi) FROM prepaid_ledger_entries WHERE kind = 'failed_delivery_credit' AND created_at > now() - interval '1 day';`. A sudden rise means a merchant upstream is down; contact them. Migration `0009_failed_delivery_credits` runs after `0008_prepaid_refunds`; its downgrade refuses while credits, credited balances or credit webhooks exist.
 - [ ] **Prepaid refunds and expiry (CONTRACT v2.13).** A buyer's refund request only sets credit aside; the merchant pays it on-chain from their own wallet (exactly `amount_sompi` to `payout_address`, no platform fee) and posts the txId, or a signed transaction carrying `payout_payload_hex`, to `POST /v1/prepaid/refunds/{id}/payout`. The ledger is debited only when the gateway sees that payout. Watch for refunds stuck in `payout_submitted` (the node could not see the payout) and for requests merchants leave open:
 
 ```bash
@@ -556,7 +573,7 @@ Public nodes are the current choice. Run your own `kaspad` later for reliability
 | SDK raises `TransactionBuildError` or `DustChangeError` ("InsufficientFundsError"). | The payer has no combination of UTXOs that pays price + network fee and leaves change of 0 or at least 0.3 KAS. Typical with one UTXO only slightly above the price, or two UTXOs that each almost cover it (for example two of 0.603 KAS at the 0.6 KAS price). Fix: fund more, or split the balance ([section 4.4](#44-split-the-balance-into-several-utxos-advisable)). The SDK fails closed rather than donate dust to the miner. |
 | `402 invalid_payment_header` on a payment the SDK built. | The payer address is not P2PK Schnorr (`kaspatest:q...` / `kaspa:q...`), the `payerProof` is wrong, the payment draws from more than 16 payer addresses, or no input is spent from `payerAddress`. Use a plain Schnorr key. |
 | `402 payment_expired` with a fresh `PAYMENT-REQUIRED`. | The nonce expired (`PAYMENT_MAX_AGE_SECONDS`, default 120 s) or was consumed. Nothing was spent; the SDK re-challenges once automatically. |
-| `409 payment_replayed`. | That txId or nonce is already settled or locked. Redelivery is only allowed for the same payer, method and path, within the window, after an upstream failure. |
+| `409 payment_replayed`. | That txId or nonce is already settled or locked. Redelivery is only allowed for the same payer, method and path, within the window, after an upstream failure, and never once the call was credited as a failed delivery (check `GET /v1/prepaid/credits?tx_id=`). |
 | `429 rate_limited` for everyone behind your proxy. | `FORWARDED_ALLOW_IPS` does not include the proxy's address, so all users share the proxy's IP ([section 7](#7-production-checklist)). |
 | Browser or `curl` gets 400/431/414 only on paid calls through nginx. | `large_client_header_buffers 4 64k;` is missing ([section 7](#7-production-checklist)). |
 | Funded tests all skip. | No key (`KASGATE_TEST_PAYER_KEY_FILE` or `KASGATE_TEST_PAYER_KEY`), or the gateway reports `kaspa_rpc:false`, or the gateway is not on testnet-10. Run `pytest -rs` to see each skip reason. |

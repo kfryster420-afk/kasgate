@@ -184,6 +184,7 @@ async def test_event_types_and_strict_payloads(client: httpx.AsyncClient, seeded
         "prepaid.refund.rejected",
         "prepaid.refund.cancelled",
         "prepaid.credit.expired",
+        "prepaid.credit.failed_delivery",
     }
     for body in (
         {"url": HOOK_URL, "event_types": []},

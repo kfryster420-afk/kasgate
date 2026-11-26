@@ -46,6 +46,12 @@ pays it back on-chain to the depositing address with no platform fee; follow it 
 GET /v1/prepaid/refunds/status?slug=&payer_address=. Credit may expire if the merchant set an expiry (see
 expires_at and spendable_sompi on the balance).
 
+Failed deliveries: if a paid call's upstream answers 5xx or not at all and redelivery is closed (last allowed
+attempt, or the redelivery window passed), the merchant share becomes prepaid credit for the payer key at that
+merchant, unless the merchant opted out. The failing response then carries X-KasGate-Credit: Base64(JSON{creditId,
+kind, txId, merchantId, creditSompi, balanceSompi, reason}); spend it with X-KasGate-Prepaid like a deposit
+(credited_sompi on the balance). Nothing is refunded on-chain.
+
 ## Free trial calls (kasgate-trial-v1)
 
 Some endpoints give each buyer key a few free calls. Their 402 carries X-KasGate-Trial-Offer and the catalog
@@ -63,7 +69,7 @@ lists kasgate-trial-v1. On the gateway host:
 
 Merchants can register HTTPS webhooks for payment.settled, prepaid.deposit, prepaid.debit, trial.used,
 endpoint.created, endpoint.updated, prepaid.refund.requested, prepaid.refund.paid, prepaid.refund.rejected,
-prepaid.refund.cancelled and prepaid.credit.expired. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
+prepaid.refund.cancelled, prepaid.credit.expired and prepaid.credit.failed_delivery. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
 HMAC-SHA256(secret, "<t>.<raw body>")>; reject timestamps older than 5 minutes and dedupe on X-KasGate-Event-Id.
 
 ## Catalog

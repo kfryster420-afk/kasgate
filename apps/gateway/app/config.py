@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     ledger_batch_size: int = Field(default=100, ge=1, le=1000)
     # A submitted refund payout that the node still cannot see after this long goes back to `requested`.
     prepaid_payout_pending_max_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    # Failed-delivery auto-credit (run by the ledger worker): a paid call whose upstream never answered or answered 5xx
+    # is credited once its redelivery window plus this grace (longer than one upstream attempt) has passed.
+    failed_delivery_credit_grace_seconds: int = Field(default=60, ge=31, le=3600)
+    # How far back the sweeper looks for uncredited failed deliveries (bounds each pass).
+    failed_delivery_credit_lookback_seconds: int = Field(default=604_800, ge=3600, le=7_776_000)
 
     @property
     def address_prefix(self) -> str:

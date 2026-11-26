@@ -65,11 +65,11 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from kaspa import Address, PublicKey, pay_to_address_script, verify_message
+from kaspa import PublicKey, verify_message
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,6 +86,8 @@ from app.deps import (
     get_redis,
 )
 from app.exact_v2 import ExactV2Verification, check_authorization_expiry
+from app.failed_delivery import credit_if_exhausted
+from app.kaspa_types import payer_public_key as payer_public_key
 from app.models import (
     PREPAID_DEBIT_DEBITED,
     PREPAID_DEBIT_REFUNDED,
@@ -95,6 +97,7 @@ from app.models import (
     Merchant,
     PrepaidBalance,
     PrepaidDebit,
+    PrepaidLedgerEntry,
     PriceCurrency,
     Settlement,
     SettlementStatus,
@@ -105,6 +108,7 @@ from app.models import (
 from app.oracle import OracleUnavailableError, usd_value
 from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.schemas import (
+    HEADER_FAILED_DELIVERY_CREDIT,
     HEADER_K402_PAYMENT,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
@@ -964,14 +968,18 @@ async def _forward_and_record(
     except UpstreamFailedError as exc:
         logger.warning("upstream failure for settled tx %s: %s", tx_id, exc)
         await _record_upstream_status(session, settlement_id, None)
-        return _error(
-            502,
-            "upstream_error",
-            "the upstream API did not return a response",
-            headers={HEADER_PAYMENT_RESPONSE: payment_response},
-        )
+        headers = {HEADER_PAYMENT_RESPONSE: payment_response}
+        credit = await credit_if_exhausted(session, settlement_id)
+        if credit is not None:
+            headers[HEADER_FAILED_DELIVERY_CREDIT] = credit.receipt().to_header()
+        return _error(502, "upstream_error", "the upstream API did not return a response", headers=headers)
     await _record_upstream_status(session, settlement_id, result.status_code)
-    return _relay(result, payment_response)
+    response = _relay(result, payment_response)
+    if result.status_code >= 500:
+        credit = await credit_if_exhausted(session, settlement_id)
+        if credit is not None:
+            response.headers[HEADER_FAILED_DELIVERY_CREDIT] = credit.receipt().to_header()
+    return response
 
 
 def _redelivery_allowed(
@@ -1033,6 +1041,8 @@ async def _claim_redelivery(session: AsyncSession, settlement_id: uuid.UUID, max
             Settlement.status == SettlementStatus.SETTLED,
             Settlement.delivery_attempts < max_attempts,
             or_(Settlement.upstream_status_code.is_(None), Settlement.upstream_status_code >= 500),
+            # A failed delivery that was already credited to prepaid can never be delivered as well.
+            ~exists().where(PrepaidLedgerEntry.settlement_id == Settlement.id),
         )
         .values(delivery_attempts=Settlement.delivery_attempts + 1)
         .returning(Settlement.id)
@@ -1797,7 +1807,6 @@ PREPAID_DEPOSIT_PREFIX: Final = "kasgate:prepaid:deposit:"
 PREPAID_CHALLENGE_PREFIX: Final = "kasgate:prepaid:challenge:"
 PREPAID_NONCE_LOCK_PREFIX: Final = "kasgate:prepaid:noncelock:"
 PREPAID_REFUND_DEAD_LETTER_KEY: Final = "kasgate:deadletter:prepaid-refunds"
-_P2PK_SCHNORR_SCRIPT: Final = re.compile(r"20([0-9a-f]{64})ac")
 
 
 def prepaid_deposit_key(nonce: str) -> str:
@@ -1810,18 +1819,6 @@ def prepaid_challenge_key(nonce: str) -> str:
 
 def prepaid_nonce_lock_key(nonce: str) -> str:
     return f"{PREPAID_NONCE_LOCK_PREFIX}{nonce}"
-
-
-def payer_public_key(address: str) -> str | None:
-    """The x-only Schnorr key of a P2PK address (script 20 <key> ac), or None for any other address kind."""
-    try:
-        script = pay_to_address_script(Address(address))
-    except Exception:
-        return None
-    if int(script.version) != 0:
-        return None
-    match = _P2PK_SCHNORR_SCRIPT.fullmatch(str(script.script).lower())
-    return match.group(1) if match else None
 
 
 def verify_prepaid_signature(message: str, signature: str, public_key: str) -> bool:

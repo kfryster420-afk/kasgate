@@ -106,7 +106,7 @@ Details and rationale are in [docs/CONTRACTS.md](docs/CONTRACTS.md) (the `CONTRA
 - **Wallet-proof auth.** Registration and login need a signed, single-use, domain-bound challenge from the merchant's wallet. API keys are shown once and stored only as a hash. Upstream secret headers are encrypted at rest.
 - **Rate limits and fail-closed behaviour.** Per-IP limits on sign-up, auth and unpaid requests, and a `503` rather than a silent pass if Redis is down.
 
-Known behaviour you should read before running it: settlement happens on-chain *before* the upstream is called. If the upstream then fails, the buyer is not refunded automatically; they retry with the same `PAYMENT-SIGNATURE` and the gateway redelivers without charging again, within a limited window. See the production checklist in the runbook.
+Known behaviour you should read before running it: settlement happens on-chain *before* the upstream is called. If the upstream then fails, the buyer retries with the same `PAYMENT-SIGNATURE` and the gateway redelivers without charging again, within a limited window. If the last delivery still fails, the merchant share becomes prepaid credit for that buyer at that merchant (failed-delivery auto-credit, merchants can opt out; nothing is refunded on-chain), see [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md). See the production checklist in the runbook.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

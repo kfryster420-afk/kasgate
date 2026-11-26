@@ -708,7 +708,7 @@ async def list_ledger(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[PrepaidLedgerEntryRead]:
-    """Refund payouts and expiries on this merchant's prepaid balances, newest first."""
+    """Refund payouts, expiries and failed-delivery credits on this merchant's prepaid balances, newest first."""
     rows = (
         await session.execute(
             select(PrepaidLedgerEntry)

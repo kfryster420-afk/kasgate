@@ -65,6 +65,8 @@ HEADER_TRIAL_CALL = "X-KasGate-Trial"
 HEADER_TRIAL_RECEIPT = "X-KasGate-Trial-Receipt"
 HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit"
 HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining"
+# Failed-delivery auto-credit: on the failing response when the call was credited back to prepaid there and then.
+HEADER_FAILED_DELIVERY_CREDIT = "X-KasGate-Credit"
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -1616,6 +1618,8 @@ class PrepaidBalanceRead(BaseModel):
     spendable_sompi: BalanceSompiStr = "0"
     """What calls can be paid from right now: balance - refund hold, or 0 once `expires_at` has passed."""
     expires_at: datetime | None = None
+    credited_sompi: BalanceSompiStr = "0"
+    """Merchant shares of failed paid calls credited back onto this balance (ledger kind failed_delivery_credit)."""
 
 
 class PrepaidDebitRead(ReadModel):
@@ -1773,7 +1777,8 @@ class PrepaidRefundReject(StrictModel):
     reason: str = Field(min_length=1, max_length=PREPAID_REFUND_REASON_MAX_LENGTH)
 
 
-PrepaidLedgerKindName = Literal["refund", "expiry"]
+PrepaidLedgerKindName = Literal["refund", "expiry", "failed_delivery_credit"]
+FailedDeliveryCreditReason = Literal["attempts_exhausted", "window_expired"]
 
 
 class PrepaidLedgerEntryRead(ReadModel):
@@ -1787,11 +1792,78 @@ class PrepaidLedgerEntryRead(ReadModel):
     refund_id: uuid.UUID | None
     note: str | None
     created_at: datetime
+    # failed_delivery_credit rows only
+    settlement_id: uuid.UUID | None = None
+    slug: str | None = None
+    credit_reason: FailedDeliveryCreditReason | None = None
 
     @field_validator("amount_sompi", "balance_after_sompi", mode="before")
     @classmethod
     def _sompi(cls, v: object) -> object:
         return str(v) if isinstance(v, int) else v
+
+
+# ---------------------------------------------------------------- failed-delivery auto-credit
+
+
+class FailedDeliveryCreditReceipt(X402Header):
+    """Body of the X-KasGate-Credit response header: the paid call failed for good and its merchant share is now
+    prepaid credit at this merchant (spend it with X-KasGate-Prepaid debits). The on-chain payment is not reversed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    creditId: uuid.UUID
+    kind: Literal["failed_delivery_credit"]
+    txId: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
+    merchantId: uuid.UUID
+    creditSompi: SompiStr
+    balanceSompi: BalanceSompiStr
+    reason: FailedDeliveryCreditReason
+
+
+class PrepaidCreditRead(BaseModel):
+    """GET /v1/prepaid/credits: one `failed_delivery_credit` ledger entry joined with the paid call it credits."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    id: uuid.UUID
+    kind: Literal["failed_delivery_credit"]
+    tx_id: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
+    settlement_id: uuid.UUID
+    endpoint_id: uuid.UUID
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    payer_address: str
+    payment_scheme: PaymentScheme
+    amount_sompi: SompiStr
+    """What the buyer paid on-chain for the call."""
+    fee_sompi: BalanceSompiStr
+    """Platform fee in output 1: already paid to the treasury and NOT reversed."""
+    credit_sompi: SompiStr
+    """The merchant share, credited to the buyer's prepaid balance at this merchant."""
+    balance_after_sompi: BalanceSompiStr
+    reason: FailedDeliveryCreditReason
+    upstream_status_code: Annotated[int, Field(ge=500)] | None
+    delivery_attempts: Annotated[int, Field(ge=1)]
+    settled_at: datetime | None
+    created_at: datetime
+
+
+class FailedDeliveryPolicyRead(BaseModel):
+    """GET/PUT /v1/prepaid/failed-delivery-policy. While `enabled`, paid calls settled since `enabled_at` whose
+    upstream fails for good are credited to the buyer's prepaid balance. Turning it off stops crediting calls settled
+    after `disabled_at`. Neither change is applied retroactively."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    enabled: bool
+    enabled_at: datetime
+    disabled_at: datetime | None
+
+
+class FailedDeliveryPolicyUpdate(StrictModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+
+    enabled: bool
 
 
 # ---------------------------------------------------------------- free trial calls (CONTRACT v2.12)
@@ -1887,6 +1959,7 @@ WebhookEventType = Literal[
     "prepaid.refund.rejected",
     "prepaid.refund.cancelled",
     "prepaid.credit.expired",
+    "prepaid.credit.failed_delivery",
 ]
 WebhookDeliveryStatus = Literal["pending", "delivering", "succeeded", "dead"]
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain")
