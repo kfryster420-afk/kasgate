@@ -58,6 +58,9 @@ HEADER_K402_PAYMENT = "X-K402-Payment"
 # CONTRACT v2.11 prepaid credit: the signed debit on a paid call and the debit receipt on its response.
 HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
 HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
+# Buyer-signed GET /v1/prepaid/balance: unix seconds + Schnorr signature over build_prepaid_balance_read_message.
+HEADER_BALANCE_TIMESTAMP = "X-KasGate-Balance-Timestamp"
+HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 # CONTRACT v2.12 free trial calls: the offer on a 402, the signed trial call, and the trial state on its response.
 HEADER_TRIAL_OFFER = "X-KasGate-Trial-Offer"
 HEADER_TRIAL_CALL = "X-KasGate-Trial"
@@ -87,6 +90,8 @@ SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
 
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
+PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
+PREPAID_BALANCE_READ_TOLERANCE_SECONDS = 300
 # Body-Hash of a request without a body.
 PREPAID_EMPTY_BODY_HASH = "-"
 PREPAID_BODY_HASH_RE = r"^(?:[0-9a-f]{64}|-)$"
@@ -258,6 +263,19 @@ def build_auth_challenge(purpose: str, domain: str, address: str, nonce: str, ex
 def prepaid_body_hash(body: bytes) -> str:
     """Body-Hash of a prepaid debit: SHA-256 hex of the raw request body, or "-" when there is no body."""
     return hashlib.sha256(body).hexdigest() if body else PREPAID_EMPTY_BODY_HASH
+
+
+def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
+    """The text a buyer signs (depositing P2PK key) to read its own deposited/debited totals. Its Purpose differs
+    from every other KasGate message, so the signature authorises nothing but this read."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Slug: {slug}\n"
+        f"Timestamp: {timestamp}"
+    )
 
 
 def build_prepaid_debit_message(
@@ -1535,11 +1553,14 @@ class PrepaidReceipt(X402Header):
 
 
 class PrepaidBalanceRead(BaseModel):
+    """`deposited_sompi` / `debited_sompi` are null on the public balance read unless the buyer signs it
+    (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature); merchant views always carry them."""
+
     merchant_id: uuid.UUID
     payer_address: str
     balance_sompi: BalanceSompiStr
-    deposited_sompi: BalanceSompiStr
-    debited_sompi: BalanceSompiStr
+    deposited_sompi: BalanceSompiStr | None
+    debited_sompi: BalanceSompiStr | None
     updated_at: datetime | None
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -54,6 +55,8 @@ from .prepaid import (
     CHALLENGE_PATH,
     DEPOSIT_PATH,
     DEPOSIT_QUOTE_PATH,
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
     PREPAID_RECEIPT_EXTENSION,
@@ -63,6 +66,7 @@ from .prepaid import (
     PrepaidDepositQuote,
     PrepaidDepositReceipt,
     PrepaidReceipt,
+    build_prepaid_balance_read_message,
     prepaid_body_hash,
     slug_of,
     validate_debit_challenge,
@@ -534,10 +538,25 @@ class KasGateClient:
         return receipt
 
     async def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
-        """This key's prepaid balance at the merchant behind `slug` (public read; never signs)."""
-        origin = self._origin(self._absolute(gateway_url))
+        """This key's prepaid balance at the merchant behind `slug`, with its deposited and debited totals.
+
+        The read is signed (a balance-read message naming the gateway domain, this address, the slug and the time,
+        nothing else) so the gateway returns the totals it hides from unsigned public reads. It authorises no
+        payment or debit.
+        """
+        url = self._absolute(gateway_url)
+        origin = self._origin(url)
+        timestamp = int(time.time())
+        message = build_prepaid_balance_read_message(
+            domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
+        )
         response = await self._http.get(
-            origin + BALANCE_PATH, params={"slug": slug, "payer_address": self.address}
+            origin + BALANCE_PATH,
+            params={"slug": slug, "payer_address": self.address},
+            headers={
+                HEADER_BALANCE_TIMESTAMP: str(timestamp),
+                HEADER_BALANCE_SIGNATURE: kaspa.sign_message(message, self._private_key),
+            },
         )
         if response.status_code != 200:
             code, message = error_details(response)

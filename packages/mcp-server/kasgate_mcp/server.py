@@ -473,7 +473,8 @@ def build_server(
 
     @server.tool()
     async def prepaid_balance(slug: str) -> dict[str, Any]:
-        """Show this buyer key's prepaid balance at the merchant behind `slug` (reads only, signs nothing)."""
+        """Show this buyer key's prepaid balance at the merchant behind `slug`, with its deposited and debited
+        totals (a read only: it signs a balance-read message that authorises no payment)."""
         slug = validate_slug(slug)
         try:
             balance = await paying_client().prepaid_balance(cfg.gateway_url, slug)
@@ -486,8 +487,8 @@ def build_server(
             "payer_address": balance.payer_address,
             "balance_kas": sompi_to_kas(int(balance.balance_sompi)),
             "balance_sompi": int(balance.balance_sompi),
-            "deposited_sompi": int(balance.deposited_sompi),
-            "debited_sompi": int(balance.debited_sompi),
+            "deposited_sompi": None if balance.deposited_sompi is None else int(balance.deposited_sompi),
+            "debited_sompi": None if balance.debited_sompi is None else int(balance.debited_sompi),
         }
 
     @server.tool()

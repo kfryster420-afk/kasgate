@@ -21,8 +21,11 @@ from .protocol import PaymentRequired, X402Header
 
 HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
 HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
+HEADER_BALANCE_TIMESTAMP = "X-KasGate-Balance-Timestamp"
+HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
+PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
 PREPAID_EMPTY_BODY_HASH = "-"
 PREPAID_RECEIPT_EXTENSION = "kasgate_prepaid_receipt"
 DEPOSIT_QUOTE_PATH = "/v1/prepaid/deposits/quote"
@@ -83,12 +86,27 @@ class PrepaidChallenge(_Model):
 
 
 class PrepaidBalance(_Model):
+    """`deposited_sompi` / `debited_sompi` are only returned on a buyer-signed read (the SDK always signs); an
+    unsigned public read leaves them None."""
+
     merchant_id: uuid.UUID
     payer_address: str
     balance_sompi: BalanceStr
-    deposited_sompi: BalanceStr
-    debited_sompi: BalanceStr
+    deposited_sompi: BalanceStr | None = None
+    debited_sompi: BalanceStr | None = None
     updated_at: datetime | None = None
+
+
+def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
+    """The text signed to read this key's own deposited/debited totals (byte-identical to the gateway's)."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Slug: {slug}\n"
+        f"Timestamp: {timestamp}"
+    )
 
 
 class PrepaidDebitHeader(X402Header):

@@ -42,6 +42,8 @@ from .exceptions import (
     UnexpectedRecipientError,
 )
 from .prepaid import (
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
     PREPAID_RECEIPT_EXTENSION,
@@ -52,6 +54,7 @@ from .prepaid import (
     PrepaidDepositQuote,
     PrepaidDepositReceipt,
     PrepaidReceipt,
+    build_prepaid_balance_read_message,
     build_prepaid_debit_message,
     prepaid_body_hash,
     validate_debit_challenge,
@@ -99,6 +102,8 @@ __all__ = [
     "DEFAULT_MAX_PRICE_SOMPI",
     "DEFAULT_MIN_CHANGE_SOMPI",
     "DEFAULT_MIN_OUTPUT_SOMPI",
+    "HEADER_BALANCE_SIGNATURE",
+    "HEADER_BALANCE_TIMESTAMP",
     "HEADER_PAYMENT_REQUIRED",
     "HEADER_PAYMENT_RESPONSE",
     "HEADER_PAYMENT_SIGNATURE",
@@ -162,6 +167,7 @@ __all__ = [
     "TrialReceipt",
     "TrialStatus",
     "UnexpectedRecipientError",
+    "build_prepaid_balance_read_message",
     "build_prepaid_debit_message",
     "build_trial_call_message",
     "compute_fee_split",

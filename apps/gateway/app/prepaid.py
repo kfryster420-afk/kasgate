@@ -12,7 +12,7 @@ Routes (all under /v1/prepaid):
   ``resolve_inputs`` + ``settle``, then ONE transaction: settlement row (kaspa-exact-v1, fee > 0, treasury), balance
   upsert (credit = merchant share only) and the prepaid_deposits row (unique tx_id and settlement_id).
 * ``POST /challenge`` (public, unpaid rate limit) -> 201 PrepaidChallenge: the exact text to sign for ONE debit.
-* ``GET /balance?slug=&payer_address=`` (public) -> PrepaidBalanceRead.
+* ``GET /balance?slug=&payer_address=`` (public; totals only when buyer-signed) -> PrepaidBalanceRead.
 * ``GET /balances``, ``GET /deposits``, ``GET /debits`` [Bearer] -> the merchant's own prepaid ledger.
 
 KasGate never holds the coins: the merchant and the treasury were paid on-chain by the deposit. Unused credit is a
@@ -21,10 +21,12 @@ merchant obligation, never a KasGate liability; there is no withdrawal route.
 
 import json
 import logging
+import re
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -62,10 +64,14 @@ from app.proxy import (
     prepaid_deposit_key,
     prepaid_only_error,
     prepaid_price,
+    verify_prepaid_signature,
 )
 from app.schemas import (
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
+    PREPAID_BALANCE_READ_TOLERANCE_SECONDS,
     PaymentRequired,
     PaymentSignature,
     PrepaidBalanceRead,
@@ -76,10 +82,11 @@ from app.schemas import (
     PrepaidDepositQuoteRequest,
     PrepaidDepositRead,
     PrepaidDepositReceipt,
+    build_prepaid_balance_read_message,
     compute_fee_split,
     new_payment_nonce,
 )
-from app.security import RATE_LIMIT_UNPAID_PROXY, get_current_merchant, limit_by_ip
+from app.security import RATE_LIMIT_UNPAID_PROXY, auth_domain, get_current_merchant, limit_by_ip
 from app.webhooks import enqueue_event
 
 logger = logging.getLogger("kasgate.prepaid")
@@ -131,9 +138,7 @@ class _CapBackstopError(Exception):
     """The conditional credit found the balance already at the cap: the settled deposit must not be credited."""
 
 
-async def _lock_balance_row(
-    session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str
-) -> int:
+async def _lock_balance_row(session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str) -> int:
     """Lock the (merchant, key) balance row FOR UPDATE and return its balance.
 
     A zero row is inserted first (ON CONFLICT DO NOTHING) so a buyer's very first deposits serialize too: a second
@@ -191,15 +196,54 @@ def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDeposit
     )
 
 
-def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None) -> PrepaidBalanceRead:
+def _balance_read(
+    merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None, *, totals: bool = True
+) -> PrepaidBalanceRead:
+    """`totals=False` (the unsigned public read) leaves deposited/debited null: only the buyer sees its spend."""
     return PrepaidBalanceRead(
         merchant_id=merchant_id,
         payer_address=payer_address if balance is None else balance.payer_address,
         balance_sompi=str(0 if balance is None else balance.balance_sompi),
-        deposited_sompi=str(0 if balance is None else balance.deposited_sompi),
-        debited_sompi=str(0 if balance is None else balance.debited_sompi),
+        deposited_sompi=str(0 if balance is None else balance.deposited_sompi) if totals else None,
+        debited_sompi=str(0 if balance is None else balance.debited_sompi) if totals else None,
         updated_at=None if balance is None else balance.updated_at,
     )
+
+
+_BALANCE_TIMESTAMP_RE: Final = re.compile(r"^[0-9]{1,12}$")
+_BALANCE_SIGNATURE_RE: Final = re.compile(r"^[0-9a-f]{128}$")
+
+
+def _balance_read_signed(request: Request, *, address: str, slug: str, public_key: str) -> bool | JSONResponse:
+    """False when the request carries no balance signature (public read), True when it verifies, otherwise a 401.
+
+    The buyer signs `build_prepaid_balance_read_message` with the key behind `payer_address`; the timestamp must be
+    within PREPAID_BALANCE_READ_TOLERANCE_SECONDS of now. A read only, so a replay inside the window reveals
+    nothing the signer did not already choose to read.
+    """
+    stamp = request.headers.get(HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(HEADER_BALANCE_SIGNATURE)
+    if stamp is None and signature is None:
+        return False
+    if stamp is None or signature is None:
+        return _error(
+            401,
+            "invalid_balance_signature",
+            f"send both {HEADER_BALANCE_TIMESTAMP} and {HEADER_BALANCE_SIGNATURE}, or neither",
+        )
+    if not _BALANCE_TIMESTAMP_RE.fullmatch(stamp) or not _BALANCE_SIGNATURE_RE.fullmatch(signature.lower()):
+        return _error(
+            401,
+            "invalid_balance_signature",
+            f"{HEADER_BALANCE_TIMESTAMP} must be unix seconds and {HEADER_BALANCE_SIGNATURE} 128 hex characters",
+        )
+    timestamp = int(stamp)
+    if abs(int(time.time()) - timestamp) > PREPAID_BALANCE_READ_TOLERANCE_SECONDS:
+        return _error(401, "invalid_balance_signature", "balance signature timestamp is outside the allowed window")
+    message = build_prepaid_balance_read_message(domain=auth_domain(), address=address, slug=slug, timestamp=timestamp)
+    if not verify_prepaid_signature(message, signature.lower(), public_key):
+        return _error(401, "invalid_balance_signature", "balance signature does not verify for payer_address")
+    return True
 
 
 # ---------------------------------------------------------------- deposits
@@ -634,6 +678,7 @@ async def debit_challenge(
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
 async def read_balance(
+    request: Request,
     session: DbSession,
     slug: Annotated[str, Query(min_length=3, max_length=64, pattern=r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$")],
     payer_address: Annotated[str, Query(min_length=10, max_length=100)],
@@ -645,6 +690,9 @@ async def read_balance(
     public_key = payer_public_key(address)
     if public_key is None:
         return _not_p2pk()
+    signed = _balance_read_signed(request, address=address, slug=slug, public_key=public_key)
+    if isinstance(signed, JSONResponse):
+        return signed
     try:
         found = await _active_endpoint(session, slug)
         if found is None:
@@ -655,8 +703,8 @@ async def read_balance(
         logger.exception("prepaid balance lookup failed")
         return _store_unavailable()
     return JSONResponse(
-        content=_balance_read(endpoint.merchant_id, address, balance).model_dump(mode="json"),
-        headers={"Cache-Control": "no-store"},
+        content=_balance_read(endpoint.merchant_id, address, balance, totals=signed).model_dump(mode="json"),
+        headers={"Cache-Control": "no-store", "Vary": f"{HEADER_BALANCE_TIMESTAMP}, {HEADER_BALANCE_SIGNATURE}"},
     )
 
 
