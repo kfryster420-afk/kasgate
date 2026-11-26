@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     rl_unpaid_proxy_per_minute: int = Field(default=300, ge=1)
     # CONTRACT v2.11: cap on one buyer's prepaid balance at one merchant (checked when a deposit is quoted).
     prepaid_max_balance_sompi: int = Field(default=10_000_000_000_000, ge=60_000_000, le=999_999_999_999_999_999)
+    # CONTRACT v2.12: free trial calls consumed per client IP per hour (on top of the per-endpoint daily cap).
+    rl_trial_calls_per_ip_per_hour: int = Field(default=30, ge=1)
+    # CONTRACT v2.12 merchant webhooks: the outbox dispatcher and its retry schedule.
+    webhook_dispatcher_enabled: bool = True
+    webhook_poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
+    webhook_batch_size: int = Field(default=20, ge=1, le=500)
+    webhook_concurrency: int = Field(default=8, ge=1, le=64)
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
+    webhook_max_attempts: int = Field(default=8, ge=1, le=20)
+    webhook_backoff_base_seconds: float = Field(default=30.0, gt=0, le=3600)
+    webhook_backoff_max_seconds: float = Field(default=3600.0, gt=0, le=86_400)
+    webhook_lease_seconds: int = Field(default=60, ge=15, le=600)
+    webhook_max_per_merchant: int = Field(default=10, ge=1, le=100)
 
     @property
     def address_prefix(self) -> str:

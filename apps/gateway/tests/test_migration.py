@@ -1,4 +1,4 @@
-"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0006 must carry existing rows over."""
+"""The migrations must reproduce Base.metadata exactly on PostgreSQL, and 0002-0007 must carry existing rows over."""
 
 import asyncio
 from typing import Any
@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0006_prepaid"
+HEAD_REVISION = "0007_trials_webhooks"
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -635,6 +635,111 @@ async def test_0006_prepaid_constraints_and_guarded_downgrade(pg_server: PgServe
         await _scalar(
             url,
             "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'prepaid_%'",
+        )
+        == 0
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
+
+
+async def test_0007_trials_webhooks_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_trials")
+    pg_server.create_database("kasgate_trials")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0006_prepaid")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100000000, '{GET}' FROM merchants LIMIT 1",
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    # existing endpoints get no trial and the default daily cap
+    assert await _scalar(url, "SELECT free_trial_calls FROM endpoints") == 0
+    assert await _scalar(url, "SELECT trial_daily_cap FROM endpoints") == 100
+
+    usage = (
+        "INSERT INTO trial_usages (id, endpoint_id, merchant_id, payer_address, payer_public_key, calls_used) "
+        "SELECT gen_random_uuid(), e.id, e.merchant_id, 'p', '{key}', {used} FROM endpoints e LIMIT 1"
+    )
+    call = (
+        "INSERT INTO trial_calls (id, usage_id, endpoint_id, merchant_id, nonce, payer_address, status, "
+        "request_method, request_path, body_hash, refunded_at) SELECT gen_random_uuid(), u.id, u.endpoint_id, "
+        "u.merchant_id, '{nonce}', 'p', '{status}', 'GET', '/p/weather', {body}, {refunded} FROM trial_usages u LIMIT 1"
+    )
+    webhook = (
+        "INSERT INTO webhooks (id, merchant_id, url, event_types, secret_encrypted, secret_prefix) "
+        "SELECT gen_random_uuid(), id, '{url}', '{types}', 'x'::bytea, 'whsec_abcd' FROM merchants LIMIT 1"
+    )
+    event = (
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) "
+        "SELECT gen_random_uuid(), '{event_id}', id, '{event_type}', '{{}}'::jsonb FROM merchants LIMIT 1"
+    )
+    delivery = (
+        "INSERT INTO webhook_deliveries (id, event_pk, webhook_id, merchant_id, status, attempts, delivered_at) "
+        "SELECT gen_random_uuid(), e.id, w.id, w.merchant_id, '{status}', {attempts}, {delivered} "
+        "FROM webhook_events e, webhooks w LIMIT 1"
+    )
+    await _execute(
+        url,
+        "UPDATE endpoints SET free_trial_calls = 3",
+        usage.format(key="a" * 64, used=1),
+        call.format(nonce="1" * 32, status="used", body="NULL", refunded="NULL"),
+        call.format(nonce="2" * 32, status="refunded", body=f"'{'e' * 64}'", refunded="now()"),
+        "INSERT INTO trial_daily_counts (endpoint_id, day, calls) SELECT id, current_date, 2 FROM endpoints",
+        webhook.format(url="https://hooks.example.com/k", types="{payment.settled}"),
+        event.format(event_id="evt_" + "a" * 32, event_type="payment.settled"),
+        delivery.format(status="pending", attempts=0, delivered="NULL"),
+    )
+    for bad in (
+        "UPDATE endpoints SET free_trial_calls = 101",  # ck_endpoints_free_trial_calls_range
+        "UPDATE endpoints SET free_trial_calls = -1",  # ck_endpoints_free_trial_calls_range
+        "UPDATE endpoints SET trial_daily_cap = 0",  # ck_endpoints_trial_daily_cap_range
+        usage.format(key="a" * 64, used=0),  # unique (endpoint_id, payer_public_key)
+        usage.format(key="b" * 64, used=-1),  # ck_trial_usages_calls_used_not_negative
+        usage.format(key="B" * 64, used=0),  # ck_trial_usages_payer_public_key_hex64
+        call.format(nonce="1" * 32, status="used", body="NULL", refunded="NULL"),  # unique nonce
+        call.format(nonce="3" * 31, status="used", body="NULL", refunded="NULL"),  # nonce_hex32
+        call.format(nonce="3" * 32, status="refunded", body="NULL", refunded="NULL"),  # refunded_at iff refunded
+        call.format(nonce="3" * 32, status="settled", body="NULL", refunded="NULL"),  # status_known
+        call.format(nonce="3" * 32, status="used", body="'xyz'", refunded="NULL"),  # body_hash_hex64
+        "INSERT INTO trial_daily_counts (endpoint_id, day, calls) SELECT id, current_date, 1 FROM endpoints",  # pk
+        "UPDATE trial_daily_counts SET calls = -1",  # ck_trial_daily_counts_calls_not_negative
+        webhook.format(url="http://hooks.example.com/k", types="{payment.settled}"),  # ck_webhooks_url_https
+        webhook.format(url="https://hooks.example.com/k", types="{}"),  # ck_webhooks_event_types_not_empty
+        event.format(event_id="evt_" + "a" * 32, event_type="payment.settled"),  # unique event_id
+        event.format(event_id="evt_" + "A" * 32, event_type="payment.settled"),  # event_id_format
+        event.format(event_id="evt_" + "b" * 32, event_type="payment.refunded"),  # event_type_known
+        delivery.format(status="pending", attempts=0, delivered="NULL"),  # unique (event_pk, webhook_id)
+        "UPDATE webhook_deliveries SET status = 'lost'",  # ck_webhook_deliveries_status_known
+        "UPDATE webhook_deliveries SET attempts = -1",  # ck_webhook_deliveries_attempts_not_negative
+        "UPDATE webhook_deliveries SET status = 'succeeded'",  # delivered_at iff succeeded
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+
+    with pytest.raises(DBAPIError, match="trial calls, trial-enabled endpoints or webhooks exist"):
+        await asyncio.to_thread(command.downgrade, config, "0006_prepaid")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    await _execute(url, "DELETE FROM webhooks", "DELETE FROM trial_calls")
+    with pytest.raises(DBAPIError, match="trial-enabled endpoints"):
+        await asyncio.to_thread(command.downgrade, config, "0006_prepaid")
+    await _execute(url, "UPDATE endpoints SET free_trial_calls = 0")
+    await asyncio.to_thread(command.downgrade, config, "0006_prepaid")
+    assert (
+        await _scalar(
+            url,
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name LIKE 'trial_%' OR table_name LIKE 'webhook%'",
         )
         == 0
     )

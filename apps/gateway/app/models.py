@@ -1,12 +1,14 @@
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -19,7 +21,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -53,6 +55,12 @@ EXACT_V2_SHAPE_SQL = (
     "payment_scheme <> 'kaspa-exact-v2' OR (fee_amount_sompi = 0 AND treasury_address IS NULL "
     "AND payment_nonce IS NULL AND k402_payment_id IS NULL AND payer_address IS NOT NULL)"
 )
+
+
+# CONTRACT v2.12 free trial limits (also enforced by Pydantic and by DB CHECKs).
+TRIAL_MAX_CALLS = 100
+TRIAL_DAILY_CAP_DEFAULT = 100
+TRIAL_DAILY_CAP_MAX = 100_000
 
 
 class SettlementStatus(enum.StrEnum):
@@ -126,6 +134,11 @@ class Endpoint(TimestampMixin, Base):
     # CONTRACT v2.11: paid only from a prepaid balance. Such an endpoint may be priced below the on-chain minimum
     # (0.6 KAS) and its 402 offers no on-chain terms. Every endpoint also accepts prepaid debits.
     prepaid_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # CONTRACT v2.12: unpaid calls each buyer key gets (0 = no trial) and the endpoint's total trial calls per UTC day.
+    free_trial_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    trial_daily_cap: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=TRIAL_DAILY_CAP_DEFAULT, server_default=str(TRIAL_DAILY_CAP_DEFAULT)
+    )
 
     merchant: Mapped[Merchant] = relationship(back_populates="endpoints")
     settlements: Mapped[list["Settlement"]] = relationship(back_populates="endpoint")
@@ -140,6 +153,8 @@ class Endpoint(TimestampMixin, Base):
             name="price_matches_currency",
         ),
         CheckConstraint("cardinality(allowed_methods) > 0", name="methods_not_empty"),
+        CheckConstraint(f"free_trial_calls BETWEEN 0 AND {TRIAL_MAX_CALLS}", name="free_trial_calls_range"),
+        CheckConstraint(f"trial_daily_cap BETWEEN 1 AND {TRIAL_DAILY_CAP_MAX}", name="trial_daily_cap_range"),
     )
 
 
@@ -336,4 +351,195 @@ class PrepaidDebit(Base):
         CheckConstraint("body_hash ~ '^[0-9a-f]{64}$'", name="body_hash_hex64"),
         CheckConstraint("status IN ('debited', 'refunded')", name="status_known"),
         CheckConstraint("(status = 'refunded') = (refunded_at IS NOT NULL)", name="refunded_at_iff_refunded"),
+    )
+
+
+# ---------------------------------------------------------------- free trial calls (CONTRACT v2.12)
+
+TRIAL_CALL_USED = "used"
+TRIAL_CALL_REFUNDED = "refunded"
+
+
+class TrialUsage(TimestampMixin, Base):
+    """How many free trial calls one buyer key has used on one endpoint. `calls_used` never exceeds the endpoint's
+    `free_trial_calls` at the moment of each call (conditional UPDATE under the row lock)."""
+
+    __tablename__ = "trial_usages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("endpoints.id", ondelete="CASCADE"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="CASCADE"), nullable=False
+    )
+    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    payer_public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    calls_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index("ix_trial_usages_endpoint_id_payer_public_key", "endpoint_id", "payer_public_key", unique=True),
+        Index("ix_trial_usages_merchant_id", "merchant_id"),
+        CheckConstraint("calls_used >= 0", name="calls_used_not_negative"),
+        CheckConstraint("payer_public_key ~ '^[0-9a-f]{64}$'", name="payer_public_key_hex64"),
+    )
+
+
+class TrialDailyCount(Base):
+    """Trial calls one endpoint served on one UTC day (the anti-abuse daily cap)."""
+
+    __tablename__ = "trial_daily_counts"
+
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("endpoints.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (CheckConstraint("calls >= 0", name="calls_not_negative"),)
+
+
+class TrialCall(Base):
+    """One free trial call: signed by the buyer key over a single-use nonce. No settlement, no fee."""
+
+    __tablename__ = "trial_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    usage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("trial_usages.id", ondelete="CASCADE"), nullable=False
+    )
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("endpoints.id", ondelete="CASCADE"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="CASCADE"), nullable=False
+    )
+    nonce: Mapped[str] = mapped_column(String(32), nullable=False)
+    payer_address: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default=TRIAL_CALL_USED, server_default=TRIAL_CALL_USED
+    )
+    request_method: Mapped[str] = mapped_column(String(10), nullable=False)
+    request_path: Mapped[str] = mapped_column(Text, nullable=False)
+    body_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upstream_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_trial_calls_nonce", "nonce", unique=True),
+        Index("ix_trial_calls_usage_id", "usage_id"),
+        Index("ix_trial_calls_endpoint_created", "endpoint_id", "created_at"),
+        Index("ix_trial_calls_merchant_created", "merchant_id", "created_at"),
+        CheckConstraint("nonce ~ '^[0-9a-f]{32}$'", name="nonce_hex32"),
+        CheckConstraint("body_hash ~ '^[0-9a-f]{64}$'", name="body_hash_hex64"),
+        CheckConstraint("status IN ('used', 'refunded')", name="status_known"),
+        CheckConstraint("(status = 'refunded') = (refunded_at IS NOT NULL)", name="refunded_at_iff_refunded"),
+    )
+
+
+# ---------------------------------------------------------------- merchant webhooks (CONTRACT v2.12)
+
+WEBHOOK_DELIVERY_PENDING = "pending"
+WEBHOOK_DELIVERY_DELIVERING = "delivering"
+WEBHOOK_DELIVERY_SUCCEEDED = "succeeded"
+WEBHOOK_DELIVERY_DEAD = "dead"
+WEBHOOK_EVENT_TYPES: tuple[str, ...] = (
+    "payment.settled",
+    "prepaid.deposit",
+    "prepaid.debit",
+    "trial.used",
+    "endpoint.created",
+    "endpoint.updated",
+)
+WEBHOOK_TEST_EVENT = "webhook.test"
+WEBHOOK_EVENT_TYPES_SQL = ", ".join(f"'{name}'" for name in (*WEBHOOK_EVENT_TYPES, WEBHOOK_TEST_EVENT))
+
+
+class Webhook(TimestampMixin, Base):
+    """A merchant's HTTPS webhook. The HMAC secret is stored Fernet-encrypted and is never returned after creation."""
+
+    __tablename__ = "webhooks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="CASCADE"), nullable=False
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    event_types: Mapped[list[str]] = mapped_column(ARRAY(String(40)), nullable=False)
+    secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    secret_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+
+    __table_args__ = (
+        Index("ix_webhooks_merchant_id", "merchant_id"),
+        CheckConstraint("cardinality(event_types) > 0", name="event_types_not_empty"),
+        CheckConstraint("url LIKE 'https://%'", name="url_https"),
+    )
+
+
+class WebhookEvent(Base):
+    """One merchant event in the outbox. `event_id` is the idempotency key receivers dedupe on."""
+
+    __tablename__ = "webhook_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="CASCADE"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_webhook_events_event_id", "event_id", unique=True),
+        Index("ix_webhook_events_merchant_created", "merchant_id", "created_at"),
+        CheckConstraint("event_id ~ '^evt_[0-9a-f]{32}$'", name="event_id_format"),
+        CheckConstraint(f"event_type IN ({WEBHOOK_EVENT_TYPES_SQL})", name="event_type_known"),
+    )
+
+
+class WebhookDelivery(Base):
+    """One (event, webhook) delivery with its retry state: pending -> delivering -> succeeded | pending | dead."""
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_pk: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("webhook_events.id", ondelete="CASCADE"), nullable=False
+    )
+    webhook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("webhooks.id", ondelete="CASCADE"), nullable=False
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(12), nullable=False, default=WEBHOOK_DELIVERY_PENDING, server_default=WEBHOOK_DELIVERY_PENDING
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_webhook_deliveries_event_pk_webhook_id", "event_pk", "webhook_id", unique=True),
+        Index("ix_webhook_deliveries_webhook_created", "webhook_id", "created_at"),
+        Index("ix_webhook_deliveries_merchant_created", "merchant_id", "created_at"),
+        Index(
+            "ix_webhook_deliveries_due",
+            "next_attempt_at",
+            postgresql_where="status IN ('pending', 'delivering')",
+        ),
+        CheckConstraint("status IN ('pending', 'delivering', 'succeeded', 'dead')", name="status_known"),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        CheckConstraint("(status = 'succeeded') = (delivered_at IS NOT NULL)", name="delivered_at_iff_succeeded"),
     )
