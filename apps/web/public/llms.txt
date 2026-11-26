@@ -38,6 +38,12 @@ the treasury receives the 0.2 KAS floor. Funds never pass through KasGate custod
 Deposit once (an ordinary payment of at least 0.6 KAS, same split), then pay calls with signed debits:
 POST /v1/prepaid/deposits/quote, POST /v1/prepaid/deposits, then per call POST /v1/prepaid/challenge and
 X-KasGate-Prepaid: Base64(JSON{nonce, signature}). Balance: GET /v1/prepaid/balance?slug=&payer_address=.
+Unsigned, it returns only balance_sompi, spendable_sompi, expires_at and updated_at; deposited_sompi,
+debited_sompi, refunded_sompi, expired_sompi and refund_hold_sompi are null. To read them, sign (depositing
+key, kaspa sign_message / KasWare signMessage schnorr) the text
+"KasGate\nDomain: <gateway host>\nPurpose: kasgate:v1:prepaid-balance-read\nAddress: <payer_address>\nSlug: <slug>\nTimestamp: <unix seconds>"
+and send X-KasGate-Balance-Timestamp and X-KasGate-Balance-Signature (128 hex); the timestamp must be within
+300 s, otherwise 401 invalid_balance_signature. The signature authorises only this read.
 
 Refunds of unused credit: POST /v1/prepaid/refunds/challenge {slug, payer_address, action: "request",
 amount_sompi?} (omit the amount for all spendable credit, at least 0.2 KAS), sign the message (Purpose

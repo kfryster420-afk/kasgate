@@ -638,6 +638,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                 <th className="th">Kind</th>
                 <th className="th text-right">Amount</th>
                 <th className="th text-right">Balance after</th>
+                <th className="th text-right">USD at settlement</th>
                 <th className="th">Tx / note</th>
               </tr>
             </thead>
@@ -659,6 +660,11 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                   </td>
                   <td className="td">
                     <KasAmount sompi={entry.balance_after_sompi} />
+                  </td>
+                  <td className="td text-right" data-ledger-usd>
+                    <span className="text-xs text-zinc-500" title="The gateway records no KAS/USD rate for refund payouts and expiries (PrepaidLedgerEntryRead has no USD fields); the deposits these credits came from carry their USD value in Settlements.">
+                      not recorded
+                    </span>
                   </td>
                   <td className="td">
                     {entry.tx_id ? txLink(entry.tx_id) : null}
