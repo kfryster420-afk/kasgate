@@ -33,6 +33,31 @@ Every payment is a single non-custodial Kaspa transaction:
 The minimum endpoint price is 0.6 KAS (60,000,000 sompi). At that price the merchant receives 0.4 KAS and
 the treasury receives the 0.2 KAS floor. Funds never pass through KasGate custody.
 
+## Prepaid credit (kasgate-prepaid-v1)
+
+Deposit once (an ordinary payment of at least 0.6 KAS, same split), then pay calls with signed debits:
+POST /v1/prepaid/deposits/quote, POST /v1/prepaid/deposits, then per call POST /v1/prepaid/challenge and
+X-KasGate-Prepaid: Base64(JSON{nonce, signature}). Balance: GET /v1/prepaid/balance?slug=&payer_address=.
+
+## Free trial calls (kasgate-trial-v1)
+
+Some endpoints give each buyer key a few free calls. Their 402 carries X-KasGate-Trial-Offer and the catalog
+lists kasgate-trial-v1. On the gateway host:
+
+- POST /v1/trials/challenge {slug, payer_address, method, path, body_hash} (P2PK address). Sign the returned
+  message (Purpose kasgate:v1:trial-call, no amount) with that key and send X-KasGate-Trial:
+  Base64(JSON{nonce, signature}) on the call. The response carries X-KasGate-Trial-Remaining and
+  X-KasGate-Trial-Receipt.
+- When the trial is used up the gateway answers 402 trial_exhausted with its normal PAYMENT-REQUIRED: pay it.
+  Trial calls move no coins and carry no fee; an upstream 5xx or no response gives the trial call back.
+- Remaining calls: GET /v1/trials/status?slug=&payer_address=.
+
+## Merchant webhooks
+
+Merchants can register HTTPS webhooks for payment.settled, prepaid.deposit, prepaid.debit, trial.used,
+endpoint.created and endpoint.updated. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
+HMAC-SHA256(secret, "<t>.<raw body>")>; reject timestamps older than 5 minutes and dedupe on X-KasGate-Event-Id.
+
 ## Catalog
 
 A public machine-readable catalog of endpoints the merchant marked listed (active merchants only), on the
@@ -63,5 +88,11 @@ MCP server (kasgate-mcp, stdio): search_catalog, inspect_endpoint, get_budget, c
 original list_directory, quote_endpoint, and call_paid_endpoint tools. call_with_budget reserves the quoted
 price before signing, enforces a per-call maximum and a session spend cap (sompi), releases the reservation
 on failure, and never logs buyer keys. get_budget reports spent, reserved, and remaining sompi.
+
+Prepaid: KasGateClient.prepaid_deposit, prepaid_request and prepaid_balance; MCP prepaid_deposit,
+call_prepaid_endpoint and prepaid_balance. Free trials: KasGateClient.request uses an offered trial before
+paying (use_free_trials=True), plus trial_request and trial_status; MCP call_free_trial and trial_status, and
+the paying tools try a trial first. Webhook receivers can verify signatures with
+kasgate_client.verify_webhook_signature.
 
 Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kfryster420-afk/kasgate).

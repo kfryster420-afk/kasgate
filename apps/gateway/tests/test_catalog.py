@@ -227,6 +227,11 @@ async def test_llms_txt_describes_agent_payment_and_leaks_no_secrets(
         "/v1/prepaid/challenge",
         "X-KasGate-Prepaid",
         "call_prepaid_endpoint",
+        "kasgate-trial-v1",
+        "/v1/trials/challenge",
+        "X-KasGate-Trial",
+        "trial_exhausted",
+        "verify_webhook_signature",
     ):
         assert needle in body
     _assert_no_secrets(body)

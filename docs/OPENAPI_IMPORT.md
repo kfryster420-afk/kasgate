@@ -22,6 +22,7 @@ default_price_usd_micros: UsdMicros | null  required for USD imports (1 USD = 1_
 upstream_headers:    dict[str,str]   default {}; same validate_upstream_headers + Fernet encryption as POST /v1/endpoints, stored on every created endpoint
 category:            str | null      <= 60; when null each endpoint gets its operation's first tag (truncated to 60)
 is_public_listed:    bool            default true
+free_trial_calls:    int             CONTRACT v2.12: free trial calls per buyer key on every created endpoint, strict int 0..100, default 0
 selections:          list[OpenApiImportSelection] | null   1..500; required for create, forbidden for preview; unique (method, path)
 OpenApiImportSelection: {method: GET|POST|PUT|PATCH|DELETE (case-insensitive), path: str 1..512 exactly as in the document,
                          price_sompi: Sompi | null  (KAS override; same fee-split check; omit in a USD import),

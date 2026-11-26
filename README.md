@@ -41,6 +41,12 @@ A buyer can deposit once and then pay many calls without a transaction each (CON
 
 Merchants can mark an endpoint **prepaid only** and price it below the 0.6 KAS on-chain minimum (down to 1 sompi); its 402 then offers only the prepaid terms. Every other endpoint accepts both per-call payments and prepaid debits. KasGate still holds no coins: the deposit already paid the merchant on-chain, and unused credit is something the merchant owes in calls (there is no withdrawal, and no expiry or refund tooling yet). The buyer SDK (`prepaid_deposit`, `prepaid_request`, `prepaid_balance`) and the MCP server (`prepaid_deposit`, `call_prepaid_endpoint`, `prepaid_balance`) support it, and the dashboard shows balances, deposits and debits.
 
+### Free trial calls and merchant webhooks
+
+Merchants can give each buyer wallet a few free calls per endpoint (CONTRACT v2.12, scheme `kasgate-trial-v1`, 0 to 100 calls, plus a daily cap across all buyers). The buyer proves the wallet with a signed, single-use challenge bound to the exact request; the counters are enforced atomically in Postgres, so concurrent calls can never exceed the trial. Trial calls move no coins and carry no fee. Once the trial is used up the gateway answers with its normal 402 and the call is paid as usual. The buyer SDK and the MCP paying tools use an offered trial automatically before paying.
+
+Merchants can also register HTTPS webhooks for `payment.settled`, `prepaid.deposit`, `prepaid.debit`, `trial.used`, `endpoint.created` and `endpoint.updated`. Deliveries are HMAC-SHA256 signed with a per-webhook secret (shown once, stored encrypted) and a timestamp for replay protection, written to a durable outbox in the same transaction as the payment, retried with exponential backoff, dead-lettered after 8 attempts and redeliverable from the dashboard. Webhook targets go through the same SSRF guard as upstream APIs, and a failing webhook can never slow down or fail a payment.
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:

@@ -137,6 +137,18 @@ Merchant: create one endpoint with **Prepaid only** on and a price below the min
 - If you can make the upstream fail (5xx or offline), make one prepaid call. Expected: the receipt says `refunded` and the balance is back where it was.
 - Merchant: the dashboard "Prepaid credit" panel shows the buyer's balance, the deposit (with credit and fee) and each debit.
 
+### 11. Free trial calls (`kasgate-trial-v1`) and webhooks
+
+Merchant: edit an endpoint and set **Free trial calls per buyer** to 2 (leave the daily cap at 100). Add a webhook in the dashboard **Webhooks** panel pointing at an HTTPS request inspector you control (for example a webhook.site URL), subscribed to `payment.settled` and `trial.used`, and copy the signing secret it shows once. Buyer: use the buyer SDK (`KasGateClient.get`, which uses trials automatically, or `trial_request` / `trial_status`) or the MCP tools (`trial_status`, `call_free_trial`, `call_with_budget`).
+
+- Call the endpoint without paying. Expected: the normal **402** with `PAYMENT-REQUIRED` plus an `X-KasGate-Trial-Offer` header (`freeTrialCalls: 2`); the catalog item lists `kasgate-trial-v1` and `free_trial_calls: 2`.
+- Make two calls with the SDK. Expected: both succeed with `X-KasGate-Trial-Remaining` 1 then 0 and an `X-KasGate-Trial-Receipt` with `status` `used`; **no** transaction on the explorer and no fee. The merchant's **Free trial calls** panel lists both.
+- Make a third call. Expected: the SDK gets **402** `trial_exhausted` (with a fresh `PAYMENT-REQUIRED`) and then pays normally: output 0 merchant, output 1 treasury, fee `max(1.5%, 0.2 KAS)` exactly as in scenario 7.
+- Sign a trial challenge, then change the path, query or body (or sign with a different wallet). Expected: **402** `invalid_payment_header`, and the trial count is unchanged. Re-send a used `X-KasGate-Trial` header. Expected: **409** `payment_replayed`.
+- Webhooks: within a few seconds the inspector receives `trial.used` (two) and `payment.settled` (one) POSTs. Check `X-KasGate-Signature` with `kasgate_client.verify_webhook_signature(secret, header, raw_body)` (or the Node snippet in the dashboard): it must be `True` for the raw body and `False` if you change one byte. Every retry of an event carries the same `X-KasGate-Event-Id`.
+- Click **Send test**. Expected: a `webhook.test` delivery shows `succeeded` in the delivery log. Point the webhook at a URL that answers 500 (or turn the inspector off), send a test, and check that the log shows `pending` with a growing next-attempt time; **Redeliver** puts it back in the queue.
+- Try to add a webhook for `http://…`, `https://localhost/…` or `https://169.254.169.254/`. Expected: refused before saving.
+
 ## When you are done
 
 File one bug report per distinct failure, using the [bug report form](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.
