@@ -12,7 +12,7 @@ import {
 } from "./kasware";
 import { KASPA_NETWORK } from "./config";
 import { formatKas, formatSompi } from "./sompi";
-import { PREPAID_REFUND_CLAIM_TTL_SECONDS, PREPAID_REFUND_PAYLOAD_PREFIX, type PrepaidRefundRead } from "./types";
+import { CLAIM_BROADCAST_MARGIN_SECONDS, PREPAID_REFUND_PAYLOAD_PREFIX, type PrepaidRefundRead } from "./types";
 
 /** How long the dashboard waits for the KasWare approval dialog before telling the merchant what to check. */
 export const SEND_TIMEOUT_MS = 180_000;
@@ -74,16 +74,27 @@ export function payoutPayloadText(refund: PrepaidRefundRead): string | null {
   return refund.payout_payload === expected && hex === refund.payout_payload_hex.toLowerCase() ? expected : null;
 }
 
-/** When a `paying` claim lapses (the buyer may cancel again after it), or null when the refund isn't claimed. */
+/** The gateway's `claim_expires_at` (only while `paying`) in ms, or null when the refund isn't claimed. */
 export function claimExpiresAt(refund: PrepaidRefundRead): number | null {
-  if (refund.status !== "paying" || !refund.claimed_at) return null;
-  const at = Date.parse(refund.claimed_at);
-  return Number.isNaN(at) ? null : at + PREPAID_REFUND_CLAIM_TTL_SECONDS * 1000;
+  if (refund.status !== "paying" || !refund.claim_expires_at) return null;
+  const at = Date.parse(refund.claim_expires_at);
+  return Number.isNaN(at) ? null : at;
+}
+
+/** Whole minutes (rounded down, at least 0) until `at`. */
+export function minutesLeft(at: number, now: number): number {
+  return Math.max(0, Math.floor((at - now) / 60_000));
+}
+
+/** True when a claim ending at `at` leaves enough time to broadcast safely. */
+export function claimLeavesTime(at: number | null, now: number): boolean {
+  return at !== null && at - now >= CLAIM_BROADCAST_MARGIN_SECONDS * 1000;
 }
 
 export type PayoutOutcome =
   | { kind: "sent"; txId: string; transaction: string | null; refund: PrepaidRefundRead }
   | { kind: "sent_no_txid"; refund: PrepaidRefundRead }
+  | { kind: "claim_too_short"; message: string; refund: PrepaidRefundRead }
   | { kind: "error"; message: string; refund?: PrepaidRefundRead };
 
 /** The signed transaction JSON KasWare returned, when it is one (an object with an `id`); null otherwise. */
@@ -102,8 +113,10 @@ export function signedTransactionText(result: unknown): string | null {
  * Builds the payout in the merchant's own KasWare wallet: `sendKaspa(payout_address, amount_sompi, {payload})`. KasWare
  * selects the merchant's UTXOs, shows its approval dialog, signs and broadcasts. The dashboard never sees a key.
  *
- * Right before broadcasting it calls `claim` (POST /claim: `requested`/`paying` -> `paying`, renewing the 15-minute
- * claim) so the buyer cannot cancel while the payment is in flight; a refund that can no longer be claimed is never paid.
+ * Right before broadcasting it calls `claim` (POST /claim: `requested`/`paying` -> `paying`, renewing the claim) so the
+ * buyer cannot cancel while the payment is in flight. It broadcasts only when the returned `claim_expires_at` is at least
+ * CLAIM_BROADCAST_MARGIN_SECONDS away; renewals stop 1 h after the first claim, so near the end it refuses and points
+ * to the signed-transaction mode (recorded before broadcast, no claim needed). An unclaimable refund is never paid.
  */
 export async function sendRefundPayout(
   refund: PrepaidRefundRead,
@@ -157,6 +170,15 @@ export async function sendRefundPayout(
   if (claimed.status !== "paying" || claimed.amount_sompi !== refund.amount_sompi || claimed.payout_address !== refund.payout_address) {
     return { kind: "error", message: "The refund changed while claiming it. Nothing was sent. Reload and check it again.", refund: claimed };
   }
+  const expires = claimExpiresAt(claimed);
+  if (!claimLeavesTime(expires, Date.now())) {
+    const left = expires === null ? 0 : minutesLeft(expires, Date.now());
+    return {
+      kind: "claim_too_short",
+      refund: claimed,
+      message: `Not sent: the claim only has ${left} min left and can't be renewed further (renewals stop 1 hour after the first claim). Paying now could land after the buyer may cancel. Post a signed transaction instead (KasGate records it before broadcasting, no claim needed), or reject the refund.`,
+    };
+  }
 
   let result: string;
   try {
@@ -167,7 +189,7 @@ export async function sendRefundPayout(
     );
   } catch (e) {
     if (e instanceof WalletTimeoutError) return { kind: "error", message: e.message, refund: claimed };
-    if (isWalletRejection(e)) return { kind: "error", message: "You rejected the payment in KasWare. Nothing was sent. The claim lapses on its own after 15 minutes.", refund: claimed };
+    if (isWalletRejection(e)) return { kind: "error", message: "You rejected the payment in KasWare. Nothing was sent. The claim lapses on its own when it expires.", refund: claimed };
     return { kind: "error", message: `KasWare could not send the payout: ${walletErrorText(e)}. Nothing was recorded.`, refund: claimed };
   }
   const txId = txIdFromSendResult(result);

@@ -62,6 +62,8 @@ export const X402_ERROR_CODES = [
   "refund_closed",
   "invalid_payout",
   "payout_replayed",
+  "payout_abandoned",
+  "too_many_attempts",
 ] as const;
 export type X402ErrorCode = (typeof X402_ERROR_CODES)[number];
 
@@ -217,8 +219,11 @@ export const PREPAID_REFUND_REASON_MAX_LENGTH = 300;
 export const PREPAID_REFUND_STATUSES = ["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"] as const;
 export type PrepaidRefundStatus = (typeof PREPAID_REFUND_STATUSES)[number];
 export type PrepaidRefundAction = "request" | "cancel" | "status";
-/** config.prepaid_refund_claim_ttl_seconds default: a merchant claim (`paying`) lapses after this without a payout. */
-export const PREPAID_REFUND_CLAIM_TTL_SECONDS = 900;
+/**
+ * The dashboard broadcasts a tx_id-mode payout only when the merchant's claim has at least this long left (the KasWare
+ * dialog may stay open up to SEND_TIMEOUT_MS, 3 min, plus network time), so the payout lands well before the claim lapses.
+ */
+export const CLAIM_BROADCAST_MARGIN_SECONDS = 300;
 export const PREPAID_REFUND_PAYOUT_STATUSES = ["pending", "confirmed", "invalid", "duplicate", "abandoned"] as const;
 export type PrepaidRefundPayoutStatus = (typeof PREPAID_REFUND_PAYOUT_STATUSES)[number];
 
@@ -271,8 +276,14 @@ export interface PrepaidRefundRead {
   last_error: string | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
-  /** When the merchant claimed it (`paying`); the claim lapses PREPAID_REFUND_CLAIM_TTL_SECONDS later without a payout. */
+  /** When the merchant last claimed it (`paying`). Null in the public view (the signed status shows it). */
   claimed_at: IsoDateTime | null;
+  /** The first claim; renewals stop at it + PREPAID_REFUND_CLAIM_MAX_SECONDS (3600 by default). Null in the public view. */
+  first_claimed_at: IsoDateTime | null;
+  /** A cancelled refund the merchant had claimed: its amount stays held (not spendable) until then (cooldown). */
+  hold_until: IsoDateTime | null;
+  /** computed_field, only while `paying`: min(claimed_at + claim TTL, first_claimed_at + claim maximum). */
+  claim_expires_at: IsoDateTime | null;
   payout_submitted_at: IsoDateTime | null;
   paid_at: IsoDateTime | null;
   resolved_at: IsoDateTime | null;
@@ -293,7 +304,8 @@ export interface PrepaidRefundPayoutRead {
   id: Uuid;
   refund_id: Uuid;
   tx_id: string;
-  method: "tx_id" | "transaction";
+  /** `scan`: found on-chain by the gateway when the buyer tried to cancel a claimed refund. */
+  method: "tx_id" | "transaction" | "scan";
   status: PrepaidRefundPayoutStatus;
   payload_verified: boolean;
   check_count: number;
@@ -730,6 +742,8 @@ export interface ApiErrorBody {
   code?: string;
   /** POST /api/endpoints/import only: per-selection errors keyed by the selection's index in the request. */
   row_errors?: Record<string, string>;
+  /** Seconds to wait before retrying, when the gateway sent `Retry-After` (e.g. 429 on refund payouts). */
+  retry_after?: number;
 }
 
 /* ------------------------------------------------------------------ free trial calls (CONTRACT v2.12) */

@@ -23,19 +23,19 @@ export const REFUND_STATUS_LABEL: Record<PrepaidRefundStatus, string> = {
 export const REFUND_STATUS_HELP: Record<"merchant" | "buyer", Record<PrepaidRefundStatus, string>> = {
   merchant: {
     requested: "Waiting for you: pay it from your wallet, or reject it with a reason.",
-    paying: "You claimed it for payment, so the buyer can't cancel. The claim lapses after 15 minutes without a payout.",
+    paying: "You claimed it for payment, so the buyer can't cancel. The claim lapses after 15 minutes without a payout; renewals stop 1 hour after the first claim.",
     payout_submitted: "Payout recorded but not confirmed on-chain yet. KasGate re-checks it automatically.",
     paid: "Payout confirmed on-chain. The buyer's balance was debited.",
     rejected: "You declined it. The held credit went back to the buyer's spendable balance.",
-    cancelled: "The buyer withdrew it. The held credit is spendable again.",
+    cancelled: "The buyer withdrew it. The held credit is spendable again, after the cooldown shown below if you had claimed it.",
   },
   buyer: {
-    requested: "Waiting for the merchant to pay it. The amount is held and can't be spent while it's open.",
+    requested: "Waiting for the merchant to pay it. The amount is held and can't be spent while it's open. Sign the status to see whether the merchant is paying it right now.",
     paying: "The merchant is paying it now, so it can't be withdrawn for the moment.",
     payout_submitted: "The merchant has sent the payout. It completes once the network confirms it.",
     paid: "Paid back on-chain to your address.",
     rejected: "The merchant declined it. The held credit is spendable again.",
-    cancelled: "You withdrew it. The held credit is spendable again.",
+    cancelled: "You withdrew it. The held credit is spendable again, after the cooldown shown below if the merchant had started paying it.",
   },
 };
 
