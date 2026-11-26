@@ -38,6 +38,11 @@ from app.schemas import (
     HEADER_PAYMENT_SIGNATURE,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
+    HEADER_TRIAL_CALL,
+    HEADER_TRIAL_LIMIT,
+    HEADER_TRIAL_OFFER,
+    HEADER_TRIAL_RECEIPT,
+    HEADER_TRIAL_REMAINING,
     NONCE_RE,
     REGISTER_PURPOSE,
     build_auth_challenge,
@@ -74,6 +79,11 @@ PAYMENT_HEADERS: frozenset[str] = frozenset(
         HEADER_K402_PAYMENT.lower(),
         HEADER_PREPAID_DEBIT.lower(),
         HEADER_PREPAID_RECEIPT.lower(),
+        HEADER_TRIAL_OFFER.lower(),
+        HEADER_TRIAL_CALL.lower(),
+        HEADER_TRIAL_RECEIPT.lower(),
+        HEADER_TRIAL_LIMIT.lower(),
+        HEADER_TRIAL_REMAINING.lower(),
     }
 )
 FORBIDDEN_UPSTREAM_HEADER_NAMES: frozenset[str] = (
@@ -409,6 +419,22 @@ class GuardedTransport(httpx.AsyncHTTPTransport):
         )
 
 
+WEBHOOK_MAX_CONNECTIONS = 50
+
+
+def build_webhook_client(timeout_seconds: float) -> httpx.AsyncClient:
+    """Outbound client for merchant webhooks: the same SSRF guard as upstream calls (every resolved address must be
+    public and the socket goes to the validated IP), no redirects, no proxy settings from the environment."""
+    return httpx.AsyncClient(
+        transport=GuardedTransport(
+            limits=httpx.Limits(max_connections=WEBHOOK_MAX_CONNECTIONS, max_keepalive_connections=10)
+        ),
+        timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0)),
+        follow_redirects=False,
+        trust_env=False,
+    )
+
+
 def build_upstream_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=GuardedTransport(),
@@ -564,6 +590,8 @@ RATE_LIMIT_CREATE_MERCHANT = RateLimit("merchants", "rl_merchant_create_per_hour
 RATE_LIMIT_AUTH_CHALLENGE = RateLimit("auth_challenge", "rl_auth_challenge_per_minute", 60)
 RATE_LIMIT_AUTH_VERIFY = RateLimit("auth_verify", "rl_auth_verify_per_minute", 60)
 RATE_LIMIT_UNPAID_PROXY = RateLimit("proxy_unpaid", "rl_unpaid_proxy_per_minute", 60)
+# CONTRACT v2.12: free trial calls actually served, per client IP (anti-abuse on top of the per-endpoint daily cap).
+RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hour", 3600)
 
 
 def client_ip(request: Request) -> str:

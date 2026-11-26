@@ -80,6 +80,7 @@ from app.schemas import (
     new_payment_nonce,
 )
 from app.security import RATE_LIMIT_UNPAID_PROXY, get_current_merchant, limit_by_ip
+from app.webhooks import enqueue_event
 
 logger = logging.getLogger("kasgate.prepaid")
 
@@ -417,6 +418,24 @@ async def deposit(
             created_at=datetime.now(UTC),
         )
         session.add(record)
+        await session.flush()
+        await enqueue_event(
+            session,
+            merchant_id=endpoint.merchant_id,
+            event_type="prepaid.deposit",
+            data={
+                "deposit_id": str(record.id),
+                "settlement_id": str(settlement.id),
+                "tx_id": verified.tx_id,
+                "endpoint_slug": endpoint.slug,
+                "payer_address": signature.payerAddress,
+                "deposit_sompi": str(verified.total_sompi),
+                "fee_sompi": str(verified.fee_sompi),
+                "credit_sompi": str(credit),
+                "balance_sompi": str(int(balance)),
+            },
+            source_id=str(record.id),
+        )
         await session.commit()
     except IntegrityError:
         await session.rollback()

@@ -57,7 +57,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Final, cast
 from urllib.parse import quote
@@ -70,6 +70,7 @@ from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -88,6 +89,8 @@ from app.exact_v2 import ExactV2Verification, check_authorization_expiry
 from app.models import (
     PREPAID_DEBIT_DEBITED,
     PREPAID_DEBIT_REFUNDED,
+    TRIAL_CALL_REFUNDED,
+    TRIAL_CALL_USED,
     Endpoint,
     Merchant,
     PrepaidBalance,
@@ -95,6 +98,9 @@ from app.models import (
     PriceCurrency,
     Settlement,
     SettlementStatus,
+    TrialCall,
+    TrialDailyCount,
+    TrialUsage,
 )
 from app.oracle import OracleUnavailableError, usd_value
 from app.payments import PaymentVerificationError, RpcUnavailableError
@@ -105,6 +111,11 @@ from app.schemas import (
     HEADER_PAYMENT_SIGNATURE,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
+    HEADER_TRIAL_CALL,
+    HEADER_TRIAL_LIMIT,
+    HEADER_TRIAL_OFFER,
+    HEADER_TRIAL_RECEIPT,
+    HEADER_TRIAL_REMAINING,
     K402_VERSION,
     NONCE_RE,
     PREPAID_EMPTY_BODY_HASH,
@@ -120,8 +131,12 @@ from app.schemas import (
     PrepaidDebitHeader,
     PrepaidOffer,
     PrepaidReceipt,
+    TrialCallHeader,
+    TrialOffer,
+    TrialReceipt,
     X402ErrorBody,
     build_prepaid_debit_message,
+    build_trial_call_message,
     min_price_sompi,
     new_k402_payment_id,
     new_k402_tag,
@@ -133,12 +148,14 @@ from app.schemas import (
 from app.security import (
     HOP_BY_HOP_HEADERS,
     PAYMENT_HEADERS,
+    RATE_LIMIT_TRIAL_CALLS,
     RATE_LIMIT_UNPAID_PROXY,
     auth_domain,
     client_ip,
     decrypt_headers,
     enforce_rate_limit,
 )
+from app.webhooks import enqueue_event, settlement_event_data
 from app.x402_v2 import (
     EXACT_V2_FINALITY,
     EXACT_V2_PROFILE,
@@ -1115,6 +1132,16 @@ async def _settle_and_deliver(
     unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
     session.add(settlement)
     try:
+        await session.flush()
+        # CONTRACT v2.12: the payment.settled outbox event commits with the settlement, in a savepoint that can
+        # never fail this transaction (enqueue_event swallows and logs its own errors).
+        await enqueue_event(
+            session,
+            merchant_id=endpoint.merchant_id,
+            event_type="payment.settled",
+            data=settlement_event_data(settlement, endpoint.slug),
+            source_id=str(settlement_id),
+        )
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -1159,7 +1186,8 @@ async def paywalled_proxy(
     signature_header = request.headers.get(HEADER_PAYMENT_SIGNATURE)
     k402_header = request.headers.get(HEADER_K402_PAYMENT)
     prepaid_header = request.headers.get(HEADER_PREPAID_DEBIT)
-    if not signature_header and k402_header is None and prepaid_header is None:
+    trial_header = request.headers.get(HEADER_TRIAL_CALL)
+    if not signature_header and k402_header is None and prepaid_header is None and trial_header is None:
         try:
             await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
         except HTTPException as exc:
@@ -1183,6 +1211,21 @@ async def paywalled_proxy(
             headers={"Allow": ", ".join(sorted(endpoint.allowed_methods))},
         )
 
+    # CONTRACT v2.12: a signed free trial call; never combined with any payment header.
+    if trial_header is not None:
+        if signature_header or k402_header is not None or prepaid_header is not None:
+            return await trial_payment_error(
+                request,
+                redis,
+                endpoint,
+                merchant_address,
+                oracle,
+                "invalid_payment_header",
+                f"send {HEADER_TRIAL_CALL} alone, not together with a payment header",
+            )
+        return await _pay_with_trial(
+            request, session, redis, client, oracle, endpoint, merchant_address, method, path, trial_header
+        )
     # CONTRACT v2.11: a signed prepaid debit, accepted on every endpoint; never combined with an on-chain payment.
     if prepaid_header is not None:
         if signature_header or k402_header is not None:
@@ -1207,8 +1250,15 @@ async def paywalled_proxy(
                 "invalid_payment_header",
                 "this endpoint is paid from a prepaid balance only",
             )
-        return await prepaid_only_error(
-            endpoint, merchant_address, oracle, "payment_required", "this endpoint is paid from a prepaid balance only"
+        return with_trial_offer(
+            await prepaid_only_error(
+                endpoint,
+                merchant_address,
+                oracle,
+                "payment_required",
+                "this endpoint is paid from a prepaid balance only",
+            ),
+            endpoint,
         )
 
     if k402_header is not None:
@@ -1227,15 +1277,18 @@ async def paywalled_proxy(
         )
 
     if not signature_header:
-        return await _challenge_error(
-            request,
-            redis,
+        return with_trial_offer(
+            await _challenge_error(
+                request,
+                redis,
+                endpoint,
+                merchant_address,
+                oracle,
+                "payment_required",
+                "payment is required to access this resource",
+                limited=False,
+            ),
             endpoint,
-            merchant_address,
-            oracle,
-            "payment_required",
-            "payment is required to access this resource",
-            limited=False,
         )
     exact_v2_data = _exact_v2_header_data(signature_header)
     if exact_v2_data is not None:
@@ -1997,6 +2050,24 @@ async def _debit_balance(
             created_at=datetime.now(UTC),
         )
     )
+    await session.flush()
+    await enqueue_event(
+        session,
+        merchant_id=endpoint.merchant_id,
+        event_type="prepaid.debit",
+        data={
+            "debit_id": str(debit_id),
+            "endpoint_id": str(endpoint.id),
+            "endpoint_slug": endpoint.slug,
+            "payer_address": stored.payer_address,
+            "amount_sompi": str(amount),
+            "balance_sompi": str(int(balance)),
+            "kas_usd_rate": None if stored.kas_usd_rate is None else format(stored.kas_usd_rate, "f"),
+            "request_method": request.method.upper(),
+            "request_path": stored.path,
+        },
+        source_id=str(debit_id),
+    )
     await session.commit()
     return debit_id, int(balance)
 
@@ -2193,3 +2264,451 @@ async def _release_prepaid_lock(redis: Redis, nonce: str) -> None:
         await redis.delete(prepaid_nonce_lock_key(nonce))
     except RedisError:
         logger.error("could not release prepaid lock for %s; it expires in %ss", nonce, REPLAY_LOCK_TTL_SECONDS)
+
+
+# ---------------------------------------------------------------- free trial calls (CONTRACT v2.12)
+
+TRIAL_CHALLENGE_PREFIX: Final = "kasgate:trial:challenge:"
+TRIAL_NONCE_LOCK_PREFIX: Final = "kasgate:trial:noncelock:"
+TRIAL_REFUND_DEAD_LETTER_KEY: Final = "kasgate:deadletter:trial-refunds"
+
+
+def trial_challenge_key(nonce: str) -> str:
+    return f"{TRIAL_CHALLENGE_PREFIX}{nonce}"
+
+
+def trial_nonce_lock_key(nonce: str) -> str:
+    return f"{TRIAL_NONCE_LOCK_PREFIX}{nonce}"
+
+
+def trial_offer_header(endpoint: Endpoint) -> str | None:
+    """The X-KasGate-Trial-Offer value for a 402 from `endpoint`, or None when it has no free trial calls."""
+    if endpoint.free_trial_calls <= 0:
+        return None
+    base = get_settings().public_base_url
+    return TrialOffer(
+        freeTrialCalls=endpoint.free_trial_calls,
+        challengeUrl=f"{base}/v1/trials/challenge",
+        statusUrl=f"{base}/v1/trials/status?slug={endpoint.slug}",
+    ).to_header()
+
+
+def with_trial_offer(response: Response, endpoint: Endpoint) -> Response:
+    """Advertise the endpoint's free trial on a 402 (no-op for any other status or an endpoint without trials)."""
+    if response.status_code == 402:
+        offer = trial_offer_header(endpoint)
+        if offer is not None:
+            response.headers[HEADER_TRIAL_OFFER] = offer
+    return response
+
+
+@dataclass(frozen=True)
+class StoredTrialChallenge:
+    slug: str
+    endpoint_id: uuid.UUID
+    merchant_id: uuid.UUID
+    payer_address: str
+    payer_public_key: str
+    method: str
+    path: str
+    body_hash: str
+    expires_at: datetime
+
+    def message(self, nonce: str) -> str:
+        return build_trial_call_message(
+            domain=auth_domain(),
+            address=self.payer_address,
+            merchant_id=self.merchant_id,
+            slug=self.slug,
+            method=self.method,
+            path=self.path,
+            body_hash=self.body_hash,
+            nonce=nonce,
+            expires_at=self.expires_at,
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "slug": self.slug,
+                "endpointId": str(self.endpoint_id),
+                "merchantId": str(self.merchant_id),
+                "payerAddress": self.payer_address,
+                "payerPublicKey": self.payer_public_key,
+                "method": self.method,
+                "path": self.path,
+                "bodyHash": self.body_hash,
+                "expiresAt": self.expires_at.isoformat(),
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str | bytes) -> "StoredTrialChallenge":
+        data = json.loads(raw)
+        expires_at = datetime.fromisoformat(data["expiresAt"])
+        public_key = data["payerPublicKey"]
+        if expires_at.tzinfo is None or not re.fullmatch(r"[0-9a-f]{64}", public_key):
+            raise ValueError("stored trial challenge is malformed")
+        return cls(
+            slug=str(data["slug"]),
+            endpoint_id=uuid.UUID(data["endpointId"]),
+            merchant_id=uuid.UUID(data["merchantId"]),
+            payer_address=str(data["payerAddress"]),
+            payer_public_key=public_key,
+            method=str(data["method"]),
+            path=str(data["path"]),
+            body_hash=str(data["bodyHash"]),
+            expires_at=expires_at,
+        )
+
+
+async def _load_trial_challenge(redis: Redis, nonce: str) -> StoredTrialChallenge | None:
+    raw = await redis.get(trial_challenge_key(nonce))
+    if raw is None:
+        return None
+    try:
+        return StoredTrialChallenge.from_json(raw)
+    except (ValueError, KeyError, TypeError):
+        logger.error("stored trial challenge %s is unreadable", nonce, exc_info=True)
+        return None
+
+
+def utc_today() -> date:
+    return datetime.now(UTC).date()
+
+
+async def trial_daily_calls(session: AsyncSession, endpoint_id: uuid.UUID) -> int:
+    calls = (
+        await session.execute(
+            select(TrialDailyCount.calls).where(
+                TrialDailyCount.endpoint_id == endpoint_id, TrialDailyCount.day == utc_today()
+            )
+        )
+    ).scalar_one_or_none()
+    return 0 if calls is None else int(calls)
+
+
+async def trial_calls_used(session: AsyncSession, endpoint_id: uuid.UUID, public_key: str) -> int:
+    used = (
+        await session.execute(
+            select(TrialUsage.calls_used).where(
+                TrialUsage.endpoint_id == endpoint_id, TrialUsage.payer_public_key == public_key
+            )
+        )
+    ).scalar_one_or_none()
+    return 0 if used is None else int(used)
+
+
+@dataclass(frozen=True)
+class TrialUse:
+    call_id: uuid.UUID
+    calls_used: int
+    limit: int
+
+    @property
+    def remaining(self) -> int:
+        return max(self.limit - self.calls_used, 0)
+
+
+async def _use_trial(
+    session: AsyncSession, endpoint: Endpoint, stored: StoredTrialChallenge, nonce: str, request: Request
+) -> TrialUse | None:
+    """ONE transaction: per-key count (conditional UPDATE under the row lock), the endpoint's daily cap (conditional
+    upsert), the trial_calls row (unique nonce) and the trial.used outbox event. None = per-key or daily limit
+    reached; nothing is written then. Raises IntegrityError for a used nonce, SQLAlchemyError when the store fails.
+    """
+    limit = endpoint.free_trial_calls
+    cap = endpoint.trial_daily_cap
+    if limit <= 0:
+        return None
+    await session.execute(
+        pg_insert(TrialUsage)
+        .values(
+            id=uuid.uuid4(),
+            endpoint_id=endpoint.id,
+            merchant_id=endpoint.merchant_id,
+            payer_address=stored.payer_address,
+            payer_public_key=stored.payer_public_key,
+            calls_used=0,
+        )
+        .on_conflict_do_nothing(index_elements=[TrialUsage.endpoint_id, TrialUsage.payer_public_key])
+    )
+    usage = (
+        await session.execute(
+            update(TrialUsage)
+            .where(
+                TrialUsage.endpoint_id == endpoint.id,
+                TrialUsage.payer_public_key == stored.payer_public_key,
+                TrialUsage.calls_used < limit,
+            )
+            .values(calls_used=TrialUsage.calls_used + 1, updated_at=func.now())
+            .returning(TrialUsage.id, TrialUsage.calls_used)
+        )
+    ).one_or_none()
+    if usage is None:
+        await _undo_trial(session, endpoint)
+        return None
+    usage_id, calls_used = usage
+    today_insert = pg_insert(TrialDailyCount).values(endpoint_id=endpoint.id, day=utc_today(), calls=1)
+    daily = (
+        await session.execute(
+            today_insert.on_conflict_do_update(
+                index_elements=[TrialDailyCount.endpoint_id, TrialDailyCount.day],
+                set_={"calls": TrialDailyCount.calls + 1},
+                where=TrialDailyCount.calls < cap,
+            ).returning(TrialDailyCount.calls)
+        )
+    ).scalar_one_or_none()
+    if daily is None:
+        await _undo_trial(session, endpoint)
+        return None
+    call_id = uuid.uuid4()
+    session.add(
+        TrialCall(
+            id=call_id,
+            usage_id=usage_id,
+            endpoint_id=endpoint.id,
+            merchant_id=endpoint.merchant_id,
+            nonce=nonce,
+            payer_address=stored.payer_address,
+            status=TRIAL_CALL_USED,
+            request_method=request.method.upper(),
+            request_path=stored.path,
+            body_hash=None if stored.body_hash == PREPAID_EMPTY_BODY_HASH else stored.body_hash,
+            created_at=datetime.now(UTC),
+        )
+    )
+    await session.flush()
+    await enqueue_event(
+        session,
+        merchant_id=endpoint.merchant_id,
+        event_type="trial.used",
+        data={
+            "trial_call_id": str(call_id),
+            "endpoint_id": str(endpoint.id),
+            "endpoint_slug": endpoint.slug,
+            "payer_address": stored.payer_address,
+            "calls_used": int(calls_used),
+            "free_trial_calls": limit,
+            "remaining": max(limit - int(calls_used), 0),
+            "request_method": request.method.upper(),
+            "request_path": stored.path,
+        },
+        source_id=str(call_id),
+    )
+    await session.commit()
+    return TrialUse(call_id=call_id, calls_used=int(calls_used), limit=limit)
+
+
+async def _undo_trial(session: AsyncSession, endpoint: Endpoint) -> None:
+    """Discard a partly written trial use, then reload the endpoint (a rollback expires every loaded row)."""
+    await session.rollback()
+    await session.refresh(endpoint)
+
+
+async def refund_trial_call(session: AsyncSession, redis: Redis, call_id: uuid.UUID, status_code: int | None) -> bool:
+    """Give an unanswered (no response or 5xx) trial call back to the buyer key. Only a `used` row is refunded, so a
+    refund can never run twice. The endpoint's daily counter is not refunded. Failures are dead-lettered."""
+    try:
+        usage_id = (
+            await session.execute(
+                update(TrialCall)
+                .where(TrialCall.id == call_id, TrialCall.status == TRIAL_CALL_USED)
+                .values(status=TRIAL_CALL_REFUNDED, refunded_at=func.now(), upstream_status_code=status_code)
+                .returning(TrialCall.usage_id)
+            )
+        ).scalar_one_or_none()
+        if usage_id is None:
+            await session.rollback()
+            return False
+        await session.execute(
+            update(TrialUsage)
+            .where(TrialUsage.id == usage_id, TrialUsage.calls_used > 0)
+            .values(calls_used=TrialUsage.calls_used - 1, updated_at=func.now())
+        )
+        await session.commit()
+        return True
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.error("could not refund trial call %s", call_id, exc_info=True)
+        payload = json.dumps({"trialCallId": str(call_id), "upstreamStatusCode": status_code}, sort_keys=True)
+        try:
+            await cast(Awaitable[int], redis.lpush(TRIAL_REFUND_DEAD_LETTER_KEY, payload))
+        except RedisError:
+            logger.error("dead-letter queue unavailable; unrefunded trial call: %s", payload, exc_info=True)
+        return False
+
+
+async def _record_trial_status(session: AsyncSession, call_id: uuid.UUID, status_code: int) -> None:
+    try:
+        await session.execute(update(TrialCall).where(TrialCall.id == call_id).values(upstream_status_code=status_code))
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("could not store upstream status for trial call %s", call_id)
+
+
+def _trial_state_headers(use: TrialUse, nonce: str, status: str) -> dict[str, str]:
+    remaining = use.remaining if status == TRIAL_CALL_USED else min(use.remaining + 1, use.limit)
+    return {
+        HEADER_TRIAL_LIMIT: str(use.limit),
+        HEADER_TRIAL_REMAINING: str(remaining),
+        HEADER_TRIAL_RECEIPT: TrialReceipt(
+            trialCallId=use.call_id,
+            nonce=nonce,
+            limit=use.limit,
+            remaining=remaining,
+            status="refunded" if status == TRIAL_CALL_REFUNDED else "used",
+        ).to_header(),
+    }
+
+
+async def trial_payment_error(
+    request: Request,
+    redis: Redis,
+    endpoint: Endpoint,
+    merchant_address: str,
+    oracle: RateProvider,
+    error: str,
+    message: str,
+    *,
+    remaining: int | None = None,
+) -> Response:
+    """A failed trial call answers with the endpoint's normal 402 (fresh on-chain challenge, or the prepaid offer on
+    a prepaid-only endpoint) so the buyer can pay straight away."""
+    if endpoint.prepaid_only:
+        response: Response = await prepaid_only_error(endpoint, merchant_address, oracle, error, message)
+    else:
+        response = await _challenge_error(request, redis, endpoint, merchant_address, oracle, error, message)
+    if remaining is not None:
+        response.headers[HEADER_TRIAL_REMAINING] = str(remaining)
+    return with_trial_offer(response, endpoint) if remaining is None or remaining > 0 else response
+
+
+async def _pay_with_trial(
+    request: Request,
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    oracle: RateProvider,
+    endpoint: Endpoint,
+    merchant_address: str,
+    method: str,
+    path: str,
+    header: str,
+) -> Response:
+    async def failure(error: str, message: str, remaining: int | None = None) -> Response:
+        return await trial_payment_error(
+            request, redis, endpoint, merchant_address, oracle, error, message, remaining=remaining
+        )
+
+    try:
+        trial = TrialCallHeader.from_header(header)
+    except (ValidationError, ValueError):
+        return await failure("invalid_payment_header", f"{HEADER_TRIAL_CALL} header is malformed")
+    nonce = trial.nonce
+
+    try:
+        prepared = await _prepare_upstream(request, endpoint, path)
+    except RequestRejectedError as exc:
+        return _error(exc.status_code, exc.error, exc.message)
+
+    try:
+        await enforce_rate_limit(redis, RATE_LIMIT_TRIAL_CALLS, f"ip:{client_ip(request)}")
+    except HTTPException as exc:
+        return _limit_error(exc)
+
+    try:
+        stored = await _load_trial_challenge(redis, nonce)
+    except RedisError:
+        logger.exception("trial challenge store unavailable")
+        return _error(503, "service_unavailable", "free trial calls are temporarily unavailable")
+    try:
+        used = (await session.execute(select(TrialCall.id).where(TrialCall.nonce == nonce))).first()
+    except SQLAlchemyError:
+        logger.exception("trial call lookup failed")
+        return _error(503, "service_unavailable", "trial store is temporarily unavailable")
+    if used is not None:
+        return _error(409, "payment_replayed", "this trial nonce was already used")
+    if stored is None or stored.expires_at <= datetime.now(UTC):
+        return await failure("payment_expired", "the trial challenge is unknown or has expired; request a new one")
+
+    actual_path = request_path_and_query(request)
+    actual_body_hash = prepaid_body_hash(prepared.body)
+    if (
+        stored.slug != endpoint.slug
+        or stored.endpoint_id != endpoint.id
+        or stored.merchant_id != endpoint.merchant_id
+        or stored.method != method
+        or stored.path != actual_path
+        or stored.body_hash != actual_body_hash
+    ):
+        return await failure(
+            "invalid_payment_header", "the trial challenge was issued for another endpoint, method, path or body"
+        )
+    if payer_public_key(stored.payer_address) != stored.payer_public_key or not verify_prepaid_signature(
+        stored.message(nonce), trial.signature, stored.payer_public_key
+    ):
+        return await failure("invalid_payment_header", "signature is not a signature by the payer key over this trial")
+
+    try:
+        claimed = bool(await redis.set(trial_nonce_lock_key(nonce), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
+    except RedisError:
+        logger.exception("trial replay lock unavailable")
+        return _error(503, "service_unavailable", "trial replay protection is temporarily unavailable")
+    if not claimed:
+        return _error(409, "payment_replayed", "this trial call is already being processed")
+
+    try:
+        use = await _use_trial(session, endpoint, stored, nonce, request)
+    except IntegrityError:
+        await session.rollback()
+        return _error(409, "payment_replayed", "this trial nonce was already used")
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("trial call could not be stored")
+        await _release_trial_lock(redis, nonce)
+        return _error(503, "service_unavailable", "trial store is temporarily unavailable")
+    if use is None:
+        await _release_trial_lock(redis, nonce)
+        return await failure(
+            "trial_exhausted", "no free trial calls are left for this key on this endpoint today; pay instead", 0
+        )
+    try:
+        await redis.getdel(trial_challenge_key(nonce))
+    except RedisError:
+        logger.warning("could not consume trial challenge %s; the unique nonce still blocks reuse", nonce)
+
+    try:
+        result = await _call_upstream(client, method, prepared)
+    except UpstreamFailedError as exc:
+        logger.warning("upstream failure for trial call %s: %s", use.call_id, exc)
+        refunded = await refund_trial_call(session, redis, use.call_id, None)
+        state = TRIAL_CALL_REFUNDED if refunded else TRIAL_CALL_USED
+        return _error(
+            502,
+            "upstream_error",
+            "the upstream API did not return a response"
+            + ("; the trial call was given back" if refunded else "; the trial call is pending reconciliation"),
+            headers=_trial_state_headers(use, nonce, state),
+        )
+    if result.status_code >= 500:
+        refunded = await refund_trial_call(session, redis, use.call_id, result.status_code)
+        state = TRIAL_CALL_REFUNDED if refunded else TRIAL_CALL_USED
+    else:
+        await _record_trial_status(session, use.call_id, result.status_code)
+        state = TRIAL_CALL_USED
+    response = Response(content=result.body, status_code=result.status_code)
+    for name, value in result.headers:
+        response.raw_headers.append((name.lower().encode("latin-1"), value.encode("latin-1")))
+    for name, value in _trial_state_headers(use, nonce, state).items():
+        response.headers[name] = value
+    return response
+
+
+async def _release_trial_lock(redis: Redis, nonce: str) -> None:
+    try:
+        await redis.delete(trial_nonce_lock_key(nonce))
+    except RedisError:
+        logger.error("could not release trial lock for %s; it expires in %ss", nonce, REPLAY_LOCK_TTL_SECONDS)

@@ -34,7 +34,14 @@ from app.kaspa_types import MAX_SOMPI as MAX_SOMPI
 from app.kaspa_types import SOMPI_STR_RE as SOMPI_STR_RE
 from app.kaspa_types import TX_ID_RE as TX_ID_RE
 from app.kaspa_types import Sompi, SompiStr, validate_kaspa_address, validate_tx_id
-from app.models import PriceCurrency, SettlementStatus
+from app.models import (
+    TRIAL_DAILY_CAP_DEFAULT,
+    TRIAL_DAILY_CAP_MAX,
+    TRIAL_MAX_CALLS,
+    WEBHOOK_EVENT_TYPES,
+    PriceCurrency,
+    SettlementStatus,
+)
 from app.x402_v2 import (
     EXACT_V2_MAX_ACCEPTS,
     ExactV2Requirements,
@@ -51,6 +58,12 @@ HEADER_K402_PAYMENT = "X-K402-Payment"
 # CONTRACT v2.11 prepaid credit: the signed debit on a paid call and the debit receipt on its response.
 HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
 HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
+# CONTRACT v2.12 free trial calls: the offer on a 402, the signed trial call, and the trial state on its response.
+HEADER_TRIAL_OFFER = "X-KasGate-Trial-Offer"
+HEADER_TRIAL_CALL = "X-KasGate-Trial"
+HEADER_TRIAL_RECEIPT = "X-KasGate-Trial-Receipt"
+HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit"
+HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining"
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -80,11 +93,16 @@ PREPAID_BODY_HASH_RE = r"^(?:[0-9a-f]{64}|-)$"
 PREPAID_PATH_MAX_LENGTH = 2048
 MAX_PREPAID_HEADER_CHARS = 512
 
+TRIAL_SCHEME = "kasgate-trial-v1"
+TRIAL_CALL_PURPOSE = "kasgate:v1:trial-call"
+
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 USD_MICROS_PER_DOLLAR = 1_000_000
 MAX_USD_MICROS = 1_000_000_000_000_000  # $1e9
 UsdMicros = Annotated[int, Field(gt=0, le=MAX_USD_MICROS)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
+FreeTrialCalls = Annotated[int, Field(strict=True, ge=0, le=TRIAL_MAX_CALLS)]
+TrialDailyCap = Annotated[int, Field(strict=True, ge=1, le=TRIAL_DAILY_CAP_MAX)]
 
 
 def sompi_to_kas(sompi: int) -> str:
@@ -270,6 +288,38 @@ def build_prepaid_debit_message(
         f"Path: {path}\n"
         f"Body-Hash: {body_hash}\n"
         f"Amount: {amount_sompi}\n"
+        f"Nonce: {nonce}\n"
+        f"Expires: {expires_at.isoformat()}"
+    )
+
+
+def build_trial_call_message(
+    *,
+    domain: str,
+    address: str,
+    merchant_id: uuid.UUID,
+    slug: str,
+    method: str,
+    path: str,
+    body_hash: str,
+    nonce: str,
+    expires_at: datetime,
+) -> str:
+    """The exact text a buyer signs (kaspa sign_message, the P2PK key of `address`) to use ONE free trial call.
+
+    Its Purpose differs from a prepaid debit, a payerProof and a login, so no other signature can stand in for it.
+    The gateway rebuilds it from the stored challenge and the request it is actually serving.
+    """
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {TRIAL_CALL_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Merchant: {merchant_id}\n"
+        f"Endpoint: {slug}\n"
+        f"Method: {method}\n"
+        f"Path: {path}\n"
+        f"Body-Hash: {body_hash}\n"
         f"Nonce: {nonce}\n"
         f"Expires: {expires_at.isoformat()}"
     )
@@ -754,6 +804,7 @@ class X402ErrorBody(StrictModel):
         "upstream_error",
         "invalid_exact_payment",
         "insufficient_balance",
+        "trial_exhausted",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -874,6 +925,10 @@ class EndpointCreate(StrictModel):
     is_public_listed: bool = True
     prepaid_only: bool = False
     """CONTRACT v2.11: paid only from a prepaid balance; a KAS price may then be below the 0.6 KAS on-chain minimum."""
+    free_trial_calls: FreeTrialCalls = 0
+    """CONTRACT v2.12: unpaid calls each buyer key gets on this endpoint (0 = no free trial)."""
+    trial_daily_cap: TrialDailyCap = TRIAL_DAILY_CAP_DEFAULT
+    """CONTRACT v2.12: total free trial calls this endpoint serves per UTC day, across all buyers."""
 
     @field_validator("upstream_url")
     @classmethod
@@ -915,6 +970,8 @@ class EndpointUpdate(StrictModel):
     is_active: bool | None = None
     is_public_listed: bool | None = None
     prepaid_only: bool | None = None
+    free_trial_calls: FreeTrialCalls | None = None
+    trial_daily_cap: TrialDailyCap | None = None
 
     @field_validator("upstream_url")
     @classmethod
@@ -956,6 +1013,8 @@ class EndpointRead(ReadModel):
     is_active: bool
     is_public_listed: bool
     prepaid_only: bool = False
+    free_trial_calls: int = 0
+    trial_daily_cap: int = TRIAL_DAILY_CAP_DEFAULT
     created_at: datetime
     updated_at: datetime
 
@@ -1034,6 +1093,8 @@ class OpenApiImportRequest(StrictModel):
     upstream_headers: dict[str, str] = Field(default_factory=dict, max_length=20)
     category: str | None = Field(default=None, max_length=60)
     is_public_listed: bool = True
+    free_trial_calls: FreeTrialCalls = 0
+    """CONTRACT v2.12: free trial calls per buyer key on every imported endpoint (0 = none)."""
     selections: list[OpenApiImportSelection] | None = Field(
         default=None, min_length=1, max_length=OPENAPI_MAX_OPERATIONS
     )
@@ -1272,6 +1333,8 @@ class DirectoryEntry(BaseModel):
     prepaid_only: bool = False
     """CONTRACT v2.11: payable only from a prepaid balance (kasgate-prepaid-v1); the price may be below the
     0.6 KAS on-chain minimum and the 402 carries no kaspa-exact-v1 terms."""
+    free_trial_calls: int = 0
+    """CONTRACT v2.12: free trial calls per buyer key (kasgate-trial-v1); 0 = none."""
 
 
 class DirectoryManifest(BaseModel):
@@ -1323,6 +1386,7 @@ class CatalogEndpoint(StrictModel):
     paid_url: str
     input_schema: dict[str, object] | None = None
     prepaid_only: bool = False
+    free_trial_calls: int = 0
 
 
 class CatalogPage(StrictModel):
@@ -1513,3 +1577,201 @@ class PrepaidDepositRead(ReadModel):
     @classmethod
     def _sompi(cls, v: object) -> object:
         return str(v) if isinstance(v, int) else v
+
+
+# ---------------------------------------------------------------- free trial calls (CONTRACT v2.12)
+
+
+class TrialOffer(X402Header):
+    """Body of the X-KasGate-Trial-Offer header on a 402 from an endpoint with free trial calls."""
+
+    scheme: Literal["kasgate-trial-v1"] = "kasgate-trial-v1"
+    freeTrialCalls: Annotated[int, Field(ge=1, le=TRIAL_MAX_CALLS)]
+    challengeUrl: str
+    statusUrl: str
+
+
+class TrialChallengeRequest(PrepaidChallengeRequest):
+    """Ask for the challenge of ONE free trial call: same fields and rules as a prepaid debit challenge. `path` is
+    the exact proxy path to be called incl. the query string; `body_hash` is prepaid_body_hash(body)."""
+
+
+class TrialChallenge(BaseModel):
+    nonce: str
+    message: str
+    """Sign exactly this text with the key of payer_address (kaspa sign_message) and send
+    X-KasGate-Trial: Base64(JSON{nonce, signature}) on the call."""
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    method: str
+    path: str
+    body_hash: str
+    free_trial_calls: int
+    calls_used: int
+    remaining: int
+    expires_at: datetime
+
+
+class TrialCallHeader(PrepaidDebitHeader):
+    """Body of the X-KasGate-Trial header: the nonce of a trial challenge and the buyer's signature over it."""
+
+
+class TrialReceipt(X402Header):
+    """Body of the X-KasGate-Trial-Receipt response header."""
+
+    trialCallId: uuid.UUID
+    nonce: str
+    limit: int
+    remaining: int
+    status: Literal["used", "refunded"]
+
+
+class TrialStatusRead(BaseModel):
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    free_trial_calls: int
+    calls_used: int
+    remaining: int
+    """Trial calls this key can still use here (0 while the endpoint's daily trial cap is reached)."""
+
+
+class TrialCallRead(ReadModel):
+    id: uuid.UUID
+    endpoint_id: uuid.UUID
+    payer_address: str
+    nonce: str
+    status: Literal["used", "refunded"]
+    request_method: str
+    request_path: str
+    upstream_status_code: int | None
+    created_at: datetime
+    refunded_at: datetime | None
+
+
+# ---------------------------------------------------------------- merchant webhooks (CONTRACT v2.12)
+
+WEBHOOK_URL_MAX_LENGTH = 2048
+WEBHOOK_API_VERSION = "2.12"
+WEBHOOK_SIGNATURE_HEADER = "X-KasGate-Signature"
+WEBHOOK_TIMESTAMP_HEADER = "X-KasGate-Timestamp"
+WEBHOOK_EVENT_ID_HEADER = "X-KasGate-Event-Id"
+WEBHOOK_EVENT_TYPE_HEADER = "X-KasGate-Event-Type"
+WEBHOOK_DELIVERY_ID_HEADER = "X-KasGate-Delivery-Id"
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
+WebhookEventType = Literal[
+    "payment.settled", "prepaid.deposit", "prepaid.debit", "trial.used", "endpoint.created", "endpoint.updated"
+]
+WebhookDeliveryStatus = Literal["pending", "delivering", "succeeded", "dead"]
+_LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain")
+
+
+def validate_webhook_url(value: str) -> str:
+    """HTTPS only, no credentials or fragment, and not a local name or a non-public IP literal.
+
+    Names are resolved again at delivery time by the SSRF guard (every resolved address must be public).
+    """
+    if len(value) > WEBHOOK_URL_MAX_LENGTH:
+        raise ValueError(f"url must be at most {WEBHOOK_URL_MAX_LENGTH} characters")
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        raise ValueError("url must be printable ASCII without spaces")
+    try:
+        parsed = HttpUrl(value)
+    except ValidationError as exc:
+        raise ValueError("url is not a valid URL") from exc
+    if parsed.scheme != "https":
+        raise ValueError("webhook url must use https://")
+    if parsed.username or parsed.password:
+        raise ValueError("webhook url must not contain credentials")
+    if parsed.fragment:
+        raise ValueError("webhook url must not contain a fragment")
+    host = (parsed.host or "").strip("[]").lower().rstrip(".")
+    if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(_LOCAL_HOST_SUFFIXES):
+        raise ValueError("webhook url may not target a local host")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host:
+            raise ValueError("webhook url host must be a public domain name") from None
+        return str(parsed)
+    if not ip.is_global or ip.is_multicast:
+        raise ValueError("webhook url may not target a private, loopback, link-local or reserved IP")
+    return str(parsed)
+
+
+def _event_types(value: list[str]) -> list[str]:
+    return sorted(set(value))
+
+
+class WebhookCreate(StrictModel):
+    url: str = Field(min_length=12, max_length=WEBHOOK_URL_MAX_LENGTH)
+    event_types: list[WebhookEventType] = Field(min_length=1, max_length=len(WEBHOOK_EVENT_TYPES))
+    description: str | None = Field(default=None, max_length=200)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        return validate_webhook_url(v)
+
+    @field_validator("event_types")
+    @classmethod
+    def _types(cls, v: list[str]) -> list[str]:
+        return _event_types(v)
+
+
+class WebhookUpdate(StrictModel):
+    url: str | None = Field(default=None, min_length=12, max_length=WEBHOOK_URL_MAX_LENGTH)
+    event_types: list[WebhookEventType] | None = Field(default=None, min_length=1, max_length=len(WEBHOOK_EVENT_TYPES))
+    description: str | None = Field(default=None, max_length=200)
+    is_active: bool | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str | None) -> str | None:
+        return None if v is None else validate_webhook_url(v)
+
+    @field_validator("event_types")
+    @classmethod
+    def _types(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _event_types(v)
+
+
+class WebhookRead(ReadModel):
+    id: uuid.UUID
+    url: str
+    description: str | None
+    event_types: list[str]
+    secret_prefix: str
+    """The first characters of the signing secret, so a merchant can tell secrets apart. Never the secret."""
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class WebhookCreated(BaseModel):
+    webhook: WebhookRead
+    secret: str = Field(description="HMAC-SHA256 signing secret (whsec_...). Shown once; store it now.")
+
+
+class WebhookDeliveryRead(BaseModel):
+    id: uuid.UUID
+    webhook_id: uuid.UUID
+    event_id: str
+    event_type: str
+    status: WebhookDeliveryStatus
+    attempts: int
+    next_attempt_at: datetime | None
+    last_attempt_at: datetime | None
+    last_status_code: int | None
+    last_error: str | None
+    delivered_at: datetime | None
+    created_at: datetime
+
+
+class WebhookEventTypes(BaseModel):
+    event_types: list[str]
+    api_version: str = WEBHOOK_API_VERSION
+    signature_header: str = WEBHOOK_SIGNATURE_HEADER
+    timestamp_header: str = WEBHOOK_TIMESTAMP_HEADER
+    timestamp_tolerance_seconds: int = WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS

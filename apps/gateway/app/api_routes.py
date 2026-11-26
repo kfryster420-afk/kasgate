@@ -53,6 +53,7 @@ from app.schemas import (
     PREPAID_SCHEME,
     PROXY_PATH_PREFIX,
     TAX_CSV_COLUMNS,
+    TRIAL_SCHEME,
     AuthChallenge,
     AuthChallengeRequest,
     AuthVerifyRequest,
@@ -104,6 +105,7 @@ from app.security import (
     revoke_session,
     validate_upstream_headers,
 )
+from app.webhooks import endpoint_event_data, enqueue_event
 
 logger = logging.getLogger("kasgate.api")
 
@@ -397,15 +399,25 @@ async def create_endpoint(payload: EndpointCreate, merchant: CurrentMerchant, se
             allowed_methods=list(payload.allowed_methods),
             is_public_listed=payload.is_public_listed,
             prepaid_only=payload.prepaid_only,
+            free_trial_calls=payload.free_trial_calls,
+            trial_daily_cap=payload.trial_daily_cap,
         )
         session.add(endpoint)
         try:
-            await session.commit()
+            await session.flush()
         except IntegrityError as exc:
             await session.rollback()
             if explicit_slug:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="slug is already taken") from exc
             continue
+        await enqueue_event(
+            session,
+            merchant_id=merchant.id,
+            event_type="endpoint.created",
+            data=endpoint_event_data(endpoint),
+            source_id=str(endpoint.id),
+        )
+        await session.commit()
         await session.refresh(endpoint)
         return EndpointRead.model_validate(endpoint)
     if explicit_slug:
@@ -429,7 +441,17 @@ async def read_endpoint(endpoint_id: uuid.UUID, merchant: CurrentMerchant, sessi
 
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
-    {"name", "upstream_url", "upstream_headers", "allowed_methods", "is_active", "is_public_listed", "prepaid_only"}
+    {
+        "name",
+        "upstream_url",
+        "upstream_headers",
+        "allowed_methods",
+        "is_active",
+        "is_public_listed",
+        "prepaid_only",
+        "free_trial_calls",
+        "trial_daily_cap",
+    }
 )
 _PRICE_UPDATE_FIELDS = frozenset({"price_currency", "price_sompi", "price_usd_micros"})
 
@@ -463,6 +485,7 @@ async def update_endpoint(
 ) -> EndpointRead:
     endpoint = await _owned_endpoint(session, merchant, endpoint_id)
     changes: dict[str, Any] = payload.model_dump(exclude_unset=True)
+    changed_fields = sorted(changes)
     nulled = sorted(name for name in _NON_NULLABLE_UPDATE_FIELDS if name in changes and changes[name] is None)
     if nulled:
         raise HTTPException(status_code=422, detail=f"fields cannot be null: {', '.join(nulled)}")
@@ -485,6 +508,14 @@ async def update_endpoint(
                 status_code=422,
                 detail=f"{exc}; set prepaid_only=true to price this endpoint below the on-chain minimum",
             ) from exc
+    await session.flush()
+    await enqueue_event(
+        session,
+        merchant_id=merchant.id,
+        event_type="endpoint.updated",
+        data=endpoint_event_data(endpoint, changed_fields),
+        source_id=None,
+    )
     await session.commit()
     await session.refresh(endpoint)
     return EndpointRead.model_validate(endpoint)
@@ -494,6 +525,14 @@ async def update_endpoint(
 async def delete_endpoint(endpoint_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession) -> Response:
     endpoint = await _owned_endpoint(session, merchant, endpoint_id)
     endpoint.is_active = False
+    await session.flush()
+    await enqueue_event(
+        session,
+        merchant_id=merchant.id,
+        event_type="endpoint.updated",
+        data=endpoint_event_data(endpoint, ["is_active"]),
+        source_id=None,
+    )
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -717,17 +756,27 @@ async def import_openapi(
                 price_usd_micros=amount if currency is PriceCurrency.USD else None,
                 allowed_methods=list(candidate.allowed_methods),
                 is_public_listed=candidate.is_public_listed,
+                free_trial_calls=payload.free_trial_calls,
             )
         )
     session.add_all(endpoints)
     try:
-        await session.commit()
+        await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="a proposed slug was taken while importing; nothing was created - preview again",
         ) from exc
+    for endpoint in endpoints:
+        await enqueue_event(
+            session,
+            merchant_id=merchant.id,
+            event_type="endpoint.created",
+            data=endpoint_event_data(endpoint),
+            source_id=str(endpoint.id),
+        )
+    await session.commit()
     for endpoint in endpoints:
         await session.refresh(endpoint)
     created = OpenApiImportCreated(
@@ -951,6 +1000,7 @@ async def _build_directory(session: AsyncSession) -> DirectoryManifest:
             allowed_methods=list(endpoint.allowed_methods),
             proxy_url=f"{settings.public_base_url}{PROXY_PATH_PREFIX}/{endpoint.slug}",
             prepaid_only=endpoint.prepaid_only,
+            free_trial_calls=endpoint.free_trial_calls,
         )
         for endpoint, display_name, pay_to in rows
     ]
@@ -1113,28 +1163,36 @@ def _catalog_item(endpoint: Endpoint, *, network: str, paid_url: str) -> Catalog
         price_usd_micros=endpoint.price_usd_micros,
         price_usd=None if endpoint.price_usd_micros is None else usd_micros_to_usd(endpoint.price_usd_micros),
         network=network,
-        schemes=[PREPAID_SCHEME] if endpoint.prepaid_only else [X402_SCHEME, PREPAID_SCHEME],
+        schemes=(
+            ([PREPAID_SCHEME] if endpoint.prepaid_only else [X402_SCHEME, PREPAID_SCHEME])
+            + ([TRIAL_SCHEME] if endpoint.free_trial_calls > 0 else [])
+        ),
         paid_url=paid_url,
         input_schema=_endpoint_input_schema(endpoint),
         prepaid_only=endpoint.prepaid_only,
+        free_trial_calls=endpoint.free_trial_calls,
     )
 
 
 async def _listed_catalog_rows(session: AsyncSession) -> list[tuple[Endpoint, str]]:
     """Return (endpoint, cursor) for every active, publicly listed endpoint of an active merchant."""
     rows = (
-        await session.execute(
-            select(Endpoint)
-            .join(Merchant, Merchant.id == Endpoint.merchant_id)
-            .where(
-                Endpoint.is_active.is_(True),
-                Endpoint.is_public_listed.is_(True),
-                Merchant.is_active.is_(True),
+        (
+            await session.execute(
+                select(Endpoint)
+                .join(Merchant, Merchant.id == Endpoint.merchant_id)
+                .where(
+                    Endpoint.is_active.is_(True),
+                    Endpoint.is_public_listed.is_(True),
+                    Merchant.is_active.is_(True),
+                )
+                .order_by(Endpoint.created_at, Endpoint.id)
+                .limit(CATALOG_MAX_ENTRIES)
             )
-            .order_by(Endpoint.created_at, Endpoint.id)
-            .limit(CATALOG_MAX_ENTRIES)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return [(endpoint, encode_catalog_cursor(endpoint.created_at, endpoint.id)) for endpoint in rows]
 
 
@@ -1185,9 +1243,7 @@ def _catalog_headers(etag: str) -> dict[str, str]:
     }
 
 
-def _paginate_catalog(
-    snapshot: dict[str, Any], *, limit: int, cursor: str | None, query: str
-) -> CatalogPage:
+def _paginate_catalog(snapshot: dict[str, Any], *, limit: int, cursor: str | None, query: str) -> CatalogPage:
     entries: list[dict[str, Any]] = list(snapshot["entries"])
     if query:
         needle = query.casefold()
@@ -1314,7 +1370,7 @@ def render_llms_txt() -> str:
         "\n"
         "All three headers are Base64(JSON) using the standard alphabet, padded.\n"
         "\n"
-        "- PAYMENT-REQUIRED: {x402Version: 2, scheme: \"kaspa-exact-v1\", network, asset: \"KAS\",\n"
+        '- PAYMENT-REQUIRED: {x402Version: 2, scheme: "kaspa-exact-v1", network, asset: "KAS",\n'
         "  amount (decimal sompi string), payTo, platformFee {feeTo, feeAmount}, nonce, expiresAt}.\n"
         "- PAYMENT-SIGNATURE: {txId, rawTx, payerAddress, nonce, payerProof}. The signed transaction payload\n"
         "  must be kasgate:v1:<nonce>. payerProof is a Schnorr signature over kasgate:v1:<nonce>:<txId>.\n"
@@ -1342,7 +1398,7 @@ def render_llms_txt() -> str:
         "  sign the returned message with the depositing key (Schnorr sign_message) and send X-KasGate-Prepaid:\n"
         "  Base64(JSON{nonce, signature}). The response carries X-KasGate-Prepaid-Receipt; 5xx or no upstream\n"
         "  response is refunded. Rebuild the message from your own request before signing.\n"
-        "- Endpoints marked prepaid_only (catalog schemes [\"kasgate-prepaid-v1\"]) may cost less than 0.6 KAS and\n"
+        '- Endpoints marked prepaid_only (catalog schemes ["kasgate-prepaid-v1"]) may cost less than 0.6 KAS and\n'
         "  answer 402 with only a kasgate-prepaid-v1 offer in accepts (no PAYMENT-REQUIRED header).\n"
         f"- Balance: GET {base}/v1/prepaid/balance?slug=&payer_address=.\n"
         "\n"
