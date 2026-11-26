@@ -108,14 +108,20 @@ adds or drops credit for calls already paid. There is no per-endpoint override (
   `credited_sompi`, `credit_balance_sompi` and `refundable_sompi`.
 * Response header `X-KasGate-Credit` (Base64 JSON, exposed via CORS, stripped from upstream responses so an
   upstream cannot forge it): `{creditId, kind, txId, merchantId, creditSompi, balanceSompi, reason,
-  shortfallSompi?}`, sent only when something was credited.
+  shortfallSompi?}`, sent only when something was credited. `creditId` is the ledger entry id, the same value as
+  `credit_id` on each item of signed `POST /v1/prepaid/credits/status`.
 * Buyer view: `POST /v1/prepaid/credits/challenge` `{slug, payer_address}` then signed
-  `POST /v1/prepaid/credits/status` `{nonce, signature}` (action `credits`; same challenge store, message layout,
-  Purpose, key binding, single-use consume and rate limit as refunds/status). Reply is
-  `{merchant_id, credited_sompi, credit_balance_sompi, refundable_sompi, credit_count, credits}` with the newest
-  10 credits as `{tx_id, slug, credit_sompi, shortfall_sompi, reason, created_at}`. A buyer with no credits gets
-  zeros and `credits: []`. A refunds `status` challenge cannot be replayed here, and the reverse is refused.
-  `GET` and signed `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
+  `POST /v1/prepaid/credits/status` `{nonce, signature, before?, limit?}` (action `credits`; same challenge store,
+  message layout, Purpose, key binding, single-use consume and rate limit as refunds/status). The challenge's
+  `spendable_sompi` and `refundable_sompi` are informational only. Each page needs a fresh challenge. `limit`
+  defaults to 10, max 100 (else 422). `before` is the opaque `next_cursor` from the previous page (newest first
+  by `(created_at, id)`, bound to this merchant and key). Reply is
+  `{merchant_id, credited_sompi, credit_balance_sompi, refundable_sompi, credit_count, credits, next_cursor}`
+  with a page of `{credit_id, tx_id, slug, credit_sompi, shortfall_sompi, reason, created_at}`. `credit_count` is
+  the total. `next_cursor` is null when there are no more pages. A malformed or foreign `before` is 400
+  `invalid_cursor` (no data leaked; the challenge is not burned). A buyer with no credits gets zeros,
+  `credits: []` and `next_cursor: null`. A refunds `status` challenge cannot be replayed here, and the reverse is
+  refused. `GET` and signed `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 
 ## Webhooks
 

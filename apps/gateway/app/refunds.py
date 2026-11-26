@@ -22,15 +22,18 @@ returned is never taxed). The gateway only keeps the record:
 4. ``GET /v1/prepaid/refunds/status`` is public without reasons or payout errors; ``POST /v1/prepaid/refunds/status``
    with a signed ``status`` challenge returns the full rows (a JSON array, unchanged). Failed-delivery credit is
    read with ``POST /v1/prepaid/credits/challenge`` then a signed ``POST /v1/prepaid/credits/status`` (action
-   ``credits``); a refunds ``status`` challenge cannot be used there, and the reverse is also refused.
+   ``credits``; optional ``before`` / ``limit``, a fresh challenge per page); a refunds ``status`` challenge cannot
+   be used there, and the reverse is also refused.
 
 Every step queues a webhook event (``prepaid.refund.requested|paid|rejected|cancelled|payout_reverted``).
 """
 
+import binascii
 import json
 import logging
 import re
 import uuid
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -88,12 +91,13 @@ from app.payments import PaymentVerificationError, PayoutSighting, RpcUnavailabl
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
     CREDIT_STATUS_ACTION,
-    MAX_SUMMARY_CREDITS,
+    DEFAULT_CREDIT_STATUS_LIMIT,
     SLUG_RE,
     BuyerCreditStatus,
     BuyerCreditStatusItem,
     PrepaidCreditStatusChallenge,
     PrepaidCreditStatusChallengeRequest,
+    PrepaidCreditStatusRequest,
     PrepaidLedgerEntryRead,
     PrepaidRefundChallenge,
     PrepaidRefundChallengeRequest,
@@ -139,6 +143,45 @@ def refund_challenge_key(nonce: str) -> str:
 
 def refund_nonce_lock_key(nonce: str) -> str:
     return f"{REFUND_NONCE_LOCK_PREFIX}{nonce}"
+
+
+CREDIT_CURSOR_VERSION: Final = "v1"
+
+
+def encode_credit_status_cursor(
+    *, created_at: datetime, credit_id: uuid.UUID, merchant_id: uuid.UUID, public_key: str
+) -> str:
+    """Opaque keyset cursor for credits/status (created_at, id), bound to this merchant and depositing key."""
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    payload = "|".join(
+        (
+            CREDIT_CURSOR_VERSION,
+            created_at.astimezone(UTC).isoformat(),
+            str(credit_id),
+            str(merchant_id),
+            public_key,
+        )
+    )
+    return urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def decode_credit_status_cursor(token: str) -> tuple[datetime, uuid.UUID, uuid.UUID, str] | None:
+    """Parse a cursor from encode_credit_status_cursor, or None if it is malformed."""
+    if not token.isascii() or not token or len(token) > 512:
+        return None
+    try:
+        padded = token + ("=" * (-len(token) % 4))
+        raw = urlsafe_b64decode(padded)
+        version, stamp, credit_id, merchant_id, public_key = raw.decode("ascii").split("|")
+        if version != CREDIT_CURSOR_VERSION or not _HEX64.fullmatch(public_key):
+            return None
+        created_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if created_at.tzinfo is None:
+            return None
+        return created_at.astimezone(UTC), uuid.UUID(credit_id), uuid.UUID(merchant_id), public_key
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
 
 
 @dataclass(frozen=True)
@@ -859,28 +902,64 @@ async def credit_status_challenge(
     response_model=BuyerCreditStatus,
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_PREPAID_REFUND))],
 )
-async def signed_credit_status(signed: PrepaidRefundSigned, session: DbSession, redis: RedisDep) -> Response:
-    """This key's failed-delivery credit at one merchant, from a signed `credits` challenge."""
-    stored, failure = await _claim_signed(redis, signed, CREDIT_STATUS_ACTION)
+async def signed_credit_status(payload: PrepaidCreditStatusRequest, session: DbSession, redis: RedisDep) -> Response:
+    """This key's failed-delivery credit at one merchant, from a signed `credits` challenge.
+
+    Each request consumes the challenge, so every page needs a fresh one. `before` is checked after the
+    signature and before the nonce lock, so a malformed or foreign cursor does not burn a valid challenge.
+    """
+    cursor_at: datetime | None = None
+    cursor_id: uuid.UUID | None = None
+
+    async def precheck(stored: StoredRefundChallenge) -> JSONResponse | None:
+        nonlocal cursor_at, cursor_id
+        if payload.before is None:
+            return None
+        parsed = decode_credit_status_cursor(payload.before)
+        if parsed is None:
+            return _error(400, "invalid_cursor", "before is not a valid credits cursor")
+        created_at, credit_id, merchant_id, public_key = parsed
+        if merchant_id != stored.merchant_id or public_key != stored.payer_public_key:
+            return _error(400, "invalid_cursor", "this cursor is not for this buyer")
+        cursor_at, cursor_id = created_at, credit_id
+        return None
+
+    stored, failure = await _claim_signed(redis, payload, CREDIT_STATUS_ACTION, precheck=precheck)
     if failure is not None or stored is None:
         return failure or _store_unavailable()
     try:
-        summary = await _credit_summary(session, stored.merchant_id, stored.payer_public_key)
+        summary = await _credit_summary(
+            session,
+            stored.merchant_id,
+            stored.payer_public_key,
+            limit=payload.limit,
+            before_created_at=cursor_at,
+            before_id=cursor_id,
+        )
     except SQLAlchemyError:
         logger.exception("signed credit status lookup failed")
         return _store_unavailable()
-    await _consume_challenge(redis, signed.nonce)
+    await _consume_challenge(redis, payload.nonce)
     return JSONResponse(
         content=summary.model_dump(mode="json"),
         headers={"Cache-Control": "no-store"},
     )
 
 
-async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_key: str) -> BuyerCreditStatus:
+async def _credit_summary(
+    session: AsyncSession,
+    merchant_id: uuid.UUID,
+    public_key: str,
+    *,
+    limit: int = DEFAULT_CREDIT_STATUS_LIMIT,
+    before_created_at: datetime | None = None,
+    before_id: uuid.UUID | None = None,
+) -> BuyerCreditStatus:
     """CONTRACT v2.14: the signing buyer's failed-delivery credit at this merchant (credits/status)."""
     balance = await _balance_of(session, merchant_id, public_key)
     rows: list[PrepaidLedgerEntry] = []
     count = 0
+    next_cursor: str | None = None
     if balance is not None:
         is_credit = (PrepaidLedgerEntry.balance_id == balance.id) & (
             PrepaidLedgerEntry.kind == LEDGER_KIND_FAILED_DELIVERY_CREDIT
@@ -888,18 +967,37 @@ async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_
         count = int(
             (await session.execute(select(func.count()).select_from(PrepaidLedgerEntry).where(is_credit))).scalar_one()
         )
-        rows = list(
+        filters: list[ColumnElement[bool]] = [is_credit]
+        if before_created_at is not None and before_id is not None:
+            filters.append(
+                or_(
+                    PrepaidLedgerEntry.created_at < before_created_at,
+                    and_(PrepaidLedgerEntry.created_at == before_created_at, PrepaidLedgerEntry.id < before_id),
+                )
+            )
+        page = list(
             (
                 await session.execute(
                     select(PrepaidLedgerEntry)
-                    .where(is_credit)
-                    .order_by(PrepaidLedgerEntry.created_at.desc(), PrepaidLedgerEntry.id)
-                    .limit(MAX_SUMMARY_CREDITS)
+                    .where(*filters)
+                    .order_by(PrepaidLedgerEntry.created_at.desc(), PrepaidLedgerEntry.id.desc())
+                    .limit(limit + 1)
                 )
             ).scalars()
         )
+        if len(page) > limit:
+            last = page[limit - 1]
+            next_cursor = encode_credit_status_cursor(
+                created_at=last.created_at,
+                credit_id=last.id,
+                merchant_id=merchant_id,
+                public_key=public_key,
+            )
+            page = page[:limit]
+        rows = page
     credits = [
         BuyerCreditStatusItem(
+            credit_id=row.id,
             tx_id=row.tx_id or "",
             slug=row.slug or "",
             credit_sompi=str(row.amount_sompi),
@@ -916,6 +1014,7 @@ async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_
         refundable_sompi=str(refundable_sompi(balance)),
         credit_count=count,
         credits=credits,
+        next_cursor=next_cursor,
     )
 
 
@@ -1135,7 +1234,11 @@ async def claim_refund(
                 status=PREPAID_REFUND_PAYING,
                 claimed_at=func.now(),
                 first_claimed_at=func.coalesce(PrepaidRefund.first_claimed_at, func.now()),
-                first_claimed_daa_score=func.coalesce(PrepaidRefund.first_claimed_daa_score, daa),
+                # Written only with the first first_claimed_at: a null score from a node outage stays null
+                # (the pre-cancel UTXO filter is skipped). A renewal must never backfill a later virtual DAA.
+                first_claimed_daa_score=case(
+                    (PrepaidRefund.first_claimed_at.is_(None), daa), else_=PrepaidRefund.first_claimed_daa_score
+                ),
                 updated_at=func.now(),
             )
             .returning(PrepaidRefund)
