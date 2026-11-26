@@ -4,6 +4,29 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 
 ## Unreleased
 
+### Changed: privacy residuals, in-flight cap, orphan sweeper, single-use refunds-status signatures (PR #6)
+
+- **Unsigned deposit responses no longer carry the balance.** `PrepaidDepositQuote` and `PrepaidDepositReceipt`
+  (including the idempotent replay) drop `balance_sompi`. Buyer SDK models keep it optional; the MCP
+  `prepaid_deposit` tool no longer returns `balance_kas`/`balance_sompi` (use `prepaid_balance`).
+- **`prepaid_cap_exceeded` is generic** (quote and deposit): "deposit would exceed the prepaid balance cap; use a
+  signed balance read for details". No balance, headroom, credit or cap value. The quote error is now the standard
+  `{error, message}` instead of FastAPI's `{detail}`.
+- **The quote counts in-flight debits** (`status='debited' AND upstream_status_code IS NULL`) through the same
+  helper as the deposit, and the failed-delivery credit clamp counts them too, so all three agree.
+- **`POST /v1/prepaid/refunds/challenge`:** an omitted `amount_sompi` on a request needs the buyer-signed balance-read
+  headers (new error `refund_amount_required`, 422); explicit amounts work as before. Errors carry no figures. The
+  unsigned challenge checks only the public spendable total; the refundable cap (spendable minus call-only credit)
+  is enforced when the signed request is submitted to `POST /v1/prepaid/refunds`. SDK `prepaid_refund_request`
+  without an amount now signs the challenge request.
+- **Accepted by design (documented):** spendable minus on-chain deposits reveals call-only credit/spent amounts to
+  anyone who knows a buyer address; headroom can be probed through quote/challenge status codes.
+- **Orphaned in-flight debit sweeper** (`PREPAID_DEBIT_SWEEPER_ENABLED=true`, `..._INTERVAL_SECONDS=60`,
+  `PREPAID_DEBIT_ORPHAN_AGE_SECONDS=900`, `..._BATCH_SIZE=100`): refunds debits whose upstream call never recorded a
+  status, idempotently and safely across replicas (conditional UPDATE). No migration.
+- **`GET /v1/prepaid/refunds/status` signatures are single use** (`kasgate:sigreplay:refunds-status:{sha256}`;
+  replay is 401 `invalid_balance_signature`, Redis down is 503). The SDK never reuses a timestamp.
+
 ### Added: failed-delivery auto-credit (CONTRACT v2.14, after v2.13 / PR #1)
 
 - When a paid call's last delivery failed for good (upstream 5xx, connection error, or a timeout unless the merchant
