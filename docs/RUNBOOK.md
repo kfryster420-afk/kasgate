@@ -78,6 +78,10 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"                   
 | `REDELIVERY_WINDOW_SECONDS` | `600` | How long after settlement a buyer may re-present the same signature to get the upstream response again (0 to 3600). |
 | `REDELIVERY_MAX_ATTEMPTS` | `3` | Maximum upstream deliveries per settlement (0 to 10). |
 | `SESSION_TTL_SECONDS` | `604800` | Dashboard session lifetime (7 days). |
+| `LEDGER_WORKER_ENABLED` | `true` | CONTRACT v2.13 prepaid ledger worker: expires due credit and re-checks refund payouts that were not visible yet. Safe on several replicas. |
+| `LEDGER_POLL_INTERVAL_SECONDS` | `30` | Pause between ledger worker passes. |
+| `LEDGER_BATCH_SIZE` | `100` | Balances expired and payouts re-checked per pass. |
+| `PREPAID_PAYOUT_PENDING_MAX_SECONDS` | `86400` | A refund payout still not visible on-chain after this long goes back to `requested` (the merchant can pay again). |
 
 ### Web variables
 
@@ -513,6 +517,19 @@ SQL
 ```
 
 Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows, contact the affected merchant about their upstream, and decide on a manual refund policy (the gateway has no refund function). Tell merchants this behaviour in your terms.
+- [ ] **Prepaid refunds and expiry (CONTRACT v2.13).** A buyer's refund request only sets credit aside; the merchant pays it on-chain from their own wallet (exactly `amount_sompi` to `payout_address`, no platform fee) and posts the txId, or a signed transaction carrying `payout_payload_hex`, to `POST /v1/prepaid/refunds/{id}/payout`. The ledger is debited only when the gateway sees that payout. Watch for refunds stuck in `payout_submitted` (the node could not see the payout) and for requests merchants leave open:
+
+```bash
+cd infra
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT id, merchant_id, status, amount_sompi, tx_id, last_error, created_at, payout_submitted_at
+FROM prepaid_refunds
+WHERE status IN ('requested', 'payout_submitted')
+ORDER BY created_at LIMIT 50;
+SQL
+```
+
+  A payout that left the mempool and whose buyer output was already spent cannot be confirmed by txId (the UTXO index no longer shows it); after `PREPAID_PAYOUT_PENDING_MAX_SECONDS` it reverts to `requested` with `last_error`. Ask the merchant for the raw signed transaction, or confirm the payment in an explorer and record it by hand. Expiry runs in the ledger worker; keep `LEDGER_WORKER_ENABLED=true` on at least one replica. Tell merchants that an expiry policy applies only from a buyer's next deposit.
 - [ ] Watch disk, memory and Postgres connections on the host. Redis uses AOF, so its volume grows.
 
 ## 8. Optional own node

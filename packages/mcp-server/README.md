@@ -14,6 +14,9 @@ Stdio MCP server for KasGate. Tools:
 | `prepaid_deposit(slug, amount_kas)` | CONTRACT v2.11: funds a prepaid balance at the endpoint's merchant with one on-chain payment (>= 0.6 KAS; merchant share = credit, fee max(1.5 %, 0.2 KAS) to the treasury). Reserved against the session cap and per-call max before signing, committed on success. |
 | `prepaid_balance(slug)` | this key's prepaid balance at that merchant (read only). |
 | `call_prepaid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` paid by one signed debit from the prepaid balance (no transaction). Refuses to sign unless the debit text matches the request and the amount is within the cap; returns the debit receipt (`debited` or `refunded`). Does not draw the session cap again. |
+| `prepaid_refund_request(slug, amount_kas?)` | CONTRACT v2.13: asks the merchant to pay unused credit back to this key's address (all spendable credit when `amount_kas` is omitted; at least 0.2 KAS). Signs one refund request (checked against what was asked), never a transaction; does not touch the session cap. |
+| `prepaid_refund_cancel(slug, refund_id)` | withdraws a refund the merchant has not paid yet; the held credit becomes spendable again. |
+| `prepaid_refunds(slug)` | this key's refund requests at that merchant, newest first (read only). |
 | `trial_status(slug)` | CONTRACT v2.12: how many free trial calls this buyer key has left on the endpoint. Signs nothing. |
 | `call_free_trial(slug, method, path, body)` | makes ONE call from the endpoint's free trial and never pays (fails with `trial_exhausted` when none is left). The signed trial text is checked against the request and carries no amount. A failed upstream gives the trial back (`refunded`). The paying tools also use a free trial automatically before paying: see `trial` in their result. |
 
