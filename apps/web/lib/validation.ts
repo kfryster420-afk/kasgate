@@ -1,6 +1,6 @@
-import { ADDRESS_PREFIX, MAX_SOMPI } from "./config";
+import { ADDRESS_PREFIX, MAX_SOMPI, MAX_USD_MICROS } from "./config";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, minPriceSompi } from "./sompi";
-import { HTTP_METHODS, type HttpMethod } from "./types";
+import { HTTP_METHODS, PRICE_CURRENCIES, type HttpMethod, type PriceCurrency } from "./types";
 
 /** Mirrors KASPA_ADDRESS_RE in schemas.py. */
 const KASPA_ADDRESS_RE = /^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$/;
@@ -140,5 +140,23 @@ export function checkPriceSompi(input: unknown, minOutput: bigint): Check<string
   if (value < floorPrice || !meetsOutputFloor(value, minOutput)) {
     return fail(`Minimum price is ${formatSompi(floorPrice)} sompi (${formatKas(floorPrice)} KAS): ${minPriceReason(minOutput)}`);
   }
+  return ok(value.toString());
+}
+
+export function checkPriceCurrency(input: unknown): Check<PriceCurrency> {
+  if (typeof input === "string" && (PRICE_CURRENCIES as readonly string[]).includes(input)) return ok(input as PriceCurrency);
+  return fail("price_currency must be KAS or USD");
+}
+
+/**
+ * Validates a decimal-string micro-dollar price (schemas.UsdMicros: integer, 1..MAX_USD_MICROS).
+ * The 0.6 KAS floor is applied at quote time, not at create.
+ */
+export function checkPriceUsdMicros(input: unknown): Check<string> {
+  if (typeof input !== "string" || !/^[1-9][0-9]{0,14}$/.test(input.trim())) {
+    return fail("Price must be a positive whole number of micro-dollars (at most 15 digits)");
+  }
+  const value = BigInt(input.trim());
+  if (value > MAX_USD_MICROS) return fail("Price exceeds the maximum of $1,000,000,000");
   return ok(value.toString());
 }

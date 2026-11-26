@@ -34,7 +34,7 @@ export async function PATCH(request: NextRequest, context: Context): Promise<Nex
   const result = await gatewayRequest<EndpointRead>(`/v1/endpoints/${id}`, {
     method: "PATCH",
     bearer: auth.token,
-    body: stringifyWithIntegers(built.payload, ["price_sompi"]),
+    body: stringifyWithIntegers(built.payload, ["price_sompi", "price_usd_micros"]),
   });
   return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
 }

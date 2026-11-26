@@ -27,7 +27,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const result = await gatewayRequest<EndpointRead>("/v1/endpoints", {
     method: "POST",
     bearer: auth.token,
-    body: stringifyWithIntegers(built.payload, ["price_sompi"]),
+    body: stringifyWithIntegers(built.payload, ["price_sompi", "price_usd_micros"]),
   });
   return result.ok ? jsonOk(result.data, 201) : fromGatewayFailure(result);
 }

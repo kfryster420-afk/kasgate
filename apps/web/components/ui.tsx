@@ -1,6 +1,7 @@
 import { AlertTriangle, Loader2, ServerOff } from "lucide-react";
 import { KASPA_UNAVAILABLE_MESSAGE } from "@/lib/errors";
 import type { ReactNode } from "react";
+import { PRICE_CURRENCIES, type PriceCurrency } from "@/lib/types";
 
 export function Field({ label, hint, error, children, htmlFor }: { label: string; hint?: string; error?: string | null; children: ReactNode; htmlFor: string }) {
   return (
@@ -64,6 +65,28 @@ export function Toggle({ checked, onChange, label, id }: { checked: boolean; onC
       </button>
       {label}
     </label>
+  );
+}
+
+export function CurrencyToggle({ value, onChange, id }: { value: PriceCurrency; onChange: (next: PriceCurrency) => void; id: string }) {
+  return (
+    <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-950 p-1" role="radiogroup" aria-label="Price currency" id={id}>
+      {PRICE_CURRENCIES.map((currency) => {
+        const on = value === currency;
+        return (
+          <button
+            key={currency}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            className={`rounded-md px-3 py-1.5 font-mono text-xs transition ${on ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"}`}
+            onClick={() => onChange(currency)}
+          >
+            {currency}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

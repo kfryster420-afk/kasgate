@@ -5,9 +5,10 @@
  * - Field names are identical to the Python schemas (snake_case). The x402 header models keep camelCase.
  * - Pydantic `Decimal` values are serialised by the gateway as JSON strings -> `DecimalString`.
  * - `datetime` / `date` values are ISO-8601 strings -> `IsoDateTime` / `IsoDate`.
- * - Sompi amounts can reach 2^63-1, beyond Number.MAX_SAFE_INTEGER. Every `*_sompi` integer returned by the
- *   gateway is normalised to a decimal string by `lib/safe-json.ts` before it reaches application code, so all
- *   `Sompi` fields below are strings. Do arithmetic on them with BigInt only (see `lib/sompi.ts`).
+ * - Sompi amounts can reach 2^63-1, beyond Number.MAX_SAFE_INTEGER. Every `*_sompi` and `*_usd_micros` integer
+ *   returned by the gateway is normalised to a decimal string by `lib/safe-json.ts` before it reaches application
+ *   code, so all `Sompi` and `UsdMicros` fields below are strings. Do arithmetic on them with BigInt only
+ *   (see `lib/sompi.ts` and `lib/format.ts`).
  */
 
 export type Uuid = string;
@@ -16,12 +17,16 @@ export type IsoDate = string;
 export type DecimalString = string;
 /** Decimal string of an integer number of sompi (1 KAS = 100,000,000 sompi). Matches SOMPI_STR_RE. */
 export type Sompi = string;
+/** Decimal string of an integer number of micro-dollars (1 USD = 1,000,000 micros). Matches UsdMicros, max $1e9. */
+export type UsdMicros = string;
 
 export type KaspaNetwork = "kaspa:testnet-10" | "kaspa:mainnet";
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+export type PriceCurrency = "KAS" | "USD";
 export type SettlementStatus = "pending" | "settled" | "rejected";
 
 export const HTTP_METHODS: readonly HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+export const PRICE_CURRENCIES: readonly PriceCurrency[] = ["KAS", "USD"];
 
 export const X402_ERROR_CODES = [
   "payment_required",
@@ -188,7 +193,11 @@ export interface AuthVerifyRequest {
 
 /* ------------------------------------------------------------------ endpoints */
 
-/** Body accepted by the Next route handler; `price_sompi` is a decimal string, converted to a JSON integer server-side. */
+/**
+ * Body accepted by the Next route handler. Sompi and micro-dollar amounts are decimal strings, converted to
+ * JSON integers server-side. KAS: send `price_sompi` and omit `price_usd_micros`. USD: send `price_usd_micros`
+ * and omit `price_sompi`. `price_currency` defaults to KAS.
+ */
 export interface EndpointCreate {
   name: string;
   slug?: string | null;
@@ -196,7 +205,9 @@ export interface EndpointCreate {
   category?: string | null;
   upstream_url: string;
   upstream_headers?: Record<string, string>;
-  price_sompi: Sompi;
+  price_currency?: PriceCurrency;
+  price_sompi?: Sompi;
+  price_usd_micros?: UsdMicros;
   allowed_methods?: HttpMethod[];
   is_public_listed?: boolean;
 }
@@ -207,7 +218,9 @@ export interface EndpointUpdate {
   category?: string | null;
   upstream_url?: string | null;
   upstream_headers?: Record<string, string> | null;
+  price_currency?: PriceCurrency | null;
   price_sompi?: Sompi | null;
+  price_usd_micros?: UsdMicros | null;
   allowed_methods?: HttpMethod[] | null;
   is_active?: boolean | null;
   is_public_listed?: boolean | null;
@@ -221,14 +234,18 @@ export interface EndpointRead {
   description: string | null;
   category: string | null;
   upstream_url: string;
-  price_sompi: Sompi;
+  price_currency: PriceCurrency;
+  price_sompi: Sompi | null;
+  price_usd_micros: UsdMicros | null;
   allowed_methods: string[];
   is_active: boolean;
   is_public_listed: boolean;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
-  /** computed_field */
-  price_kas: string;
+  /** computed_field; null when price_currency is USD. */
+  price_kas: string | null;
+  /** computed_field; null when price_currency is KAS. */
+  price_usd: string | null;
   /** computed_field: `${PUBLIC_BASE_URL}/p/${slug}` */
   proxy_url: string;
 }
@@ -237,20 +254,30 @@ export interface EndpointRead {
 
 export type OpenApiImportMode = "preview" | "create";
 
-/** One operation to create, addressed by method + path exactly as in the document; `price_sompi` overrides the default. */
+/**
+ * One operation to create, addressed by method + path exactly as in the document. A row override is in the
+ * import's default_price_currency: `price_sompi` for KAS, `price_usd_micros` for USD.
+ */
 export interface OpenApiImportSelection {
   method: HttpMethod;
   path: string;
   price_sompi?: Sompi;
+  price_usd_micros?: UsdMicros;
 }
 
-/** Body accepted by POST /api/endpoints/import. Exactly one of `spec_text` / `spec_url`; sompi values are decimal strings. */
+/**
+ * Body accepted by POST /api/endpoints/import. Exactly one of `spec_text` / `spec_url`; sompi and micro-dollar
+ * values are decimal strings. KAS (the default): `default_price_sompi` and no USD fields. USD:
+ * `default_price_currency: "USD"`, `default_price_usd_micros`, and no sompi fields.
+ */
 export interface OpenApiImportBody {
   mode: OpenApiImportMode;
   spec_text?: string;
   spec_url?: string;
   upstream_base_url: string;
-  default_price_sompi: Sompi;
+  default_price_currency?: PriceCurrency;
+  default_price_sompi?: Sompi;
+  default_price_usd_micros?: UsdMicros;
   upstream_headers?: Record<string, string>;
   category?: string;
   is_public_listed?: boolean;
@@ -272,7 +299,11 @@ export interface OpenApiOperationPreview {
   /** Buyer route, e.g. "/p/list-pets/{petId}": path parameters become the proxy path suffix. */
   proxy_path: string | null;
   proxy_url: string | null;
-  price_sompi: Sompi;
+  price_currency: PriceCurrency;
+  /** Default KAS price; null when price_currency is USD. */
+  price_sompi: Sompi | null;
+  /** Default USD price in micro-dollars; null when price_currency is KAS. */
+  price_usd_micros: UsdMicros | null;
 }
 
 export interface OpenApiImportPreview {
@@ -283,7 +314,9 @@ export interface OpenApiImportPreview {
   servers: string[];
   operation_count: number;
   importable_count: number;
-  default_price_sompi: Sompi;
+  default_price_currency: PriceCurrency;
+  default_price_sompi: Sompi | null;
+  default_price_usd_micros: UsdMicros | null;
   min_price_sompi: Sompi;
   operations: OpenApiOperationPreview[];
 }
@@ -393,8 +426,11 @@ export interface DirectoryEntry {
   category: string | null;
   merchant_display_name: string;
   pay_to: string;
-  price_sompi: Sompi;
-  price_kas: string;
+  price_currency: PriceCurrency;
+  price_sompi: Sompi | null;
+  price_kas: string | null;
+  price_usd_micros: UsdMicros | null;
+  price_usd: string | null;
   allowed_methods: string[];
   proxy_url: string;
 }

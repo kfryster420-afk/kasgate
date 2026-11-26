@@ -43,7 +43,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const response = await gatewayRaw("/v1/endpoints/import", {
     method: "POST",
     bearer: auth.token,
-    body: stringifyWithIntegerKeys(built.payload, ["default_price_sompi", "price_sompi"]),
+    body: stringifyWithIntegerKeys(built.payload, ["default_price_sompi", "price_sompi", "default_price_usd_micros", "price_usd_micros"]),
   });
   if (!response) return jsonError("The KasGate gateway is unreachable. Try again shortly.", 502);
   const text = await response.text();

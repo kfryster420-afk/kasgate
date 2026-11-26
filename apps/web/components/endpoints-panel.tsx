@@ -4,7 +4,7 @@ import { Ban, ExternalLink, FileCode2, Pencil, Plus, RotateCcw, X } from "lucide
 import Link from "next/link";
 import { useState } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
-import { formatKas, formatSompi } from "@/lib/sompi";
+import { listedPrice } from "@/lib/format";
 import type { EndpointRead, EndpointUpdate } from "@/lib/types";
 import { CopyButton } from "./copy-button";
 import { EndpointForm } from "./endpoint-form";
@@ -122,8 +122,8 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
                   </p>
                 </div>
                 <div className="text-right">
-                  <div className="font-mono text-lg font-semibold text-zinc-100">{formatKas(endpoint.price_sompi)} KAS</div>
-                  <div className="font-mono text-xs text-zinc-500">{formatSompi(endpoint.price_sompi)} sompi / call</div>
+                  <div className="font-mono text-lg font-semibold text-zinc-100">{listedPrice(endpoint).primary}</div>
+                  <div className="font-mono text-xs text-zinc-500">{listedPrice(endpoint).secondary} / call</div>
                   <div className="mt-1 font-mono text-xs text-zinc-500">{endpoint.allowed_methods.join(" · ")}</div>
                 </div>
               </div>

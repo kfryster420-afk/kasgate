@@ -38,5 +38,9 @@ export const PLATFORM_FEE_BPS = 150n;
 export const BPS_DENOMINATOR = 10_000n;
 /** Largest total price whose decimal string still fits SompiStr (max 18 digits, CONTRACT v2). */
 export const MAX_SOMPI = 999_999_999_999_999_999n;
+/** 1 USD = 1,000,000 micro-dollars. Mirrors schemas.USD_MICROS_PER_DOLLAR. */
+export const USD_MICROS_PER_DOLLAR = 1_000_000n;
+/** Largest USD price in micro-dollars (schemas.MAX_USD_MICROS): $1,000,000,000. */
+export const MAX_USD_MICROS = 1_000_000_000_000_000n;
 
 export const SESSION_COOKIE = "kg_session";

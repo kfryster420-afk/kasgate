@@ -1,8 +1,8 @@
 /**
- * The gateway serialises BIGINT sompi columns as JSON integers that may exceed Number.MAX_SAFE_INTEGER.
- * `JSON.parse` would silently round them. `parseGatewayJson` first rewrites every integer literal whose
- * object key ends in `_sompi` into a JSON string (using a string-aware scanner, so user text is never touched),
- * then parses normally. All sompi fields therefore arrive as exact decimal strings.
+ * The gateway serialises BIGINT sompi (and micro-dollar) columns as JSON integers that may exceed
+ * Number.MAX_SAFE_INTEGER. `JSON.parse` would silently round them. `parseGatewayJson` first rewrites every
+ * integer literal whose object key ends in `_sompi` or `_usd_micros` into a JSON string (using a string-aware
+ * scanner, so user text is never touched), then parses normally. Those fields therefore arrive as exact decimal strings.
  */
 
 const NUMBER_TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
@@ -42,7 +42,7 @@ export function quoteSompiIntegers(text: string): string {
       const match = NUMBER_TOKEN.exec(text);
       if (match) {
         const token = match[0];
-        out += lastKey.endsWith("_sompi") && INTEGER_TOKEN.test(token) ? `"${token}"` : token;
+        out += (lastKey.endsWith("_sompi") || lastKey.endsWith("_usd_micros")) && INTEGER_TOKEN.test(token) ? `"${token}"` : token;
         i += token.length;
         continue;
       }

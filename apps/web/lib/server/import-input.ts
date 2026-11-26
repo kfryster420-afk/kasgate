@@ -8,7 +8,8 @@ import {
   isHttpMethod,
 } from "../openapi-import";
 import type { OpenApiImportBody, OpenApiImportSelection } from "../types";
-import { checkOptionalText, checkPriceSompi, checkUpstreamHeaders, checkUpstreamUrl } from "../validation";
+import type { PriceCurrency } from "../types";
+import { checkOptionalText, checkPriceCurrency, checkPriceSompi, checkPriceUsdMicros, checkUpstreamHeaders, checkUpstreamUrl } from "../validation";
 
 export type ImportInputResult =
   | { ok: true; payload: OpenApiImportBody }
@@ -43,12 +44,19 @@ export async function readCappedText(request: Request, maxBytes: number = OPENAP
   return { ok: true, text: new TextDecoder().decode(joined) };
 }
 
-function checkSelections(input: unknown, floor: bigint): { selections?: OpenApiImportSelection[]; error?: string; rowErrors: Record<string, string> } {
+function checkSelections(
+  input: unknown,
+  currency: PriceCurrency,
+  floor: bigint,
+): { selections?: OpenApiImportSelection[]; error?: string; rowErrors: Record<string, string> } {
   const rowErrors: Record<string, string> = {};
   if (!Array.isArray(input) || input.length === 0) return { error: "Select at least one operation to import", rowErrors };
   if (input.length > OPENAPI_MAX_OPERATIONS) return { error: `At most ${OPENAPI_MAX_OPERATIONS} operations can be imported at once`, rowErrors };
   const selections: OpenApiImportSelection[] = [];
   const seen = new Set<string>();
+  const wrongField = currency === "USD" ? "price_sompi" : "price_usd_micros";
+  const wrongMessage =
+    currency === "USD" ? "price_sompi must be omitted in a USD-priced import" : "price_usd_micros must be omitted in a KAS-priced import";
   input.forEach((raw: unknown, index) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       rowErrors[String(index)] = "Selection must be an object";
@@ -71,8 +79,21 @@ function checkSelections(input: unknown, floor: bigint): { selections?: OpenApiI
       return;
     }
     seen.add(key);
+    if (item[wrongField] !== undefined && item[wrongField] !== null) {
+      rowErrors[String(index)] = wrongMessage;
+      return;
+    }
     const selection: OpenApiImportSelection = { method, path };
-    if (item.price_sompi !== undefined && item.price_sompi !== null) {
+    if (currency === "USD") {
+      if (item.price_usd_micros !== undefined && item.price_usd_micros !== null) {
+        const price = checkPriceUsdMicros(item.price_usd_micros);
+        if (!price.ok) {
+          rowErrors[String(index)] = price.error;
+          return;
+        }
+        selection.price_usd_micros = price.value;
+      }
+    } else if (item.price_sompi !== undefined && item.price_sompi !== null) {
       const price = checkPriceSompi(item.price_sompi, floor);
       if (!price.ok) {
         rowErrors[String(index)] = price.error;
@@ -110,9 +131,26 @@ export function buildImportPayload(body: Record<string, unknown>, floor: bigint)
   if (base.ok) payload.upstream_base_url = base.value;
   else errors.push(base.error.replace(/^Upstream URL/, "Base upstream URL"));
 
-  const price = checkPriceSompi(body.default_price_sompi, floor);
-  if (price.ok) payload.default_price_sompi = price.value;
-  else errors.push(`Default price: ${price.error}`);
+  const currencyResult = checkPriceCurrency(body.default_price_currency === undefined ? "KAS" : body.default_price_currency);
+  const currency: PriceCurrency = currencyResult.ok ? currencyResult.value : "KAS";
+  if (!currencyResult.ok) errors.push(currencyResult.error);
+  else payload.default_price_currency = currency;
+
+  if (currency === "USD") {
+    const price = checkPriceUsdMicros(body.default_price_usd_micros);
+    if (price.ok) payload.default_price_usd_micros = price.value;
+    else errors.push(`Default price: ${price.error}`);
+    if (body.default_price_sompi !== undefined && body.default_price_sompi !== null) {
+      errors.push("default_price_sompi must be omitted when default_price_currency is USD");
+    }
+  } else {
+    const price = checkPriceSompi(body.default_price_sompi, floor);
+    if (price.ok) payload.default_price_sompi = price.value;
+    else errors.push(`Default price: ${price.error}`);
+    if (body.default_price_usd_micros !== undefined && body.default_price_usd_micros !== null) {
+      errors.push("default_price_usd_micros must be omitted when default_price_currency is KAS");
+    }
+  }
 
   const headers = checkUpstreamHeaders(body.upstream_headers);
   if (headers.ok) payload.upstream_headers = headers.value;
@@ -127,7 +165,7 @@ export function buildImportPayload(body: Record<string, unknown>, floor: bigint)
   else payload.is_public_listed = listed;
 
   if (mode === "create") {
-    const checked = checkSelections(body.selections, floor);
+    const checked = checkSelections(body.selections, currency, floor);
     if (checked.error) return { ok: false, status: 422, error: [...errors, checked.error].join("; "), rowErrors: checked.rowErrors };
     payload.selections = checked.selections;
   } else if (body.selections !== undefined) {

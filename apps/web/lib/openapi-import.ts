@@ -1,5 +1,6 @@
+import { parseUsdToMicros } from "./format";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceSompi, parseKasToSompi } from "./sompi";
-import { HTTP_METHODS, type HttpMethod, type OpenApiImportSelection, type OpenApiOperationPreview } from "./types";
+import { HTTP_METHODS, type HttpMethod, type OpenApiImportSelection, type OpenApiOperationPreview, type PriceCurrency } from "./types";
 import { checkUpstreamUrl, type Check } from "./validation";
 
 /** Mirrors schemas.OPENAPI_MAX_DOCUMENT_BYTES (2 MiB): the largest OpenAPI document the gateway imports. */
@@ -51,9 +52,12 @@ export function isHttpMethod(value: string): value is HttpMethod {
   return (HTTP_METHODS as readonly string[]).includes(value);
 }
 
-/** Inline per-row error for a KAS price input, or null when the price is valid against the floor F. */
-export function rowPriceError(kasInput: string, minOutput: bigint): string | null {
-  const sompi = parseKasToSompi(kasInput);
+/** Inline per-row error for a price input in the import currency, or null when the value is valid. */
+export function rowPriceError(input: string, currency: PriceCurrency, minOutput: bigint): string | null {
+  if (currency === "USD") {
+    return parseUsdToMicros(input) === null ? "Enter a USD amount (up to 6 decimals)" : null;
+  }
+  const sompi = parseKasToSompi(input);
   if (sompi === null) return "Enter a KAS amount (up to 8 decimals)";
   if (!meetsOutputFloor(sompi, minOutput)) {
     const floorPrice = minPriceSompi(minOutput);
@@ -64,26 +68,30 @@ export function rowPriceError(kasInput: string, minOutput: bigint): string | nul
 
 export interface ImportRowState {
   selected: boolean;
-  priceKas: string;
+  priceInput: string;
 }
 
 /**
- * Selections for mode "create" from the preview rows and their UI state. `price_sompi` is sent only when the row's
- * price differs from the default; returns null when any selected row has an unparsable price.
+ * Selections for mode "create" from the preview rows and their UI state. A per-row override is sent only when the
+ * row's price differs from the default; returns null when any selected row has an unparsable price.
  */
 export function buildSelections(
   operations: readonly OpenApiOperationPreview[],
   rows: Readonly<Record<string, ImportRowState>>,
-  defaultSompi: bigint,
+  currency: PriceCurrency,
+  defaultAmount: bigint,
 ): OpenApiImportSelection[] | null {
   const out: OpenApiImportSelection[] = [];
   for (const operation of operations) {
     const row = rows[operation.key];
     if (!operation.importable || !row?.selected || !isHttpMethod(operation.method)) continue;
-    const sompi = parseKasToSompi(row.priceKas);
-    if (sompi === null) return null;
+    const amount = currency === "USD" ? parseUsdToMicros(row.priceInput) : parseKasToSompi(row.priceInput);
+    if (amount === null) return null;
     const selection: OpenApiImportSelection = { method: operation.method, path: operation.path };
-    if (sompi !== defaultSompi) selection.price_sompi = sompi.toString();
+    if (amount !== defaultAmount) {
+      if (currency === "USD") selection.price_usd_micros = amount.toString();
+      else selection.price_sompi = amount.toString();
+    }
     out.push(selection);
   }
   return out;

@@ -8,7 +8,7 @@ import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { curlCreateEndpoint, curlDiscover, curlPaid, curlRegisterMerchant, pythonSnippet } from "@/lib/snippets";
 import type { EndpointCreate, EndpointRead, MerchantCreate, MerchantKeyIssued, MerchantRead } from "@/lib/types";
 import { checkDisplayName, checkKaspaAddress, checkOptionalEmail } from "@/lib/validation";
-import { formatKas, formatSompi } from "@/lib/sompi";
+import { formatEndpointPrice } from "@/lib/format";
 import { CodeBlock } from "./code-block";
 import { ApiKeyReveal } from "./api-key-reveal";
 import { CopyButton } from "./copy-button";
@@ -207,7 +207,7 @@ function LiveStep({ endpoint, onAnother }: { endpoint: EndpointRead; onAnother: 
           <h2 className="text-lg font-medium">Step 3 · You are live</h2>
         </div>
         <p className="mt-1 text-sm text-zinc-400">
-          <span className="text-zinc-200">{endpoint.name}</span> now charges {formatKas(endpoint.price_sompi)} KAS ({formatSompi(endpoint.price_sompi)} sompi) per call. Unpaid requests receive HTTP 402.
+          <span className="text-zinc-200">{endpoint.name}</span> now charges {formatEndpointPrice(endpoint)} per call. Unpaid requests receive HTTP 402.
         </p>
         <div className="mt-5">
           <span className="label">Live proxy URL</span>

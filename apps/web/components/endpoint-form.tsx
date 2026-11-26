@@ -3,12 +3,13 @@
 import { Loader2 } from "lucide-react";
 import { useId, useMemo, useState, type FormEvent } from "react";
 import { ADDRESS_PREFIX } from "@/lib/config";
+import { microsToUsdPlain, parseUsdToMicros } from "@/lib/format";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
-import { HTTP_METHODS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod } from "@/lib/types";
+import { HTTP_METHODS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod, type PriceCurrency } from "@/lib/types";
 import { checkEndpointName, checkOptionalSlug, checkUpstreamUrl } from "@/lib/validation";
 import { FeeSplitView } from "./fee-split";
-import { ErrorBanner, Field, Toggle } from "./ui";
+import { CurrencyToggle, ErrorBanner, Field, Toggle } from "./ui";
 
 const CATEGORIES = ["data", "ai", "finance", "weather", "geo", "media", "search", "dev-tools", "other"] as const;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
@@ -17,13 +18,26 @@ type Props =
   | { mode: "create"; busy: boolean; error: string | null; onSubmit: (payload: EndpointCreate) => void; onCancel?: undefined; initial?: undefined }
   | { mode: "edit"; busy: boolean; error: string | null; onSubmit: (payload: EndpointUpdate) => void; onCancel: () => void; initial: EndpointRead };
 
+function initialKas(initial?: EndpointRead): string {
+  if (!initial || initial.price_currency !== "KAS" || initial.price_sompi === null) return "";
+  return sompiToKasPlain(initial.price_sompi);
+}
+
+function initialUsd(initial?: EndpointRead): string {
+  if (!initial || initial.price_currency !== "USD") return "";
+  if (initial.price_usd) return initial.price_usd;
+  return initial.price_usd_micros ? microsToUsdPlain(initial.price_usd_micros) : "";
+}
+
 export function EndpointForm(props: Props) {
   const uid = useId();
   const pricing = usePricing();
   const initial = props.initial;
   const [name, setName] = useState(initial?.name ?? "");
   const [upstreamUrl, setUpstreamUrl] = useState(initial?.upstream_url ?? "");
-  const [priceKas, setPriceKas] = useState(initial ? sompiToKasPlain(initial.price_sompi) : "");
+  const [currency, setCurrency] = useState<PriceCurrency>(initial?.price_currency ?? "KAS");
+  const [priceKas, setPriceKas] = useState(initialKas(initial));
+  const [priceUsd, setPriceUsd] = useState(initialUsd(initial));
   const [methods, setMethods] = useState<HttpMethod[]>(
     initial ? initial.allowed_methods.filter((m): m is HttpMethod => (HTTP_METHODS as readonly string[]).includes(m)) : ["GET"],
   );
@@ -36,6 +50,7 @@ export function EndpointForm(props: Props) {
   const [touched, setTouched] = useState(false);
 
   const sompi = useMemo(() => parseKasToSompi(priceKas), [priceKas]);
+  const micros = useMemo(() => parseUsdToMicros(priceUsd), [priceUsd]);
 
   const errors = useMemo(() => {
     const out: Partial<Record<"name" | "url" | "price" | "methods" | "slug" | "header", string>> = {};
@@ -43,7 +58,9 @@ export function EndpointForm(props: Props) {
     if (!n.ok) out.name = n.error;
     const u = checkUpstreamUrl(upstreamUrl);
     if (!u.ok) out.url = u.error;
-    if (sompi === null) out.price = "Enter a price in KAS, e.g. 6.67 (up to 8 decimals)";
+    if (currency === "USD") {
+      if (micros === null) out.price = "Enter a price in USD, e.g. 1.50 (up to 6 decimals)";
+    } else if (sompi === null) out.price = "Enter a price in KAS, e.g. 6.67 (up to 8 decimals)";
     else if (pricing.status === "ready" && !meetsOutputFloor(sompi, pricing.minOutput))
       out.price = `Minimum price is ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}`;
     else if (pricing.status === "error") out.price = `Cannot verify the minimum price: ${pricing.message}`;
@@ -58,14 +75,19 @@ export function EndpointForm(props: Props) {
       else if (headerValue === "" || /[\r\n]/.test(headerValue)) out.header = "Enter a single-line header value";
     }
     return out;
-  }, [name, upstreamUrl, sompi, methods, slug, headerName, headerValue, props.mode, pricing]);
+  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing]);
 
   const minPriceHint =
-    pricing.status === "ready"
-      ? `Fixed price per call. Minimum ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}.`
-      : "Fixed price per call, entered in KAS and stored as sompi. The minimum is read from the gateway.";
+    currency === "USD"
+      ? pricing.status === "ready"
+        ? `Entered in dollars. Buyers pay the KAS equivalent at the rate locked when they call, and never less than ${formatKas(pricing.minPrice)} KAS.`
+        : "Entered in dollars. Buyers pay the KAS equivalent at the rate locked when they call, with a 0.60 KAS minimum."
+      : pricing.status === "ready"
+        ? `Fixed price per call. Minimum ${formatKas(pricing.minPrice)} KAS (${formatSompi(pricing.minPrice)} sompi): ${minPriceReason(pricing.minOutput)}.`
+        : "Fixed price per call, entered in KAS and stored as sompi. The minimum is read from the gateway.";
   const hasErrors = Object.keys(errors).length > 0;
   const show = (key: keyof typeof errors) => (touched ? (errors[key] ?? null) : null);
+  const priceReady = currency === "USD" ? micros !== null : sompi !== null;
 
   function toggleMethod(method: HttpMethod) {
     setMethods((current) => (current.includes(method) ? current.filter((m) => m !== method) : [...current, method]));
@@ -74,13 +96,17 @@ export function EndpointForm(props: Props) {
   function submit(event: FormEvent) {
     event.preventDefault();
     setTouched(true);
-    if (hasErrors || sompi === null) return;
+    if (hasErrors || !priceReady) return;
     const headers = headerName.trim() !== "" ? { [headerName.trim()]: headerValue } : undefined;
+    const priceFields =
+      currency === "USD"
+        ? { price_currency: "USD" as const, price_usd_micros: micros!.toString() }
+        : { price_currency: "KAS" as const, price_sompi: sompi!.toString() };
     if (props.mode === "create") {
       const payload: EndpointCreate = {
         name: name.trim(),
         upstream_url: upstreamUrl.trim(),
-        price_sompi: sompi.toString(),
+        ...priceFields,
         allowed_methods: methods,
         is_public_listed: listed,
         upstream_headers: headers ?? {},
@@ -93,7 +119,7 @@ export function EndpointForm(props: Props) {
       const payload: EndpointUpdate = {
         name: name.trim(),
         upstream_url: upstreamUrl.trim(),
-        price_sompi: sompi.toString(),
+        ...priceFields,
         allowed_methods: methods,
         is_public_listed: listed,
         category: category.trim() === "" ? null : category.trim(),
@@ -138,14 +164,25 @@ export function EndpointForm(props: Props) {
         </Field>
       </div>
 
-      <Field label="Price per call (KAS)" htmlFor={`${uid}-price`} error={show("price")} hint={minPriceHint}>
-        <div className="relative">
-          <input id={`${uid}-price`} className="input pr-14 font-mono" value={priceKas} onChange={(e) => setPriceKas(e.target.value)} placeholder="6.67" inputMode="decimal" autoComplete="off" />
-          <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center font-mono text-xs text-zinc-500">KAS</span>
+      <Field label={`Price per call (${currency})`} htmlFor={`${uid}-price`} error={show("price")} hint={minPriceHint}>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <CurrencyToggle id={`${uid}-currency`} value={currency} onChange={setCurrency} />
+          <div className="relative flex-1">
+            <input
+              id={`${uid}-price`}
+              className="input pr-14 font-mono"
+              value={currency === "USD" ? priceUsd : priceKas}
+              onChange={(e) => (currency === "USD" ? setPriceUsd(e.target.value) : setPriceKas(e.target.value))}
+              placeholder={currency === "USD" ? "1.50" : "6.67"}
+              inputMode="decimal"
+              autoComplete="off"
+            />
+            <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center font-mono text-xs text-zinc-500">{currency}</span>
+          </div>
         </div>
       </Field>
 
-      {sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} minOutput={pricing.minOutput} /> : null}
+      {currency === "KAS" && sompi !== null && pricing.status === "ready" && meetsOutputFloor(sompi, pricing.minOutput) ? <FeeSplitView totalSompi={sompi} minOutput={pricing.minOutput} /> : null}
 
       <fieldset>
         <legend className="label">Allowed methods</legend>

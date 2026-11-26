@@ -2,9 +2,8 @@
 
 import { Search } from "lucide-react";
 import { useMemo, useState } from "react";
-import { formatKas, formatSompi } from "@/lib/sompi";
+import { listedPrice, shortAddress } from "@/lib/format";
 import type { DirectoryEntry } from "@/lib/types";
-import { shortAddress } from "@/lib/format";
 import { CopyButton } from "./copy-button";
 
 export function DirectoryExplorer({ entries }: { entries: DirectoryEntry[] }) {
@@ -57,8 +56,8 @@ export function DirectoryExplorer({ entries }: { entries: DirectoryEntry[] }) {
                   <p className="text-xs text-zinc-500">by {e.merchant_display_name}</p>
                 </div>
                 <div className="shrink-0 text-right">
-                  <div className="font-mono text-sm font-semibold text-kas-300">{formatKas(e.price_sompi)} KAS</div>
-                  <div className="font-mono text-[11px] text-zinc-600">{formatSompi(e.price_sompi)} sompi</div>
+                  <div className="font-mono text-sm font-semibold text-kas-300">{listedPrice(e).primary}</div>
+                  <div className="font-mono text-[11px] text-zinc-600">{listedPrice(e).secondary}</div>
                 </div>
               </div>
               {e.description ? <p className="mt-2 line-clamp-3 text-sm text-zinc-400">{e.description}</p> : null}
