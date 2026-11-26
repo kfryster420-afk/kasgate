@@ -78,7 +78,7 @@ Refunds of unused credit (CONTRACT v2.13):
 ```python
 refund = await client.prepaid_refund_request("https://gw.example", "weather")            # all spendable credit
 refund = await client.prepaid_refund_request("https://gw.example", "weather", 25_000_000)  # or an amount (>= 0.2 KAS)
-print(await client.prepaid_refunds("https://gw.example", "weather"))   # requested -> paying -> payout_submitted -> paid
+print(await client.prepaid_refunds("https://gw.example", "weather"))   # signed read; requested -> paying -> payout_submitted -> paid
 print(await client.prepaid_refunds("https://gw.example", "weather", signed=True))  # also the merchant's reasons
 await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  # only while `requested`, no payout pending
 ```
@@ -86,12 +86,18 @@ await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  
 - The request signs a refund text (purpose `kasgate:v1:prepaid-refund`) that the SDK rebuilds itself; it refuses to sign
   for another payer, endpoint, action, refund or amount, or for more than the spendable credit the gateway reported.
   The signature moves no coins: the merchant pays the amount back on-chain to this key's address, with no platform fee.
-- The public list hides the merchant's reject reason and claim (`paying` reads as `requested`); `signed=True` signs a
-  `status` text (amount 0) to read them (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
+- `GET /v1/prepaid/refunds/status` is a buyer-signed read (the gateway answers unsigned calls with 401): the SDK sends
+  `X-KasGate-Balance-Timestamp` + `X-KasGate-Balance-Signature` over the balance-read text (purpose
+  `kasgate:v1:prepaid-balance-read`, this domain, address, slug and unix time), the same read signature as
+  `prepaid_balance`; it authorises nothing else. That list hides the merchant's reject reason and claim (`paying`
+  reads as `requested`); `signed=True` signs a single-use `status` challenge (amount 0) instead to read them (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
   claimed it keeps its amount set aside until `hold_until`; a cancel is refused while a payout of it is on-chain.
   `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
-- `prepaid_balance` now also reports `refunded_sompi`, `expired_sompi`, `refund_hold_sompi` (set aside by an open
-  refund), `spendable_sompi` and `expires_at` (when the merchant set a credit expiry).
+- `prepaid_balance` is a signed read by default (same headers as above) and reports `balance_sompi`, the ledger totals
+  (`deposited`, `debited`, `refunded`, `expired`, `refund_hold_sompi`), `updated_at`, `spendable_sompi` and
+  `expires_at`. `prepaid_balance(..., signed=False)` is the unsigned public read, which carries only `spendable_sompi`
+  and `expires_at`; every other field of `PrepaidBalance` is then `None`. Read `spendable_sompi` for what calls can pay;
+  nothing in the SDK falls back to `balance_sompi`. A balance for another payer address is refused.
 
 ## Failed-delivery credits (CONTRACT v2.14)
 
@@ -108,15 +114,16 @@ observation = credit_of(response)             # None when there is no header
 observation.status                            # "hint": parsed, NOT checked
 observation = await client.confirm_credit("https://gw.example", "weather", observation)
 observation.status                            # "confirmed" | "unconfirmed"
-observation.confirmation.basis                # "tx_id" | "increase" | "none"
+observation.confirmation.basis                # "credit_id" | "increase" | "none"
 
-# or let the client check by itself (one signed challenge + status exchange, only when a hint arrives):
-client = KasGateClient(key, auto_confirm_credit=True)
+# or let the client check by itself (signed status pages, only when a hint arrives):
+client = KasGateClient(key, auto_confirm_credit=True, credit_page_budget=10)
 
-# the signed status itself, any time (moves no coins, signs one text):
-status = await client.credit_status("https://gw.example", "weather")   # BuyerCreditStatus
-status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi, status.credit_count
-[(c.tx_id, c.credit_sompi, c.shortfall_sompi, c.reason) for c in status.credits]   # newest first, at most 10
+# the signed status itself, any time (moves no coins, one fresh challenge per page):
+status = await client.credit_status("https://gw.example", "weather", limit=100)   # BuyerCreditStatus
+status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi, status.credit_count   # count: all pages
+[(c.credit_id, c.tx_id, c.credit_sompi, c.shortfall_sompi, c.reason) for c in status.credits]   # newest first
+older = await client.credit_status("https://gw.example", "weather", before=status.next_cursor)  # None on the last page
 ```
 
 - `credit_of(response)` returns a frozen, strict `CreditObservation(status, hint, error, confirmation)`, or `None` without
@@ -124,18 +131,26 @@ status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi, sta
   could not be read) or `invalid` (malformed, larger than 2 KiB, not a 5xx, or inconsistent with the payment it came
   with: another `txId`, an amount other than the merchant share, a balance below the credit). Nothing in the header can
   raise.
-- `credit_status(gateway_url, slug)` runs the signed flow: `POST /v1/prepaid/credits/challenge {slug, payer_address}`, then
-  `POST /v1/prepaid/credits/status {nonce, signature}`. The challenge is checked before anything is signed (action
+- `credit_status(gateway_url, slug, *, before=None, limit=None)` reads one page with the signed flow:
+  `POST /v1/prepaid/credits/challenge {slug, payer_address}`, then `POST /v1/prepaid/credits/status {nonce, signature,
+  before?, limit?}` (the body is the strict `CreditStatusRequest`: `limit` 1..100, gateway default 10; `before` the
+  previous page's `next_cursor`). Challenges are single use, so every page asks for a new one. The challenge is checked before anything is signed (action
   `credits`, this payer and slug, amount `0`, no refund id, not expired, and the text rebuilt byte for byte from the
   fields); a refunds `status` challenge is refused. The reply is parsed into the strict `BuyerCreditStatus` (extra
-  fields rejected, sompi are decimal strings read as ints, at most 10 `credits`). Errors raise the SDK's typed errors
-  (`PaymentRejectedError` carries the gateway's `status_code` / `error` such as `rate_limited`; replay `409` and expiry
-  `410` have their own classes). A key with no balance gets zeros and `credits == []`.
-- `confirm_credit(gateway_url, slug, credit, *, baseline_credited_sompi=None)` calls `credit_status` and says `confirmed`
-  only when the hinted `tx_id` is in `credits` with the hinted amount, reason and slug (`basis="tx_id"`). The status
-  lists only the newest 10: if the `tx_id` is not there, it is `confirmed` with the weaker `basis="increase"` only when
-  you passed a baseline and `credited_sompi` has grown by at least the credit; otherwise `unconfirmed`. It never raises
-  for gateway problems: they become `unconfirmed` with `confirmation.http_status`, `error_code` and a generic `detail`.
+  fields rejected, sompi are decimal strings read as ints, at most 100 `credits`, each with its `credit_id`, no
+  credit_id twice, `next_cursor` required and null on the last page). Errors raise the SDK's typed errors
+  (`PaymentRejectedError` carries the gateway's `status_code` / `error` such as `rate_limited` or `invalid_cursor`;
+  replay `409` and expiry `410` have their own classes). The challenge's `spendable_sompi` / `refundable_sompi` are
+  informational and optional. A key with no balance gets zeros and `credits == []`.
+- `confirm_credit(gateway_url, slug, credit, *, baseline_credited_sompi=None)` walks the signed status 100 credits per
+  page (a fresh challenge each, at most `credit_page_budget` pages, default 10, restart and re-walk included) until it
+  meets the hinted credit. It says `confirmed` (`basis="credit_id"`) only when a credit's `credit_id` is the header's
+  `creditId` and its `tx_id`, amount, reason and slug match the hint; the hinted `creditId` with other details, or the
+  hinted `tx_id` under another `credit_id`, is `unconfirmed`. A 400 `invalid_cursor` restarts from the newest page once;
+  a full walk that listed fewer credits than `credit_count` is walked again once. Only when the walk could not see every
+  credit (budget spent, count still higher) can a baseline confirm it with the weaker `basis="increase"` (`credited_sompi`
+  grew by at least the credit). `confirmation.pages_read` says how many pages were read. It never raises for gateway
+  problems: they become `unconfirmed` with `confirmation.http_status`, `error_code` and a generic `detail`.
 - Keys and signatures are never logged or put in an error.
 - A credit is call-only prepaid credit at one merchant: it is not refundable and it is not spend that came back, so it
   must not be subtracted from a spend total. `KasGateSyncClient.credit_status` / `confirm_credit` are the blocking twins.

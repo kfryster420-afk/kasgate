@@ -32,6 +32,22 @@ def xonly(key_hex: str) -> str:
     return kaspa.PrivateKey(key_hex).to_public_key().to_x_only_public_key().to_string()
 
 
+def signed_read_ok(request: httpx.Request) -> bool:
+    """The buyer-signed read scheme (fix/earlier-features 0dff846 `_balance_read_signed`): both headers, unix-seconds
+    timestamp within 60 s, a signature over the balance-read text for this domain, payer and slug."""
+    stamp = request.headers.get(sdk.HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(sdk.HEADER_BALANCE_SIGNATURE)
+    if stamp is None or signature is None or not stamp.isdigit() or abs(int(stamp) - int(datetime.now(UTC).timestamp())) > 60:
+        return False
+    message = sdk.build_prepaid_balance_read_message(
+        domain=request.url.netloc.decode("ascii").lower(),
+        address=request.url.params["payer_address"],
+        slug=request.url.params["slug"],
+        timestamp=int(stamp),
+    )
+    return bool(kaspa.verify_message(message, signature, kaspa.PublicKey(xonly(PAYER_KEY))))
+
+
 class RefundGateway:
     """Fake /v1/prepaid/refunds*: validates the SDK's bodies with the gateway's strict models and builds the
     challenge text with the gateway's builder, so a drifting SDK fails here."""
@@ -57,6 +73,8 @@ class RefundGateway:
             assert kaspa.verify_message(self.last["message"], body.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
             return httpx.Response(200, json=[{**row, "reason": "promo credit"} for row in self.refunds])
         if path == "/v1/prepaid/refunds/status":
+            if not signed_read_ok(request):  # buyer-signed read only; unsigned calls get 401
+                return httpx.Response(401, json={"error": "invalid_balance_signature", "message": "sign the read"})
             return httpx.Response(200, json=self.refunds)
         if path == "/v1/prepaid/refunds" or path.endswith("/cancel"):
             return self.signed(request)
@@ -286,3 +304,103 @@ def test_paying_and_late_payout_fields_decode() -> None:
     )
     assert refund.status == "paying" and refund.claimed_at is not None
     assert refund.claim_expires_at is not None and refund.first_claimed_at is not None and refund.hold_until is None
+
+
+# ---------------------------------------------------------------- buyer-signed reads (balance, refunds/status)
+
+
+def test_the_read_text_is_byte_identical_to_the_gateway_scheme() -> None:
+    """The text of fix/earlier-features 0dff846 `build_prepaid_balance_read_message`, spelled out."""
+    assert sdk.build_prepaid_balance_read_message(domain="gw.example", address=PAYER, slug="weather", timestamp=1700000000) == (
+        "KasGate\nDomain: gw.example\nPurpose: kasgate:v1:prepaid-balance-read\n"
+        f"Address: {PAYER}\nSlug: weather\nTimestamp: 1700000000"
+    )
+    assert (sdk.HEADER_BALANCE_TIMESTAMP, sdk.HEADER_BALANCE_SIGNATURE) == (
+        "X-KasGate-Balance-Timestamp",
+        "X-KasGate-Balance-Signature",
+    )
+    if hasattr(gw, "build_prepaid_balance_read_message"):  # once the gateway tree carries the builder
+        args = {"domain": "gw.example", "address": PAYER, "slug": "weather", "timestamp": 1700000000}
+        assert sdk.build_prepaid_balance_read_message(**args) == gw.build_prepaid_balance_read_message(**args)
+
+
+async def test_the_refund_list_is_a_signed_read_and_an_unsigned_one_is_refused(rgw, make_client) -> None:
+    client: KasGateClient = make_client(rgw)
+    await client.prepaid_refund_request("http://gateway.test", "weather")
+    listed = await client.prepaid_refunds("http://gateway.test", "weather")
+    assert len(listed) == 1
+    get = rgw.requests[-1]
+    assert get.method == "GET" and signed_read_ok(get)
+    assert PAYER_KEY not in str(get.headers) and PAYER_KEY not in str(get.url)
+    with httpx.Client(transport=httpx.MockTransport(rgw), base_url="http://gateway.test") as raw:
+        unsigned = raw.get("/v1/prepaid/refunds/status", params={"slug": "weather", "payer_address": PAYER})
+    assert unsigned.status_code == 401
+
+
+async def test_a_401_on_the_refund_list_is_a_typed_rejection(make_client) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid_balance_signature", "message": "no"})
+
+    client: KasGateClient = make_client(handler)
+    with pytest.raises(PaymentRejectedError) as caught:
+        await client.prepaid_refunds("http://gateway.test", "weather")
+    assert (caught.value.status_code, caught.value.code) == (401, "invalid_balance_signature")
+
+
+async def test_the_balance_is_a_signed_read_by_default(make_client) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        signed = signed_read_ok(request)
+        body: dict[str, Any] = {"spendable_sompi": "20000000", "expires_at": "2027-01-01T00:00:00+00:00"}
+        if signed:
+            body |= {
+                "merchant_id": str(MERCHANT_ID),
+                "payer_address": PAYER,
+                "balance_sompi": "40000000",
+                "deposited_sompi": "50000000",
+                "debited_sompi": "5000000",
+                "refunded_sompi": "5000000",
+                "expired_sompi": "0",
+                "refund_hold_sompi": "20000000",
+                "updated_at": None,
+            }
+        return httpx.Response(200, json=body)
+
+    client: KasGateClient = make_client(handler)
+    mine = await client.prepaid_balance("http://gateway.test", "weather")
+    assert signed_read_ok(seen[0]) and mine.balance_sompi == "40000000" and mine.spendable_sompi == "20000000"
+    public = await client.prepaid_balance("http://gateway.test", "weather", signed=False)
+    assert sdk.HEADER_BALANCE_SIGNATURE not in seen[1].headers
+    assert (public.spendable_sompi, public.balance_sompi, public.updated_at, public.deposited_sompi) == (
+        "20000000",
+        None,
+        None,
+        None,
+    )
+    assert public.expires_at is not None and public.expires_at.year == 2027
+
+
+async def test_an_unsigned_balance_with_only_spendable_and_expiry_decodes(make_client) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"spendable_sompi": "0", "expires_at": None})
+
+    balance = await make_client(handler).prepaid_balance("http://gateway.test", "weather", signed=False)
+    assert balance.spendable_sompi == "0" and balance.balance_sompi is None and balance.merchant_id is None
+
+
+async def test_a_balance_for_another_payer_or_malformed_is_refused(make_client) -> None:
+    replies: list[Any] = [
+        {"payer_address": "kaspatest:qqother", "spendable_sompi": "1"},
+        {"spendable_sompi": 5},
+        {"spendable_sompi": "-1"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=replies.pop(0))
+
+    client: KasGateClient = make_client(handler)
+    for _ in range(3):
+        with pytest.raises(PaymentReceiptError):
+            await client.prepaid_balance("http://gateway.test", "weather")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -43,11 +44,16 @@ from .credit import (
     CREDIT_CHALLENGE_PATH,
     CREDIT_EXTENSION,
     CREDIT_STATUS_PATH,
+    DEFAULT_CREDIT_PAGE_BUDGET,
     HEADER_CREDIT,
+    MAX_CREDIT_PAGE_BUDGET,
+    MAX_STATUS_CREDITS,
+    BuyerCreditItem,
     BuyerCreditStatus,
     CreditConfirmation,
     CreditObservation,
     CreditStatusChallenge,
+    CreditStatusRequest,
     FailedDeliveryCreditHint,
     judge_credit,
     observe_credit,
@@ -71,6 +77,8 @@ from .prepaid import (
     CHALLENGE_PATH,
     DEPOSIT_PATH,
     DEPOSIT_QUOTE_PATH,
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
     PREPAID_RECEIPT_EXTENSION,
@@ -86,6 +94,7 @@ from .prepaid import (
     PrepaidRefund,
     PrepaidRefundChallenge,
     RefundAction,
+    build_prepaid_balance_read_message,
     prepaid_body_hash,
     slug_of,
     validate_debit_challenge,
@@ -194,6 +203,7 @@ class KasGateClient:
         http_client: httpx.AsyncClient | None = None,
         use_free_trials: bool = True,
         auto_confirm_credit: bool = False,
+        credit_page_budget: int = DEFAULT_CREDIT_PAGE_BUDGET,
         **httpx_kwargs: Any,
     ) -> None:
         if network not in NETWORK_ADDRESS_PREFIX:
@@ -212,6 +222,12 @@ class KasGateClient:
             )
         if max_redeliveries < 0:
             raise ConfigurationError("max_redeliveries must be >= 0")
+        if (
+            not isinstance(credit_page_budget, int)
+            or isinstance(credit_page_budget, bool)
+            or not 1 <= credit_page_budget <= MAX_CREDIT_PAGE_BUDGET
+        ):
+            raise ConfigurationError(f"credit_page_budget must be an integer within 1..{MAX_CREDIT_PAGE_BUDGET}")
         if not 1_000 <= max_signature_header_bytes <= GATEWAY_MAX_HEADER_BYTES:
             raise ConfigurationError(
                 f"max_signature_header_bytes must be within 1000..{GATEWAY_MAX_HEADER_BYTES}"
@@ -239,6 +255,7 @@ class KasGateClient:
         self.max_redeliveries = max_redeliveries
         self.use_free_trials = bool(use_free_trials)
         self.auto_confirm_credit = bool(auto_confirm_credit)
+        self.credit_page_budget = credit_page_budget
         self._manifest_floors: dict[str, int] = {}
         self.unavailable_retry_delay = unavailable_retry_delay
         self.max_signature_header_bytes = max_signature_header_bytes
@@ -292,7 +309,7 @@ class KasGateClient:
         A response that carries `X-KasGate-Credit` (a paid call that failed for good and was credited, CONTRACT
         v2.14) gets a `CreditObservation`, read with `credit_of(response)`. The header is an unsigned hint: it is
         `confirmed` only after the signed credit status lists it (`confirm_credit`, or automatically with
-        `auto_confirm_credit`, which then makes one challenge + one status call, only when a hint arrived).
+        `auto_confirm_credit`, which then reads signed status pages, one fresh challenge each, only when a hint arrived).
         """
         response = await self._paid_request(
             method, url, max_price_kas=max_price_kas, expected_pay_to=expected_pay_to, **kwargs
@@ -581,30 +598,77 @@ class KasGateClient:
         self._ledger.mark_spent(built)
         return receipt
 
-    async def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
-        """This key's prepaid balance at the merchant behind `slug` (public read; never signs)."""
-        origin = self._origin(self._absolute(gateway_url))
+    def _signed_read_headers(self, url: httpx.URL, slug: str) -> dict[str, str]:
+        """Headers for a buyer-signed read (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature).
+
+        Signs `build_prepaid_balance_read_message` (this gateway's domain, this address, `slug`, the time): a read
+        only, it authorises no payment, debit or refund. Used for the balance and the refund list."""
+        timestamp = int(time.time())
+        message = build_prepaid_balance_read_message(
+            domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
+        )
+        return {
+            HEADER_BALANCE_TIMESTAMP: str(timestamp),
+            HEADER_BALANCE_SIGNATURE: kaspa.sign_message(message, self._private_key),
+        }
+
+    async def prepaid_balance(
+        self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = True
+    ) -> PrepaidBalance:
+        """This key's prepaid balance at the merchant behind `slug`.
+
+        Signed (default): a signed read (see `_signed_read_headers`) that returns the balance and ledger totals.
+        `signed=False` is the public read, which only carries `spendable_sompi` and `expires_at`; every other field
+        is then None. A reply for another payer address is refused."""
+        url = self._absolute(gateway_url)
+        origin = self._origin(url)
         response = await self._http.get(
-            origin + BALANCE_PATH, params={"slug": slug, "payer_address": self.address}
+            origin + BALANCE_PATH,
+            params={"slug": slug, "payer_address": self.address},
+            headers=self._signed_read_headers(url, slug) if signed else None,
         )
         if response.status_code != 200:
             code, message = error_details(response)
             raise PaymentRejectedError(response.status_code, code, message, response)
-        return PrepaidBalance.model_validate(response.json())
+        try:
+            balance = PrepaidBalance.model_validate(response.json())
+        except ValueError as exc:
+            raise PaymentReceiptError(f"prepaid balance cannot be decoded: {exc}", response) from exc
+        if balance.payer_address is not None and balance.payer_address != self.address:
+            raise PaymentReceiptError("prepaid balance is for another payer address", response)
+        return balance
 
     # ------------------------------------------------------------------ failed-delivery credit (CONTRACT v2.14)
 
-    async def credit_status(self, gateway_url: str | httpx.URL, slug: str) -> BuyerCreditStatus:
-        """This key's failed-delivery credit at the merchant behind `slug`, from the gateway's SIGNED credit status.
+    async def credit_status(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+    ) -> BuyerCreditStatus:
+        """One page of this key's failed-delivery credit at the merchant behind `slug`, from the SIGNED credit status.
 
-        Asks for a `credits` challenge, rebuilds its text locally (this payer, this domain, `Action: credits`, amount
-        0) and signs it with the depositing key; it moves no coins and is single use. Returns lifetime
-        `credited_sompi`, the unspent call-only `credit_balance_sompi`, `refundable_sompi`, `credit_count` and the
-        newest 10 credits. A buyer with no balance gets zeros and no credits. Raises `PaymentRejectedError`
-        (`status_code`/`code` of the gateway answer; `PaymentReplayedError` for 409, `PaymentExpiredError` for 410),
-        `InvalidChallengeError` for a challenge that is not exactly what was asked for, and `PaymentReceiptError`
-        for an answer that is not a strict BuyerCreditStatus.
+        Asks for a fresh `credits` challenge (each page consumes one), rebuilds its text locally (this payer, this
+        domain, `Action: credits`, amount 0) and signs it with the depositing key; it moves no coins. Returns lifetime
+        `credited_sompi`, the unspent call-only `credit_balance_sompi`, `refundable_sompi`, `credit_count` (all
+        pages) and one page of `credits`, newest first: `limit` 1..100 (gateway default 10), older than `before` (the
+        previous page's `next_cursor`). A buyer with no balance gets zeros and no credits. Raises `PaymentRejectedError`
+        (`status_code`/`code` of the gateway answer, e.g. 400 `invalid_cursor`; `PaymentReplayedError` for 409,
+        `PaymentExpiredError` for 410), `InvalidChallengeError` for a challenge that is not exactly what was asked for,
+        `PaymentReceiptError` for an answer that is not a strict BuyerCreditStatus, and ConfigurationError for a bad
+        `before` or `limit`.
         """
+        try:
+            page = CreditStatusRequest.model_validate(
+                {"nonce": "0" * 32, "signature": "0" * 128, "before": before, "limit": limit}
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"before must be a cursor string of at most 512 characters and limit an integer within "
+                f"1..{MAX_STATUS_CREDITS}"
+            ) from exc
         url = self._absolute(gateway_url)
         origin = self._origin(url)
         challenged = await self._http.post(
@@ -624,11 +688,13 @@ class KasGateClient:
             address=self.address,
             slug=slug,
         )
-        signed = {
-            "nonce": challenge.nonce,
-            "signature": kaspa.sign_message(challenge.message, self._private_key),
-        }
-        response = await self._http.post(origin + CREDIT_STATUS_PATH, json=signed)
+        signed = CreditStatusRequest(
+            nonce=challenge.nonce,
+            signature=kaspa.sign_message(challenge.message, self._private_key),
+            before=page.before,
+            limit=page.limit,
+        )
+        response = await self._http.post(origin + CREDIT_STATUS_PATH, json=signed.body())
         if response.status_code != 200:
             code, message = error_details(response)
             if response.status_code == 409 and code == "challenge_replayed":
@@ -645,7 +711,67 @@ class KasGateClient:
                 "credit status is for another merchant than the signed challenge",
                 response,
             )
+        if page.limit is not None and len(status.credits) > page.limit:
+            raise PaymentReceiptError("credit status lists more credits than the requested limit", response)
         return status
+
+    async def _walk_credit_status(
+        self, gateway_url: str | httpx.URL, slug: str, hint: FailedDeliveryCreditHint
+    ) -> tuple[BuyerCreditStatus, list[BuyerCreditItem], bool, int]:
+        """Read signed status pages (100 each, a fresh challenge per page) until the hinted credit_id or txId shows up,
+        the last page is read or `credit_page_budget` pages are spent (restart and re-walk included).
+
+        Returns (newest page, every item read, complete, pages read). `complete` means every credit counted by
+        `credit_count` was listed. A 400 `invalid_cursor` restarts from the newest page once; a full walk that listed
+        fewer credits than `credit_count` (credits added while paging) is walked again once. Other errors raise.
+        """
+        pages = 0
+        restarted = False
+        rewalked = False
+        while True:
+            first: BuyerCreditStatus | None = None
+            seen: dict[uuid.UUID, BuyerCreditItem] = {}
+            cursors: set[str] = set()
+            cursor: str | None = None
+            complete = False
+            found = False
+            while pages < self.credit_page_budget:
+                try:
+                    page = await self.credit_status(gateway_url, slug, before=cursor, limit=MAX_STATUS_CREDITS)
+                except PaymentRejectedError as exc:
+                    if exc.status_code == 400 and exc.code == "invalid_cursor" and cursor is not None and not restarted:
+                        pages += 1
+                        restarted = True
+                        first, seen, cursors, cursor = None, {}, set(), None
+                        continue
+                    raise
+                pages += 1
+                if first is None:
+                    first = page
+                elif page.merchant_id != first.merchant_id:
+                    raise PaymentReceiptError("credit status pages are for different merchants", None)
+                for item in page.credits:
+                    if seen.setdefault(item.credit_id, item) != item:
+                        raise PaymentReceiptError("credit status pages list one credit_id twice, differently", None)
+                if any(item.credit_id == hint.creditId or item.tx_id == hint.txId for item in page.credits):
+                    found = True
+                    break
+                if page.next_cursor is None:
+                    complete = True
+                    break
+                if page.next_cursor in cursors:
+                    raise PaymentReceiptError("credit status pages do not advance", None)
+                cursors.add(page.next_cursor)
+                cursor = page.next_cursor
+            if first is None:
+                raise PaymentReceiptError("the credit page budget ran out before a status page was read", None)
+            if found or not complete:
+                return first, list(seen.values()), complete, pages
+            if first.credit_count <= len(seen):
+                return first, list(seen.values()), True, pages
+            if rewalked or pages >= self.credit_page_budget:
+                return first, list(seen.values()), False, pages
+            rewalked = True
 
     async def confirm_credit(
         self,
@@ -657,13 +783,15 @@ class KasGateClient:
     ) -> CreditObservation:
         """Check an `X-KasGate-Credit` hint against the gateway's signed credit status before calling it real.
 
-        `credit` is the response (or its `credit_of(...)` observation, or a bare hint) of a call to `slug`. The
-        status (`credit_status`) must be for the hinted merchant and list a credit with the hinted txId, amount and
-        reason at `slug`. Only if that payment is not among the newest 10 credits can `baseline_credited_sompi` (the
-        `credited_sompi` read before the call) confirm it by increase. Returns a new observation: `confirmed`, or
-        `unconfirmed` with the reason in `confirmation` (credit not listed, details differ, gateway 429/503/410/409,
-        unreachable, malformed answer). An `invalid` observation stays invalid. Never raises for gateway or network
-        problems; a bad `credit` or baseline argument is a ConfigurationError.
+        `credit` is the response (or its `credit_of(...)` observation, or a bare hint) of a call to `slug`. The signed
+        status is read page by page (100 per page, one fresh challenge each, at most `credit_page_budget` pages) and
+        must be for the hinted merchant and list the hinted `creditId` with the hinted txId, amount and reason at
+        `slug`. Only if the walk could not see every credit (budget spent, or `credit_count` above what was listed
+        after one re-walk) can `baseline_credited_sompi` (the `credited_sompi` read before the call) confirm it by
+        increase. Returns a new observation: `confirmed`, or `unconfirmed` with the reason in `confirmation` (credit not
+        listed, details differ, gateway 429/503/410/409/400, unreachable, malformed answer). An `invalid` observation
+        stays invalid. Never raises for gateway or network problems; a bad `credit` or baseline argument is a
+        ConfigurationError.
         """
         observation = self._as_observation(credit)
         if observation.hint is None or observation.status == "invalid":
@@ -675,7 +803,7 @@ class KasGateClient:
         ):
             raise ConfigurationError("baseline_credited_sompi must be a non-negative integer or None")
         try:
-            status = await self.credit_status(gateway_url, slug)
+            first, items, complete, pages = await self._walk_credit_status(gateway_url, slug, observation.hint)
         except PaymentRejectedError as exc:
             confirmation = CreditConfirmation(
                 confirmed=False,
@@ -701,9 +829,12 @@ class KasGateClient:
         else:
             confirmation = judge_credit(
                 observation.hint,
-                status,
+                first,
                 slug=slug,
                 baseline_credited_sompi=baseline_credited_sompi,
+                credits=items,
+                complete=complete,
+                pages_read=pages,
             )
         return CreditObservation(
             status="confirmed" if confirmation.confirmed else "unconfirmed",
@@ -860,15 +991,20 @@ class KasGateClient:
     ) -> list[PrepaidRefund]:
         """This key's refunds at the merchant behind `slug`, newest first.
 
-        Unsigned (default) it is the public read: the merchant's reject `reason` and payout errors are withheld.
-        With `signed=True` it signs a `status` challenge (moves nothing) and the rows include them."""
+        Default: `GET /v1/prepaid/refunds/status` as a buyer-signed read (the same timestamped read signature as
+        `prepaid_balance`; the gateway answers unsigned calls with 401). The merchant's reject `reason` and payout
+        errors are withheld there. With `signed=True` it signs a single-use `status` challenge (moves nothing) and
+        posts it, and the rows include them."""
         if signed:
             origin, (_, signed_body) = await self._sign_refund_challenge(gateway_url, slug, "status", None, None)
             response = await self._http.post(origin + REFUND_STATUS_PATH, json=signed_body)
         else:
-            origin = self._origin(self._absolute(gateway_url))
+            url = self._absolute(gateway_url)
+            origin = self._origin(url)
             response = await self._http.get(
-                origin + REFUND_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
+                origin + REFUND_STATUS_PATH,
+                params={"slug": slug, "payer_address": self.address},
+                headers=self._signed_read_headers(url, slug),
             )
         if response.status_code != 200:
             code, message = error_details(response)

@@ -21,8 +21,11 @@ from .protocol import PaymentRequired, X402Header
 
 HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
 HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
+HEADER_BALANCE_TIMESTAMP = "X-KasGate-Balance-Timestamp"
+HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
+PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
 PREPAID_EMPTY_BODY_HASH = "-"
 PREPAID_RECEIPT_EXTENSION = "kasgate_prepaid_receipt"
 DEPOSIT_QUOTE_PATH = "/v1/prepaid/deposits/quote"
@@ -88,18 +91,24 @@ class PrepaidChallenge(_Model):
 
 
 class PrepaidBalance(_Model):
-    merchant_id: uuid.UUID
-    payer_address: str
-    balance_sompi: BalanceStr
-    deposited_sompi: BalanceStr
-    debited_sompi: BalanceStr
+    """`GET /v1/prepaid/balance`. The unsigned public read carries only `spendable_sompi` and `expires_at`; the
+    balance, the ledger totals and `updated_at` come only on a buyer-signed read (X-KasGate-Balance-Timestamp +
+    X-KasGate-Balance-Signature, which `KasGateClient.prepaid_balance` sends by default). Every other field is
+    therefore optional: read `spendable_sompi` for what calls can pay, never `balance_sompi`."""
+
+    merchant_id: uuid.UUID | None = None
+    payer_address: str | None = None
+    balance_sompi: BalanceStr | None = None
+    """Signed reads only."""
+    deposited_sompi: BalanceStr | None = None
+    debited_sompi: BalanceStr | None = None
     updated_at: datetime | None = None
-    # CONTRACT v2.13 (absent from older gateways, hence the defaults)
-    refunded_sompi: BalanceStr = "0"
-    expired_sompi: BalanceStr = "0"
-    refund_hold_sompi: BalanceStr = "0"
+    """Signed reads only."""
+    refunded_sompi: BalanceStr | None = None
+    expired_sompi: BalanceStr | None = None
+    refund_hold_sompi: BalanceStr | None = None
     spendable_sompi: BalanceStr | None = None
-    """What calls can be paid from now (balance minus an open refund's hold, 0 once expired). None = old gateway."""
+    """What calls can be paid from now (balance minus an open refund's hold, 0 once expired). Public."""
     expires_at: datetime | None = None
     # CONTRACT v2.14 (absent from older gateways, hence None): cumulative failed-delivery credit at this merchant.
     credited_sompi: BalanceStr | None = None
@@ -153,6 +162,20 @@ class PrepaidRefund(_Model):
     hold_until: datetime | None = None
     late_paid_from: Literal["cancelled", "rejected"] | None = None
     shortfall_sompi: BalanceStr = "0"
+
+
+def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
+    """The text a buyer signs for a signed read of its own prepaid state (byte-identical to the gateway's
+    `build_prepaid_balance_read_message`). Its Purpose differs from every money-moving KasGate text, so the
+    signature authorises nothing but the read."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Slug: {slug}\n"
+        f"Timestamp: {timestamp}"
+    )
 
 
 class PrepaidDebitHeader(X402Header):

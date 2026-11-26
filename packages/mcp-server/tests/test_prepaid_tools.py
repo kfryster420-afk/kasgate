@@ -13,6 +13,7 @@ from app import schemas as gw
 from kasgate_client import KasGateClient, compute_fee_split
 from mcp import Client
 from sdk_helpers import PAYER, PAYER_KEY, challenge, make_utxo, static_utxos
+from test_refund_tools import signed_read_ok
 
 from kasgate_mcp import Config, build_server
 
@@ -24,6 +25,7 @@ DEBIT_NONCE = "abcdef0123456789" * 2
 class Gateway:
     def __init__(self) -> None:
         self.balance = 0
+        self.unsigned_balance_only = False
         self.price = 1000
         self.message = ""
         self.upstream_status = 200
@@ -77,9 +79,13 @@ class Gateway:
                 },
             )
         if path == "/v1/prepaid/balance":
+            public: dict[str, Any] = {"spendable_sompi": str(self.balance), "expires_at": None}
+            if self.unsigned_balance_only or not signed_read_ok(request):
+                return httpx.Response(200, json=public)  # the unsigned public read: spendable and expiry only
             return httpx.Response(
                 200,
-                json={
+                json=public
+                | {
                     "merchant_id": str(MERCHANT_ID),
                     "payer_address": request.url.params["payer_address"],
                     "balance_sompi": str(self.balance),
@@ -253,3 +259,16 @@ async def test_prepaid_tools_validate_slug_and_path() -> None:
 def test_server_exposes_its_config() -> None:
     server = make_server(Gateway())
     assert server.kasgate_config.gateway_url == "http://gateway.test"
+
+
+async def test_prepaid_balance_never_depends_on_signed_only_fields() -> None:
+    fake = Gateway()
+    fake.balance = 5000
+    fake.unsigned_balance_only = True  # a gateway that answers with the public shape only
+    async with Client(make_server(fake)) as client:
+        result = await client.call_tool("prepaid_balance", {"slug": "cheap-api"})
+    assert not result.is_error, result.content[0].text
+    data = structured(result)
+    assert (data["spendable_sompi"], data["spendable_kas"]) == (5000, "0.00005")
+    assert data["balance_sompi"] is None and data["balance_kas"] is None and data["updated_at"] is None
+    assert data["deposited_sompi"] is None and data["merchant_id"] is None

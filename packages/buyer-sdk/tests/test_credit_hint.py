@@ -36,6 +36,7 @@ FEE = max(-(-PRICE * 150 // 10_000), 20_000_000)
 MERCHANT_SHARE = PRICE - FEE
 TX = "cd" * 32
 NONCE = "0123456789abcdef" * 2
+DEFAULT_PAGE_BUDGET = sdk.DEFAULT_CREDIT_PAGE_BUDGET
 GATEWAY = "http://gateway.test"
 
 
@@ -69,11 +70,13 @@ def raw_header(payload: Any) -> str:
 def credit_item(
     tx_id: str = TX,
     *,
+    credit_id: uuid.UUID | None = None,
     slug: str = "demo",
     credit: int = MERCHANT_SHARE,
     reason: str = "attempts_exhausted",
 ) -> dict[str, Any]:
     return {
+        "credit_id": str(credit_id or uuid.uuid4()),
         "tx_id": tx_id,
         "slug": slug,
         "credit_sompi": str(credit),
@@ -84,9 +87,11 @@ def credit_item(
 
 
 class CreditGateway(FakeGateway):
-    """The paid route answers 502 with an X-KasGate-Credit header and (like the gateway) records the credit; the fake
-    `/v1/prepaid/credits/challenge` + `/credits/status` validate the SDK's bodies with the gateway's own strict
-    models, build the challenge text with the gateway's builder and check the signature."""
+    """The paid route answers 502 with an X-KasGate-Credit header and (like the gateway) records the credit under the
+    header's creditId; the fake `/v1/prepaid/credits/challenge` + `/credits/status` validate the SDK's bodies with the
+    gateway's own strict models (PrepaidCreditStatusRequest: extra=forbid, limit 1..100), build the challenge text
+    with the gateway's builder, check the signature, issue a fresh single-use nonce per challenge and page newest
+    first with an opaque keyset cursor."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -103,7 +108,13 @@ class CreditGateway(FakeGateway):
         self.status_overrides: dict[str, Any] = {}
         self.message_override: str | None = None
         self.raw_status_body: Any = None
+        self.fixed_nonce: str | None = None  # set to reuse one nonce, like a replayed challenge
+        self.issued: dict[str, str] = {}  # nonce -> signed text
+        self.credit_ids: dict[str, uuid.UUID] = {}  # tx_id -> the creditId the header announced
         self.used_nonces: set[str] = set()
+        self.invalid_cursor_answers = 0  # answer this many cursor requests with 400 invalid_cursor
+        self.after_last_page: Any = None  # called once when the last page is served
+        self.status_bodies: list[dict[str, Any]] = []
         self.last: dict[str, Any] | None = None
         self.status_calls = 0
         self.challenge_calls = 0
@@ -121,12 +132,13 @@ class CreditGateway(FakeGateway):
             ).to_header()
         }
         header = self.credit_header
+        credit_id = self.credit_ids.setdefault(tx_id, uuid.uuid4())  # a redelivery of the same payment: same credit
         if header is None and self.credit_for_tx:
-            header = receipt_header(tx_id)
+            header = receipt_header(tx_id, creditId=credit_id)
         if header is not None:
             headers["X-KasGate-Credit"] = header
             if self.register_credit and self.credit_header is None and all(c["tx_id"] != tx_id for c in self.credits):
-                self.credits.insert(0, credit_item(tx_id))
+                self.credits.insert(0, credit_item(tx_id, credit_id=credit_id))
                 self.credited_sompi += MERCHANT_SHARE
         return httpx.Response(
             self.status,
@@ -147,6 +159,7 @@ class CreditGateway(FakeGateway):
         if self.challenge_error is not None:
             status, code = self.challenge_error
             return httpx.Response(status, json={"error": code, "message": "no"})
+        nonce = self.fixed_nonce or uuid.uuid4().hex
         expires = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=60)
         message = gw.build_prepaid_refund_message(
             domain="gateway.test",
@@ -155,11 +168,11 @@ class CreditGateway(FakeGateway):
             merchant_id=self.status_merchant,
             amount_sompi=0,
             refund_id=None,
-            nonce=NONCE,
+            nonce=nonce,
             expires_at=expires,
         )
         payload = {
-            "nonce": NONCE,
+            "nonce": nonce,
             "message": self.message_override or message,
             "action": "credits",
             "slug": parsed.slug,
@@ -171,23 +184,35 @@ class CreditGateway(FakeGateway):
             "refundable_sompi": "100",
             "expires_at": expires.isoformat(),
         } | self.challenge_overrides
-        self.last = {"message": message, "nonce": NONCE}
+        payload = {key: value for key, value in payload.items() if value is not ...}
+        self.issued[nonce] = message
+        self.last = {"message": message, "nonce": nonce}
         return httpx.Response(201, json=payload)
 
     def credit_status(self, body: dict[str, Any]) -> httpx.Response:
-        signed = gw.PrepaidRefundSigned.model_validate(body)
+        signed = gw.PrepaidCreditStatusRequest.model_validate(body)
         self.status_calls += 1
+        self.status_bodies.append(body)
         self.status_signatures.append(signed.signature)
-        assert self.last is not None and signed.nonce == self.last["nonce"]
-        assert kaspa.verify_message(self.last["message"], signed.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
+        assert signed.nonce in self.issued
+        assert kaspa.verify_message(self.issued[signed.nonce], signed.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
         if self.status_error is not None:
             status, code = self.status_error
             return httpx.Response(status, json={"error": code, "message": "no"})
+        ids = [c["credit_id"] for c in self.credits]
+        start = 0
+        if signed.before is not None:
+            if self.invalid_cursor_answers > 0 or signed.before not in ids:
+                self.invalid_cursor_answers = max(0, self.invalid_cursor_answers - 1)
+                return httpx.Response(400, json={"error": "invalid_cursor", "message": "bad cursor"})  # nonce not burned
+            start = ids.index(signed.before) + 1
         if signed.nonce in self.used_nonces:
             return httpx.Response(409, json={"error": "challenge_replayed", "message": "used"})
         self.used_nonces.add(signed.nonce)
         if self.raw_status_body is not None:
             return httpx.Response(200, json=self.raw_status_body)
+        page = self.credits[start : start + signed.limit]
+        more = start + signed.limit < len(self.credits)
         count = len(self.credits) if self.credit_count is None else self.credit_count
         reply = {
             "merchant_id": str(self.status_merchant),
@@ -195,9 +220,13 @@ class CreditGateway(FakeGateway):
             "credit_balance_sompi": str(self.credited_sompi),
             "refundable_sompi": "100",
             "credit_count": count,
-            "credits": self.credits[:10],
+            "credits": page,
+            "next_cursor": page[-1]["credit_id"] if more else None,
         } | self.status_overrides
         gw.BuyerCreditStatus.model_validate(reply)  # the fake itself speaks the gateway's strict shape
+        if not more and self.after_last_page is not None:
+            hook, self.after_last_page = self.after_last_page, None
+            hook()
         return httpx.Response(200, json=reply)
 
     def reset_nonce(self) -> None:
@@ -530,10 +559,11 @@ async def test_a_challenge_error_is_a_typed_rejection(make_client, credit_gatewa
 
 async def test_a_replayed_nonce_is_a_409_and_a_fresh_challenge_works(make_client, credit_gateway: CreditGateway) -> None:
     client = make_client(credit_gateway)
+    credit_gateway.fixed_nonce = NONCE
     await client.credit_status(GATEWAY, "demo")
     with pytest.raises(PaymentReplayedError):  # the fake reuses the nonce, like a replayed challenge
         await client.credit_status(GATEWAY, "demo")
-    credit_gateway.reset_nonce()
+    credit_gateway.fixed_nonce = None
     assert (await client.credit_status(GATEWAY, "demo")).credit_count == 0
 
 
@@ -552,6 +582,14 @@ async def test_a_replayed_nonce_is_a_409_and_a_fresh_challenge_works(make_client
         {"credits": [{**credit_item(), "tx_id": "XY"}]},
         {"credits": [{**credit_item(), "credit_sompi": 5}]},
         {"merchant_id": "nope"},
+        {"next_cursor": ...},  # the field is required (null on the last page)
+        {"next_cursor": 5},
+        {"next_cursor": ""},
+        {"next_cursor": "c" * 513},
+        {"next_cursor": "abc"},  # a cursor on a page without credits
+        {"credits": [{k: v for k, v in credit_item().items() if k != "credit_id"}]},
+        {"credits": [{**credit_item(), "credit_id": "not-a-uuid"}]},
+        {"credit_count": 2, "credits": [credit_item(credit_id=MERCHANT_ID), credit_item("ab" * 32, credit_id=MERCHANT_ID)]},
     ],
 )
 async def test_malformed_status_replies_are_refused(
@@ -564,20 +602,25 @@ async def test_malformed_status_replies_are_refused(
         "refundable_sompi": "0",
         "credit_count": 0,
         "credits": [],
+        "next_cursor": None,
     } | mutate
+    credit_gateway.raw_status_body = {k: v for k, v in credit_gateway.raw_status_body.items() if v is not ...}
     with pytest.raises(sdk.PaymentReceiptError, match="cannot be decoded"):
         await make_client(credit_gateway).credit_status(GATEWAY, "demo")
 
 
-async def test_more_than_ten_credits_or_a_non_object_reply_is_refused(make_client, credit_gateway: CreditGateway) -> None:
-    items = [credit_item(f"{i:064x}") for i in range(11)]
+async def test_more_than_a_hundred_credits_or_a_non_object_reply_is_refused(
+    make_client, credit_gateway: CreditGateway
+) -> None:
+    items = [credit_item(f"{i:064x}") for i in range(101)]
     credit_gateway.raw_status_body = {
         "merchant_id": str(MERCHANT_ID),
         "credited_sompi": "0",
         "credit_balance_sompi": "0",
         "refundable_sompi": "0",
-        "credit_count": 11,
+        "credit_count": 101,
         "credits": items,
+        "next_cursor": None,
     }
     with pytest.raises(sdk.PaymentReceiptError):
         await make_client(credit_gateway).credit_status(GATEWAY, "demo")
@@ -604,7 +647,9 @@ async def test_a_credit_the_status_lists_is_confirmed(make_client, credit_gatewa
     checked = await client.confirm_credit(GATEWAY, "demo", response)
     assert checked.status == "confirmed" and checked.confirmed is True
     assert checked.confirmation is not None
-    assert (checked.confirmation.basis, checked.confirmation.credited_sompi) == ("tx_id", MERCHANT_SHARE)
+    assert (checked.confirmation.basis, checked.confirmation.credited_sompi) == ("credit_id", MERCHANT_SHARE)
+    assert checked.confirmation.pages_read == 1 and credit_gateway.status_bodies[0]["limit"] == 100
+    assert "before" not in credit_gateway.status_bodies[0]
     assert checked.hint is not None and checked.hint.txId == receipt_of(response).tx_id  # type: ignore[union-attr]
     original = credit_of(response)
     assert original is not None and original.status == "hint"  # the response keeps its unconfirmed hint
@@ -649,7 +694,11 @@ async def test_a_listed_payment_with_other_details_contradicts_the_hint(
     credit_gateway.register_credit = False
     client = make_client(credit_gateway, unavailable_retry_delay=0)
     response = await client.get("/p/demo")
-    credit_gateway.credits = [credit_item(receipt_of(response).tx_id, **changes)]  # type: ignore[union-attr]
+    observation = credit_of(response)
+    assert observation is not None and observation.hint is not None
+    credit_gateway.credits = [
+        credit_item(receipt_of(response).tx_id, credit_id=observation.hint.creditId, **changes)  # type: ignore[union-attr]
+    ]
     checked = await client.confirm_credit(GATEWAY, "demo", response)
     assert checked.status == "unconfirmed" and checked.confirmation is not None
     assert fragment in checked.confirmation.detail
@@ -664,28 +713,284 @@ async def test_the_status_of_another_merchant_does_not_confirm(make_client, cred
     assert checked.confirmation is not None and "different merchant" in checked.confirmation.detail
 
 
-async def test_a_payment_beyond_the_newest_ten_needs_a_baseline_to_be_confirmed(
+def _hint_of(response: httpx.Response) -> FailedDeliveryCreditHint:
+    observation = credit_of(response)
+    assert observation is not None and observation.hint is not None
+    return observation.hint
+
+
+def _older(n: int, start: int = 0) -> list[dict[str, Any]]:
+    return [credit_item(f"{i:064x}") for i in range(start, start + n)]
+
+
+async def test_a_credit_id_match_confirms(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    hint = _hint_of(response)
+    assert credit_gateway.credits[0]["credit_id"] == str(hint.creditId)
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.confirmed and checked.confirmation is not None and checked.confirmation.basis == "credit_id"
+
+
+async def test_the_hinted_payment_under_another_credit_id_is_not_confirmed(
     make_client, credit_gateway: CreditGateway
 ) -> None:
-    client = make_client(credit_gateway, unavailable_retry_delay=0)
-    credit_gateway.credit_header = None
+    """Same txId, amount, reason and slug, but the gateway's credit_id is not the header's creditId."""
     credit_gateway.register_credit = False
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
     response = await client.get("/p/demo")
-    # The hinted payment is not listed, but 25 credits exist: only the newest 10 are visible.
-    credit_gateway.credits = [credit_item(f"{i:064x}") for i in range(10)]
-    credit_gateway.credit_count = 25
+    credit_gateway.credits = [credit_item(_hint_of(response).txId, credit_id=uuid.uuid4())]
+    credit_gateway.credited_sompi = 10**12
+    checked = await client.confirm_credit(GATEWAY, "demo", response, baseline_credited_sompi=0)
+    assert checked.status == "unconfirmed" and checked.confirmation is not None
+    assert checked.confirmation.basis == "none" and "another credit_id" in checked.confirmation.detail
+
+
+async def test_the_hinted_credit_id_for_another_payment_is_not_confirmed(
+    make_client, credit_gateway: CreditGateway
+) -> None:
+    credit_gateway.register_credit = False
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    credit_gateway.credits = [credit_item("ab" * 32, credit_id=_hint_of(response).creditId)]
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.status == "unconfirmed" and checked.confirmation is not None
+    assert "another payment" in checked.confirmation.detail
+
+
+async def test_a_multi_page_walk_uses_a_fresh_challenge_per_page(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    mine = credit_gateway.credits.pop(0)
+    credit_gateway.credits = _older(250, 1) + [mine]  # the hinted credit is the oldest of 251: page 3
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.confirmed and checked.confirmation is not None
+    assert (checked.confirmation.basis, checked.confirmation.pages_read) == ("credit_id", 3)
+    bodies = credit_gateway.status_bodies
+    assert [b["limit"] for b in bodies] == [100, 100, 100]
+    assert "before" not in bodies[0]
+    assert [b.get("before") for b in bodies[1:]] == [credit_gateway.credits[99]["credit_id"], credit_gateway.credits[199]["credit_id"]]
+    nonces = [b["nonce"] for b in bodies]
+    assert len(set(nonces)) == 3 and credit_gateway.challenge_calls == 3
+
+
+async def test_the_walk_stops_at_the_page_that_lists_the_credit(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    credit_gateway.credits += _older(400, 1)  # the hinted credit is the newest
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.confirmed and credit_gateway.status_calls == 1
+
+
+async def test_an_invalid_cursor_restarts_from_the_newest_page_once(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    mine = credit_gateway.credits.pop(0)
+    credit_gateway.credits = _older(150, 1) + [mine]
+    credit_gateway.invalid_cursor_answers = 1
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.confirmed and checked.confirmation is not None
+    befores = [b.get("before") for b in credit_gateway.status_bodies]
+    assert befores[0] is None and befores[1] is not None and befores[2] is None and befores[3] is not None
+    assert checked.confirmation.pages_read == 4
+
+
+async def test_a_second_invalid_cursor_leaves_the_credit_unconfirmed(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    mine = credit_gateway.credits.pop(0)
+    credit_gateway.credits = _older(150, 1) + [mine]
+    credit_gateway.invalid_cursor_answers = 2
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.status == "unconfirmed" and checked.confirmation is not None
+    assert (checked.confirmation.http_status, checked.confirmation.error_code) == (400, "invalid_cursor")
+
+
+async def test_a_spent_page_budget_needs_a_baseline_to_be_confirmed(make_client, credit_gateway: CreditGateway) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0, credit_page_budget=2)
+    response = await client.get("/p/demo")
+    mine = credit_gateway.credits.pop(0)
+    credit_gateway.credits = _older(250, 1) + [mine]  # needs 3 pages, only 2 allowed
     credit_gateway.credited_sompi = 500 + MERCHANT_SHARE
     no_baseline = await client.confirm_credit(GATEWAY, "demo", response)
     assert no_baseline.status == "unconfirmed" and no_baseline.confirmation is not None
-    assert "newest 10" in no_baseline.confirmation.detail
-    credit_gateway.reset_nonce()
+    assert "200 of 251 credits read" in no_baseline.confirmation.detail and no_baseline.confirmation.pages_read == 2
+    assert credit_gateway.status_calls == 2
     grew = await client.confirm_credit(GATEWAY, "demo", response, baseline_credited_sompi=500)
     assert grew.status == "confirmed" and grew.confirmation is not None
     assert (grew.confirmation.basis, grew.confirmation.baseline_credited_sompi) == ("increase", 500)
-    credit_gateway.reset_nonce()
     flat = await client.confirm_credit(GATEWAY, "demo", response, baseline_credited_sompi=501)
     assert flat.status == "unconfirmed" and flat.confirmation is not None
     assert "less than the hinted" in flat.confirmation.detail
+    assert credit_gateway.status_calls == 6
+
+
+async def test_a_count_above_the_listed_credits_is_walked_again_once(make_client, credit_gateway: CreditGateway) -> None:
+    """The credit lands while the walk pages (newer than its cursor): the count is 1 higher; a re-walk finds it."""
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    mine = credit_gateway.credits.pop(0)
+    credit_gateway.credits = _older(150, 1)
+    credit_gateway.credit_count = 151
+
+    def land() -> None:
+        credit_gateway.credits.insert(0, mine)
+        credit_gateway.credit_count = None
+
+    credit_gateway.after_last_page = land
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.confirmed and checked.confirmation is not None and checked.confirmation.pages_read == 3
+    assert [b.get("before") is None for b in credit_gateway.status_bodies] == [True, False, True]
+
+
+async def test_a_count_that_never_matches_falls_back_to_the_baseline(make_client, credit_gateway: CreditGateway) -> None:
+    credit_gateway.register_credit = False
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    credit_gateway.credits = _older(150)
+    credit_gateway.credit_count = 175  # the gateway counts credits it never lists
+    credit_gateway.credited_sompi = 500 + MERCHANT_SHARE
+    no_baseline = await client.confirm_credit(GATEWAY, "demo", response)
+    assert no_baseline.status == "unconfirmed" and no_baseline.confirmation is not None
+    assert "150 of 175 credits read" in no_baseline.confirmation.detail
+    assert no_baseline.confirmation.pages_read == 4  # 2 pages, then one re-walk of 2
+    grew = await client.confirm_credit(GATEWAY, "demo", response, baseline_credited_sompi=500)
+    assert grew.confirmed and grew.confirmation is not None and grew.confirmation.basis == "increase"
+
+
+async def test_a_complete_walk_without_the_credit_does_not_use_the_baseline(
+    make_client, credit_gateway: CreditGateway
+) -> None:
+    credit_gateway.register_credit = False
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    credit_gateway.credits = _older(150)
+    credit_gateway.credited_sompi = 10**12
+    checked = await client.confirm_credit(GATEWAY, "demo", response, baseline_credited_sompi=0)
+    assert checked.status == "unconfirmed" and checked.confirmation is not None
+    assert "lists no credit" in checked.confirmation.detail and checked.confirmation.pages_read == 2
+
+
+async def test_pages_that_do_not_advance_or_repeat_a_credit_are_unconfirmed(
+    make_client, credit_gateway: CreditGateway
+) -> None:
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    credit_gateway.credits = _older(3)
+    credit_gateway.credit_count = 9
+    credit_gateway.raw_status_body = {
+        "merchant_id": str(MERCHANT_ID),
+        "credited_sompi": "0",
+        "credit_balance_sompi": "0",
+        "refundable_sompi": "0",
+        "credit_count": 9,
+        "credits": credit_gateway.credits,
+        "next_cursor": credit_gateway.credits[-1]["credit_id"],
+    }
+    checked = await client.confirm_credit(GATEWAY, "demo", response)
+    assert checked.status == "unconfirmed" and checked.confirmation is not None
+    assert "PaymentReceiptError" in checked.confirmation.detail
+    assert credit_gateway.status_calls <= DEFAULT_PAGE_BUDGET
+
+
+async def test_a_challenge_without_the_informational_balances_is_accepted(
+    make_client, credit_gateway: CreditGateway
+) -> None:
+    credit_gateway.challenge_overrides = {"spendable_sompi": ..., "refundable_sompi": ...}
+    client = make_client(credit_gateway, unavailable_retry_delay=0)
+    response = await client.get("/p/demo")
+    assert (await client.confirm_credit(GATEWAY, "demo", response)).confirmed
+    challenge = sdk.CreditStatusChallenge.model_validate(
+        {
+            "nonce": NONCE,
+            "message": "m",
+            "action": "credits",
+            "slug": "demo",
+            "merchant_id": str(MERCHANT_ID),
+            "payer_address": PAYER,
+            "amount_sompi": "0",
+            "refund_id": None,
+            "expires_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    assert challenge.spendable_sompi is None and challenge.refundable_sompi is None
+
+
+async def test_credit_status_pages_by_hand(make_client, credit_gateway: CreditGateway) -> None:
+    credit_gateway.credits = _older(25)
+    client = make_client(credit_gateway)
+    first = await client.credit_status(GATEWAY, "demo")
+    assert len(first.credits) == 10 and first.credit_count == 25 and first.next_cursor is not None
+    assert credit_gateway.status_bodies[0].keys() == {"nonce", "signature"}  # gateway default page
+    rest = await client.credit_status(GATEWAY, "demo", before=first.next_cursor, limit=20)
+    assert len(rest.credits) == 15 and rest.next_cursor is None
+    assert [c.tx_id for c in first.credits + rest.credits] == [c["tx_id"] for c in credit_gateway.credits]
+    credit_gateway.invalid_cursor_answers = 1
+    with pytest.raises(PaymentRejectedError) as caught:
+        await client.credit_status(GATEWAY, "demo", before=first.next_cursor)
+    assert (caught.value.status_code, caught.value.code) == (400, "invalid_cursor")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit": 0}, {"limit": 101}, {"limit": True}, {"limit": "10"}, {"before": ""}, {"before": "c" * 513}, {"before": 5}],
+)
+async def test_bad_page_arguments_are_refused_before_any_request(
+    make_client, credit_gateway: CreditGateway, kwargs: dict[str, Any]
+) -> None:
+    with pytest.raises(sdk.ConfigurationError):
+        await make_client(credit_gateway).credit_status(GATEWAY, "demo", **kwargs)
+    assert credit_gateway.challenge_calls == 0
+
+
+@pytest.mark.parametrize("budget", [0, 101, True, 1.5])
+def test_the_page_budget_is_bounded(budget: Any) -> None:
+    with pytest.raises(sdk.ConfigurationError):
+        sdk.KasGateClient(PAYER_KEY, credit_page_budget=budget, utxo_provider=object())  # type: ignore[arg-type]
+
+
+def test_our_status_request_is_strict() -> None:
+    good = {"nonce": NONCE, "signature": "ab" * 64}
+    assert sdk.CreditStatusRequest.model_validate(good).body() == good
+    assert sdk.CreditStatusRequest.model_validate(good | {"before": "x", "limit": 100}).body() == good | {
+        "before": "x",
+        "limit": 100,
+    }
+    for bad in (
+        {"extra": 1},
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": "10"},
+        {"limit": True},
+        {"before": ""},
+        {"signature": "AB" * 64},
+        {"nonce": "x"},
+    ):
+        with pytest.raises(ValueError):
+            sdk.CreditStatusRequest.model_validate(good | bad)
+    # Every body the SDK sends is accepted by the gateway's own strict request model.
+    gw.PrepaidCreditStatusRequest.model_validate(sdk.CreditStatusRequest.model_validate(good | {"limit": 100}).body())
+
+
+def test_our_reply_models_refuse_extra_fields() -> None:
+    item = credit_item()
+    with pytest.raises(ValueError):
+        sdk.BuyerCreditItem.model_validate(item | {"extra": 1})
+    with pytest.raises(ValueError):
+        sdk.CreditStatusChallenge.model_validate(
+            {
+                "nonce": NONCE,
+                "message": "m",
+                "action": "credits",
+                "slug": "demo",
+                "merchant_id": str(MERCHANT_ID),
+                "payer_address": PAYER,
+                "amount_sompi": "0",
+                "refund_id": None,
+                "expires_at": datetime.now(UTC).isoformat(),
+                "hold_sompi": "1",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -760,7 +1065,7 @@ async def test_confirm_credit_argument_errors(make_client, credit_gateway: Credi
             await client.confirm_credit(GATEWAY, "demo", hint, baseline_credited_sompi=bad)  # type: ignore[arg-type]
     with pytest.raises(sdk.ConfigurationError):
         await client.confirm_credit(GATEWAY, "demo", "nope")  # type: ignore[arg-type]
-    credit_gateway.credits = [credit_item()]
+    credit_gateway.credits = [credit_item(credit_id=hint.creditId)]
     assert (await client.confirm_credit(GATEWAY, "demo", hint)).confirmed
 
 
@@ -782,7 +1087,7 @@ async def test_auto_confirm_confirms_a_credit_the_status_lists(make_client, cred
     response = await client.get("/p/demo")
     observation = credit_of(response)
     assert observation is not None and observation.status == "confirmed"
-    assert observation.confirmation is not None and observation.confirmation.basis == "tx_id"
+    assert observation.confirmation is not None and observation.confirmation.basis == "credit_id"
     assert (credit_gateway.challenge_calls, credit_gateway.status_calls) == (1, 1)  # once, only because a hint came
 
 
@@ -837,6 +1142,7 @@ def _status(credits: list[dict[str, Any]], *, count: int | None = None, credited
             "refundable_sompi": "0",
             "credit_count": len(credits) if count is None else count,
             "credits": credits,
+            "next_cursor": None,
         }
     )
 
@@ -844,8 +1150,9 @@ def _status(credits: list[dict[str, Any]], *, count: int | None = None, credited
 def test_judge_credit_and_model_strictness() -> None:
     hint, _ = parse_credit_header(receipt_header())
     assert hint is not None
-    listed = _status([credit_item()], credited=MERCHANT_SHARE)
+    listed = _status([credit_item(credit_id=hint.creditId)], credited=MERCHANT_SHARE)
     assert judge_credit(hint, listed).confirmed
+    assert not judge_credit(hint, _status([credit_item()])).confirmed  # same txId, another credit_id
     assert judge_credit(hint, listed, slug="demo").confirmed
     assert not judge_credit(hint, listed, slug="other").confirmed
     assert not judge_credit(hint, _status([])).confirmed

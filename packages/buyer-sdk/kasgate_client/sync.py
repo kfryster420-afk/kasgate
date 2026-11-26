@@ -88,11 +88,18 @@ class KasGateSyncClient:
     ) -> PrepaidDepositReceipt:
         return self._call(self._client.prepaid_deposit(gateway_url, slug, amount_sompi, **kwargs))
 
-    def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
-        return self._call(self._client.prepaid_balance(gateway_url, slug))
+    def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = True) -> PrepaidBalance:
+        return self._call(self._client.prepaid_balance(gateway_url, slug, signed=signed))
 
-    def credit_status(self, gateway_url: str | httpx.URL, slug: str) -> BuyerCreditStatus:
-        return self._call(self._client.credit_status(gateway_url, slug))
+    def credit_status(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+    ) -> BuyerCreditStatus:
+        return self._call(self._client.credit_status(gateway_url, slug, before=before, limit=limit))
 
     def confirm_credit(
         self,

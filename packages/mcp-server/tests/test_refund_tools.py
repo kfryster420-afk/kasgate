@@ -21,6 +21,24 @@ MERCHANT_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
 NONCE = "fedcba9876543210" * 2
 
 
+def signed_read_ok(request: httpx.Request) -> bool:
+    """The buyer-signed read scheme (timestamp + signature headers over the balance-read text)."""
+    import kasgate_client as sdk
+
+    stamp = request.headers.get(sdk.HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(sdk.HEADER_BALANCE_SIGNATURE)
+    if stamp is None or signature is None or not stamp.isdigit():
+        return False
+    message = sdk.build_prepaid_balance_read_message(
+        domain=request.url.netloc.decode("ascii").lower(),
+        address=request.url.params["payer_address"],
+        slug=request.url.params["slug"],
+        timestamp=int(stamp),
+    )
+    public_key = kaspa.PrivateKey(PAYER_KEY).to_public_key().to_x_only_public_key().to_string()
+    return bool(kaspa.verify_message(message, signature, kaspa.PublicKey(public_key)))
+
+
 class RefundGateway:
     def __init__(self) -> None:
         self.spendable = 40_000_000
@@ -28,6 +46,8 @@ class RefundGateway:
         self.amount = 0
         self.action = "request"
         self.refunds: list[dict[str, Any]] = []
+        self.get_reads = 0
+        self.refuse_reads = False
         self.paths: list[str] = []
         self.refund_id = uuid.uuid4()
 
@@ -67,6 +87,9 @@ class RefundGateway:
             )
             return httpx.Response(201, content=challenge.model_dump_json(), headers={"content-type": "application/json"})
         if path == "/v1/prepaid/refunds/status" and request.method == "GET":
+            self.get_reads += 1
+            if self.refuse_reads or not signed_read_ok(request):
+                return httpx.Response(401, json={"error": "invalid_balance_signature", "message": "sign the read"})
             return httpx.Response(200, json=self.refunds)
         signed = gw.PrepaidRefundSigned.model_validate(json.loads(request.content))
         public_key = kaspa.PrivateKey(PAYER_KEY).to_public_key().to_x_only_public_key().to_string()
@@ -126,6 +149,7 @@ async def test_request_list_and_cancel_a_refund() -> None:
         assert data["payout_address"] == PAYER
         listed = structured(await client.call_tool("prepaid_refunds", {"slug": "cheap-api"}))
         assert [r["refund_id"] for r in listed["refunds"]] == [data["refund_id"]]
+        assert fake.get_reads == 1  # the fake answers 401 unless the GET carries a valid signed-read header pair
         cancelled = await client.call_tool(
             "prepaid_refund_cancel", {"slug": "cheap-api", "refund_id": data["refund_id"]}
         )
@@ -159,3 +183,12 @@ async def test_include_reasons_signs_a_status_challenge() -> None:
     assert full["refunds"][0]["reason"] == "promo credit" and full["refunds"][0]["shortfall_sompi"] == 0
     assert full["refunds"][0]["hold_until"] is None and full["refunds"][0]["claim_expires_at"] is None
     assert fake.action == "status" and "Amount: 0" in fake.message
+
+
+async def test_a_refused_refund_list_read_is_a_tool_error() -> None:
+    fake = RefundGateway()
+    fake.refuse_reads = True  # e.g. a clock outside the gateway's window
+    async with Client(make_server(fake)) as client:
+        result = await client.call_tool("prepaid_refunds", {"slug": "cheap-api"})
+    assert result.is_error and "invalid_balance_signature" in result.content[0].text
+    assert PAYER_KEY not in result.content[0].text

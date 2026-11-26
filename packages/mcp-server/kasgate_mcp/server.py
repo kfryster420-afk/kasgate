@@ -15,7 +15,9 @@ from urllib.parse import quote, unquote
 
 import httpx
 from kasgate_client import (
+    DEFAULT_CREDIT_PAGE_BUDGET,
     DEFAULT_MAX_PRICE_SOMPI,
+    MAX_STATUS_CREDITS,
     CreditObservation,
     KasGateClient,
     KasGateError,
@@ -97,6 +99,7 @@ class Config:
     timeout_seconds: float = 60.0
     use_free_trials: bool = True
     auto_confirm_credit: bool = True
+    credit_page_budget: int = DEFAULT_CREDIT_PAGE_BUDGET
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -125,6 +128,12 @@ class Config:
             raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a number of seconds") from exc
         if not 0 < timeout < float("inf"):
             raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a positive number of seconds")
+        try:
+            page_budget = int(env.get("KASGATE_CREDIT_PAGE_BUDGET", str(DEFAULT_CREDIT_PAGE_BUDGET)).strip())
+        except ValueError as exc:
+            raise SystemExit("KASGATE_CREDIT_PAGE_BUDGET must be an integer within 1..100") from exc
+        if not 1 <= page_budget <= 100:
+            raise SystemExit("KASGATE_CREDIT_PAGE_BUDGET must be an integer within 1..100")
         return cls(
             gateway_url=env.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip("/"),
             buyer_private_key=buyer_key,
@@ -135,6 +144,7 @@ class Config:
             timeout_seconds=timeout,
             use_free_trials=env.get("KASGATE_USE_FREE_TRIALS", "1").strip().lower() in TRUTHY,
             auto_confirm_credit=env.get("KASGATE_AUTO_CONFIRM_CREDIT", "1").strip().lower() in TRUTHY,
+            credit_page_budget=page_budget,
         )
 
 
@@ -246,6 +256,7 @@ def _describe_credit(observation: CreditObservation) -> dict[str, Any]:
             "baseline_credited_sompi": confirmation.baseline_credited_sompi,
             "http_status": confirmation.http_status,
             "error_code": confirmation.error_code,
+            "pages_read": confirmation.pages_read,
             "detail": confirmation.detail,
         },
         "error": observation.error,
@@ -314,6 +325,7 @@ def build_server(
                     follow_redirects=False,
                     use_free_trials=cfg.use_free_trials,
                     auto_confirm_credit=cfg.auto_confirm_credit,
+                    credit_page_budget=cfg.credit_page_budget,
                 )
             except KasGateError as exc:
                 raise ToolError(f"cannot start the payment client: {exc}") from exc
@@ -546,7 +558,11 @@ def build_server(
 
     @server.tool()
     async def prepaid_balance(slug: str) -> dict[str, Any]:
-        """Show this buyer key's prepaid balance at the merchant behind `slug` (reads only, signs nothing)."""
+        """Show this buyer key's prepaid balance at the merchant behind `slug`.
+
+        A buyer-signed read (it signs a timestamped balance-read text that authorises no payment, debit or refund),
+        so the gateway includes the balance and ledger totals. `spendable_sompi` is what calls can pay now; a total
+        the gateway does not return is null (never guessed from another field)."""
         slug = validate_slug(slug)
         try:
             balance = await paying_client().prepaid_balance(cfg.gateway_url, slug)
@@ -554,35 +570,45 @@ def build_server(
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
             raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        def sompi(value: str | None) -> int | None:
+            return None if value is None else int(value)
+
+        spendable = sompi(balance.spendable_sompi)
         return {
-            "merchant_id": str(balance.merchant_id),
+            "merchant_id": None if balance.merchant_id is None else str(balance.merchant_id),
             "payer_address": balance.payer_address,
-            "balance_kas": sompi_to_kas(int(balance.balance_sompi)),
-            "balance_sompi": int(balance.balance_sompi),
-            "deposited_sompi": int(balance.deposited_sompi),
-            "debited_sompi": int(balance.debited_sompi),
-            "refunded_sompi": int(balance.refunded_sompi),
-            "expired_sompi": int(balance.expired_sompi),
-            "refund_hold_sompi": int(balance.refund_hold_sompi),
-            "credited_sompi": int(balance.credited_sompi) if balance.credited_sompi is not None else None,
-            "spendable_sompi": int(balance.spendable_sompi)
-            if balance.spendable_sompi is not None
-            else int(balance.balance_sompi),
+            "spendable_kas": None if spendable is None else sompi_to_kas(spendable),
+            "spendable_sompi": spendable,
             "expires_at": balance.expires_at.isoformat() if balance.expires_at else None,
+            "balance_kas": None if balance.balance_sompi is None else sompi_to_kas(int(balance.balance_sompi)),
+            "balance_sompi": sompi(balance.balance_sompi),
+            "deposited_sompi": sompi(balance.deposited_sompi),
+            "debited_sompi": sompi(balance.debited_sompi),
+            "refunded_sompi": sompi(balance.refunded_sompi),
+            "expired_sompi": sompi(balance.expired_sompi),
+            "refund_hold_sompi": sompi(balance.refund_hold_sompi),
+            "credited_sompi": sompi(balance.credited_sompi),
+            "updated_at": balance.updated_at.isoformat() if balance.updated_at else None,
         }
 
     @server.tool()
-    async def get_credit_status(slug: str) -> dict[str, Any]:
+    async def get_credit_status(slug: str, before: str | None = None, limit: int = 10) -> dict[str, Any]:
         """This buyer key's failed-delivery credit at the merchant behind `slug`, from the gateway's SIGNED status.
 
-        Signs one `credits` challenge (it moves no coins and never touches the session budget) and returns lifetime
-        `credited_sompi`, the unspent call-only `credit_balance_sompi` (spend it with call_prepaid_endpoint; never
-        refundable), `refundable_sompi`, `credit_count` and the newest 10 `credits`. A key with no balance gets zeros.
-        This is the check behind `credit.confirmed` on the paid-call tools.
+        Signs one fresh `credits` challenge (it moves no coins and never touches the session budget) and returns
+        lifetime `credited_sompi`, the unspent call-only `credit_balance_sompi` (spend it with call_prepaid_endpoint;
+        never refundable), `refundable_sompi`, `credit_count` (all pages) and one page of `credits`, newest first:
+        `limit` 1..100 (default 10). To read older credits, call again with `before` set to the `next_cursor` of the
+        previous page (null on the last page). A key with no balance gets zeros. The paid-call tools run the same check,
+        page by page, behind `credit.confirmed`.
         """
         slug = validate_slug(slug)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_STATUS_CREDITS:
+            raise ToolError(f"limit must be an integer within 1..{MAX_STATUS_CREDITS}")
+        if before is not None and (not isinstance(before, str) or not 1 <= len(before) <= 512):
+            raise ToolError("before must be the next_cursor of a previous page")
         try:
-            status = await paying_client().credit_status(cfg.gateway_url, slug)
+            status = await paying_client().credit_status(cfg.gateway_url, slug, before=before, limit=limit)
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -597,6 +623,7 @@ def build_server(
             "credit_count": status.credit_count,
             "credits": [
                 {
+                    "credit_id": str(item.credit_id),
                     "tx_id": item.tx_id,
                     "slug": item.slug,
                     "credit_sompi": item.credit_sompi,
@@ -607,9 +634,10 @@ def build_server(
                 }
                 for item in status.credits
             ],
+            "next_cursor": status.next_cursor,
             "note": (
                 "Call-only credit: it can pay calls at this merchant, it is not refundable, and it does not change "
-                "the session budget. `credits` lists only the newest 10 of credit_count."
+                "the session budget. `credits` is one page of credit_count; pass next_cursor as `before` for older ones."
             ),
         }
 
@@ -668,8 +696,9 @@ def build_server(
     async def prepaid_refunds(slug: str, include_reasons: bool = False) -> dict[str, Any]:
         """This buyer key's refund requests at the merchant behind `slug`, newest first.
 
-        By default a public read that signs nothing (the merchant's reject reasons are withheld). With
-        include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
+        By default a buyer-signed read (a timestamped read signature that moves nothing; the gateway refuses unsigned
+        reads with 401), with the merchant's reject reasons withheld. With include_reasons it signs one single-use
+        `status` challenge instead (moves no coins) and returns the reasons too."""
         slug = validate_slug(slug)
         try:
             refunds = await paying_client().prepaid_refunds(cfg.gateway_url, slug, signed=include_reasons)

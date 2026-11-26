@@ -8,10 +8,11 @@ signature, so the SDK never reports a credit as real from the header alone:
 * `credit_of(response)` returns a `CreditObservation` whose status is `hint` (parsed, not checked), `invalid`
   (malformed, oversized or inconsistent with the paid call) or, after the balance check, `confirmed` / `unconfirmed`.
 * `KasGateClient.confirm_credit()` (or `auto_confirm_credit=True`) asks the gateway for the buyer's SIGNED credit
-  status (`POST /v1/prepaid/credits/challenge`, sign the text with the depositing key, `POST /v1/prepaid/credits/status`)
-  and only then says `confirmed`: the status must belong to the hinted merchant and list a credit with the hinted
-  `txId`, amount and reason (at the slug that was called). Only when that payment is not among the newest 10 credits
-  does a caller-supplied `baseline_credited_sompi` allow a weaker `increase` confirmation.
+  status (`POST /v1/prepaid/credits/challenge`, sign the text with the depositing key, `POST /v1/prepaid/credits/status`,
+  one fresh challenge per page) and only then says `confirmed`: the status must belong to the hinted merchant and list
+  a credit whose `credit_id` is the hinted `creditId`, with the hinted `txId`, amount and reason (at the slug that was
+  called). Only when the paged walk could not see every credit (page budget spent, or `credit_count` still above what
+  was listed) does a caller-supplied `baseline_credited_sompi` allow a weaker `increase` confirmation.
 
 A credit is call-only prepaid credit at one merchant: it is not refundable and it is not spend that came back, so it
 never changes a spend budget. Parsing never raises.
@@ -23,6 +24,7 @@ import base64
 import binascii
 import re
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -45,10 +47,19 @@ _BALANCE_SOMPI = r"^(?:0|[1-9][0-9]{0,17})$"
 CREDIT_CHALLENGE_PATH = "/v1/prepaid/credits/challenge"
 CREDIT_STATUS_PATH = "/v1/prepaid/credits/status"
 CREDITS_ACTION = "credits"
-MAX_STATUS_CREDITS = 10
+DEFAULT_CREDIT_STATUS_LIMIT = 10
+"""The gateway's page size when a status request names no `limit`."""
+MAX_STATUS_CREDITS = 100
+"""The largest `limit` (and so the most `credits` on one page) the gateway serves."""
+MAX_CREDIT_CURSOR_CHARS = 512
+"""The gateway refuses longer `before` cursors (400 invalid_cursor); a longer `next_cursor` is not a gateway cursor."""
+DEFAULT_CREDIT_PAGE_BUDGET = 10
+"""Signed status pages one confirmation may read (restart and re-walk included): 1000 credits at 100 per page, well
+inside the gateway's default 30 status calls per minute."""
+MAX_CREDIT_PAGE_BUDGET = 100
 
 CreditStatus = Literal["hint", "confirmed", "unconfirmed", "invalid"]
-ConfirmationBasis = Literal["tx_id", "increase", "none"]
+ConfirmationBasis = Literal["credit_id", "increase", "none"]
 CreditReason = Literal["attempts_exhausted", "window_expired"]
 _NONCE = r"^[0-9a-f]{32}$"
 _SLUG = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
@@ -94,9 +105,9 @@ class CreditConfirmation(BaseModel):
 
     confirmed: bool
     basis: ConfirmationBasis
-    """`tx_id`: the signed status lists a credit with the hinted txId, amount and reason.
-    `increase`: that payment is not among the newest 10 credits, so `credited_sompi` grew by at least the hinted
-    credit since the caller's `baseline_credited_sompi` (a weaker check).
+    """`credit_id`: the signed status lists the hinted creditId with the hinted txId, amount, reason and slug.
+    `increase`: the paged walk could not see every credit (page budget spent or the count never matched), so
+    `credited_sompi` grew by at least the hinted credit since the caller's `baseline_credited_sompi` (a weaker check).
     `none`: the check could not be completed or the status contradicts the hint."""
     credited_sompi: int | None = None
     baseline_credited_sompi: int | None = None
@@ -104,6 +115,8 @@ class CreditConfirmation(BaseModel):
     """The gateway's HTTP status when the check failed because of an error answer."""
     error_code: str | None = None
     """The gateway's `error` code (for example `rate_limited`) when the check failed because of an error answer."""
+    pages_read: int | None = None
+    """Signed status pages read for this check (each one a fresh challenge), when any reply was read."""
     detail: str
 
 
@@ -188,9 +201,28 @@ class CreditStatusChallenge(BaseModel):
     payer_address: str
     amount_sompi: Literal["0"]
     refund_id: None
-    spendable_sompi: Sompi
-    refundable_sompi: Sompi
+    spendable_sompi: Sompi | None = None
+    """Informational only for `credits` (not signed, not a hold); the gateway may drop it."""
+    refundable_sompi: Sompi | None = None
+    """Informational only for `credits` (not signed, not a hold); the signed status body is authoritative."""
     expires_at: datetime
+
+
+class CreditStatusRequest(BaseModel):
+    """`POST /v1/prepaid/credits/status` body this SDK sends: the signed challenge plus an optional page (strict)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    nonce: Annotated[str, Field(pattern=_NONCE)]
+    signature: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+    before: Annotated[str, Field(min_length=1, max_length=MAX_CREDIT_CURSOR_CHARS)] | None = None
+    """The previous page's `next_cursor`; omitted for the newest page."""
+    limit: Annotated[int, Field(ge=1, le=MAX_STATUS_CREDITS)] | None = None
+    """Page size 1..100; omitted means the gateway default (10)."""
+
+    def body(self) -> dict[str, str | int]:
+        """The JSON body, without the fields left unset."""
+        return self.model_dump(exclude_none=True)
 
 
 class BuyerCreditItem(BaseModel):
@@ -198,6 +230,8 @@ class BuyerCreditItem(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    credit_id: uuid.UUID
+    """The ledger entry id; the same value as `creditId` in X-KasGate-Credit."""
     tx_id: Annotated[str, Field(pattern=_TX_ID)]
     slug: Annotated[str, Field(pattern=_SLUG)]
     credit_sompi: Sompi
@@ -209,9 +243,10 @@ class BuyerCreditItem(BaseModel):
 class BuyerCreditStatus(BaseModel):
     """`POST /v1/prepaid/credits/status` reply: this key's failed-delivery credit at one merchant (CONTRACT v2.14).
 
-    Strict: unknown fields, JSON numbers where the gateway sends decimal strings, or more than 10 credits are
+    Strict: unknown fields, JSON numbers where the gateway sends decimal strings, or more than 100 credits are
     refused. Call-only credit (`credit_balance_sompi`) is never refundable; `refundable_sompi` is what a refund may
-    take. `credit_count` is the lifetime number of credits, `credits` only the newest 10."""
+    take. `credit_count` is the number of credits across all pages; `credits` is one page, newest first, and
+    `next_cursor` (null on the last page) is passed as `before` with a NEW challenge to read the next older page."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -221,11 +256,16 @@ class BuyerCreditStatus(BaseModel):
     refundable_sompi: Sompi
     credit_count: Annotated[int, Field(strict=True, ge=0)]
     credits: Annotated[list[BuyerCreditItem], Field(max_length=MAX_STATUS_CREDITS)]
+    next_cursor: Annotated[str, Field(min_length=1, max_length=MAX_CREDIT_CURSOR_CHARS)] | None
 
     @model_validator(mode="after")
     def _count_covers_list(self) -> BuyerCreditStatus:
         if self.credit_count < len(self.credits):
             raise ValueError("credit_count is smaller than the number of credits listed")
+        if len({item.credit_id for item in self.credits}) != len(self.credits):
+            raise ValueError("a credit_id is listed twice")
+        if self.next_cursor is not None and not self.credits:
+            raise ValueError("next_cursor on a page without credits")
         return self
 
 
@@ -266,17 +306,27 @@ def judge_credit(
     *,
     slug: str | None = None,
     baseline_credited_sompi: int | None = None,
+    credits: Sequence[BuyerCreditItem] | None = None,
+    complete: bool | None = None,
+    pages_read: int | None = None,
 ) -> CreditConfirmation:
     """Compare a hint with the buyer's signed credit status.
 
-    Confirmed (`tx_id`) only when the status is for the hinted merchant and lists a credit with the hinted txId whose
-    amount and reason equal the hint's (and whose slug is `slug`, the endpoint that was called, when given). A listed
-    txId with different details contradicts the hint. When the txId is not listed AND older credits exist beyond the
-    newest 10, a `baseline_credited_sompi` (read before the call) allows a weaker `increase` confirmation; without it
-    the hint stays unconfirmed. If every credit is listed and none matches, the hint is simply not a credit.
+    `status` is the newest page (its lifetime `credited_sompi` and `credit_count`); `credits` are all the items read
+    across pages (default: `status.credits`) and `complete` says whether they are every credit there is (default: this
+    page is the last and `credit_count` does not exceed what it lists).
+
+    Confirmed (`credit_id`) only when the status is for the hinted merchant and lists the hinted `creditId` with the
+    hinted txId, amount and reason (and slug `slug`, the endpoint that was called, when given). The hinted creditId
+    with any other detail, or the hinted txId under another credit_id, contradicts the hint. When nothing matches and
+    the walk was complete, the hint is simply not a credit. When it was not complete, a `baseline_credited_sompi`
+    (read before the call) allows a weaker `increase` confirmation; without it the hint stays unconfirmed.
     """
     credited = status.credited_sompi
     amount = hint.credit_sompi
+    items = status.credits if credits is None else credits
+    if complete is None:
+        complete = status.next_cursor is None and status.credit_count <= len(items)
 
     def no(detail: str) -> CreditConfirmation:
         return CreditConfirmation(
@@ -284,13 +334,16 @@ def judge_credit(
             basis="none",
             credited_sompi=credited,
             baseline_credited_sompi=baseline_credited_sompi,
+            pages_read=pages_read,
             detail=detail,
         )
 
     if status.merchant_id != hint.merchantId:
         return no("the credit status belongs to a different merchant than the hint")
-    item = next((entry for entry in status.credits if entry.tx_id == hint.txId), None)
+    item = next((entry for entry in items if entry.credit_id == hint.creditId), None)
     if item is not None:
+        if item.tx_id != hint.txId:
+            return no("the gateway lists this credit_id for another payment than the hinted txId")
         if item.credit_sompi != amount:
             return no(
                 f"the gateway lists this payment with a credit of {item.credit_sompi} sompi, not the hinted {amount}"
@@ -301,17 +354,21 @@ def judge_credit(
             return no(f"the gateway lists this payment at endpoint {item.slug}, not {slug}")
         return CreditConfirmation(
             confirmed=True,
-            basis="tx_id",
+            basis="credit_id",
             credited_sompi=credited,
             baseline_credited_sompi=baseline_credited_sompi,
-            detail=f"the signed credit status lists this payment with a credit of {amount} sompi",
+            pages_read=pages_read,
+            detail=f"the signed credit status lists this credit_id and payment with a credit of {amount} sompi",
         )
-    if status.credit_count <= len(status.credits):
+    if any(entry.tx_id == hint.txId for entry in items):
+        return no("the gateway lists this payment under another credit_id than the hinted creditId")
+    if complete:
         return no("the signed credit status lists no credit for this payment")
+    seen = len(items)
     if baseline_credited_sompi is None:
         return no(
-            f"this payment is not among the newest {MAX_STATUS_CREDITS} credits and no earlier credited_sompi was "
-            "given to compare with"
+            f"this payment is not among the {seen} of {status.credit_count} credits read and no earlier "
+            "credited_sompi was given to compare with"
         )
     grew = credited - baseline_credited_sompi
     if grew >= amount:
@@ -320,9 +377,10 @@ def judge_credit(
             basis="increase",
             credited_sompi=credited,
             baseline_credited_sompi=baseline_credited_sompi,
+            pages_read=pages_read,
             detail=(
-                f"this payment is not among the newest {MAX_STATUS_CREDITS} credits; credited_sompi grew by {grew} "
-                f"sompi since the baseline (hint: {amount})"
+                f"this payment is not among the {seen} of {status.credit_count} credits read; credited_sompi grew by "
+                f"{grew} sompi since the baseline (hint: {amount})"
             ),
         )
     return no(f"credited_sompi grew by {grew} sompi since the baseline, less than the hinted {amount}")

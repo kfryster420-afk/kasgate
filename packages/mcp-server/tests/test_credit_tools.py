@@ -23,7 +23,6 @@ KAS = 100_000_000
 MERCHANT_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
 FEE = max(-(-PRICE * 150 // 10_000), 20_000_000)
 MERCHANT_SHARE = PRICE - FEE
-NONCE = "0123456789abcdef" * 2
 SLUG = "demo-abc123"
 
 
@@ -31,9 +30,9 @@ def xonly(key_hex: str) -> str:
     return kaspa.PrivateKey(key_hex).to_public_key().to_x_only_public_key().to_string()
 
 
-def credit_header(tx_id: str, *, credit: int = MERCHANT_SHARE) -> str:
+def credit_header(tx_id: str, *, credit: int = MERCHANT_SHARE, credit_id: uuid.UUID | None = None) -> str:
     return gw.FailedDeliveryCreditReceipt(
-        creditId=uuid.uuid4(),
+        creditId=credit_id or uuid.uuid4(),
         kind="failed_delivery_credit",
         txId=tx_id,
         merchantId=MERCHANT_ID,
@@ -57,6 +56,9 @@ class CreditWorld:
         self.status_error: tuple[int, str] | None = None
         self.challenge_overrides: dict[str, Any] = {}
         self.used: set[str] = set()
+        self.issued: dict[str, str] = {}  # nonce -> signed text (a fresh nonce per challenge)
+        self.credit_ids: dict[str, uuid.UUID] = {}  # tx_id -> the creditId the header announced
+        self.status_bodies: list[dict[str, Any]] = []
         self.last: dict[str, Any] | None = None
         self.balance_calls = 0
         self.challenge_calls = 0
@@ -73,9 +75,10 @@ class CreditWorld:
             ).to_header()
         }
         if self.header == "auto":
-            headers["X-KasGate-Credit"] = credit_header(tx_id)
+            credit_id = self.credit_ids.setdefault(tx_id, uuid.uuid4())
+            headers["X-KasGate-Credit"] = credit_header(tx_id, credit_id=credit_id)
             if self.register_credit and all(c["tx_id"] != tx_id for c in self.credits):
-                self.credits.insert(0, credit_item(tx_id))
+                self.credits.insert(0, credit_item(tx_id, credit_id=credit_id))
         elif self.header is not None:
             headers["X-KasGate-Credit"] = self.header
         return httpx.Response(
@@ -95,6 +98,7 @@ class CreditWorld:
             status, code = self.challenge_error
             return httpx.Response(status, json={"error": code, "message": "no"})
         expires = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=60)
+        nonce = uuid.uuid4().hex
         message = gw.build_prepaid_refund_message(
             domain="gateway.test",
             action="credits",
@@ -102,14 +106,14 @@ class CreditWorld:
             merchant_id=MERCHANT_ID,
             amount_sompi=0,
             refund_id=None,
-            nonce=NONCE,
+            nonce=nonce,
             expires_at=expires,
         )
-        self.last = {"message": message}
+        self.issued[nonce] = message
         return httpx.Response(
             201,
             json={
-                "nonce": NONCE,
+                "nonce": nonce,
                 "message": message,
                 "action": "credits",
                 "slug": parsed.slug,
@@ -125,23 +129,33 @@ class CreditWorld:
         )
 
     def credit_status(self, body: dict[str, Any]) -> httpx.Response:
-        signed = gw.PrepaidRefundSigned.model_validate(body)
+        signed = gw.PrepaidCreditStatusRequest.model_validate(body)  # the gateway's strict request (limit 1..100)
         self.status_calls += 1
-        assert self.last is not None
-        assert kaspa.verify_message(self.last["message"], signed.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
+        self.status_bodies.append(body)
+        message = self.issued[signed.nonce]
+        assert kaspa.verify_message(message, signed.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
         if self.status_error is not None:
             status, code = self.status_error
             return httpx.Response(status, json={"error": code, "message": "no"})
         if signed.nonce in self.used:
             return httpx.Response(409, json={"error": "challenge_replayed", "message": "used"})
+        ids = [c["credit_id"] for c in self.credits]
+        start = 0
+        if signed.before is not None:
+            if signed.before not in ids:
+                return httpx.Response(400, json={"error": "invalid_cursor", "message": "bad cursor"})
+            start = ids.index(signed.before) + 1
         self.used.add(signed.nonce)
+        page = self.credits[start : start + signed.limit]
+        more = start + signed.limit < len(self.credits)
         reply = {
             "merchant_id": str(MERCHANT_ID),
             "credited_sompi": str(self.credited),
             "credit_balance_sompi": str(self.credited),
             "refundable_sompi": "0",
             "credit_count": len(self.credits),
-            "credits": self.credits[:10],
+            "credits": page,
+            "next_cursor": page[-1]["credit_id"] if more else None,
         }
         gw.BuyerCreditStatus.model_validate(reply)
         return httpx.Response(200, json=reply)
@@ -173,8 +187,9 @@ class CreditWorld:
         return handle
 
 
-def credit_item(tx_id: str, *, credit: int = MERCHANT_SHARE) -> dict[str, Any]:
+def credit_item(tx_id: str, *, credit: int = MERCHANT_SHARE, credit_id: uuid.UUID | None = None) -> dict[str, Any]:
     return {
+        "credit_id": str(credit_id or uuid.uuid4()),
         "tx_id": tx_id,
         "slug": SLUG,
         "credit_sompi": str(credit),
@@ -231,7 +246,8 @@ async def test_a_credit_the_signed_status_lists_is_confirmed() -> None:
     credit = data["credit"]
     assert (credit["status"], credit["confirmed"]) == ("confirmed", True)
     assert credit["credit_sompi"] == MERCHANT_SHARE and credit["credit_kas"] == "14.775"
-    assert credit["confirmation"]["basis"] == "tx_id" and credit["confirmation"]["credited_sompi"] == MERCHANT_SHARE
+    assert credit["confirmation"]["pages_read"] == 1
+    assert credit["confirmation"]["basis"] == "credit_id" and credit["confirmation"]["credited_sompi"] == MERCHANT_SHARE
     assert (world.challenge_calls, world.status_calls) == (1, 1) and world.balance_calls == 0  # no public balance
     assert "not refundable" in credit["note"]
 
@@ -336,6 +352,8 @@ async def test_get_credit_status_lists_this_keys_credits() -> None:
     assert data["credited_kas"] == "14.775"
     [item] = data["credits"]
     assert (item["tx_id"], item["slug"], item["reason"], item["credit_sompi"]) == ("ab" * 32, SLUG, "attempts_exhausted", MERCHANT_SHARE)
+    assert item["credit_id"] == world.credits[0]["credit_id"] and data["next_cursor"] is None
+    assert world.status_bodies[0]["limit"] == 10 and "before" not in world.status_bodies[0]
     assert "not refundable" in data["note"] and PAYER_KEY not in json.dumps(data)
     assert (world.challenge_calls, world.status_calls, world.balance_calls) == (1, 1, 0)
 
@@ -389,3 +407,57 @@ def test_config_flag_defaults_on_and_can_be_switched_off() -> None:
         Config.from_env({"KASGATE_AUTO_CONFIRM_CREDIT": "0"}).auto_confirm_credit
         is False
     )
+
+
+async def test_get_credit_status_pages_with_before_and_limit() -> None:
+    world = CreditWorld()
+    world.credits = [credit_item(f"{i:064x}") for i in range(25)]
+    async with Client(make_world_server(world)) as client:
+        first = structured(await client.call_tool("get_credit_status", {"slug": SLUG, "limit": 20}))
+        rest = structured(
+            await client.call_tool("get_credit_status", {"slug": SLUG, "limit": 20, "before": first["next_cursor"]})
+        )
+        bad_cursor = await client.call_tool("get_credit_status", {"slug": SLUG, "before": "not-a-cursor"})
+    assert (len(first["credits"]), first["credit_count"], len(rest["credits"]), rest["next_cursor"]) == (20, 25, 5, None)
+    assert [c["credit_id"] for c in first["credits"] + rest["credits"]] == [c["credit_id"] for c in world.credits]
+    assert len({b["nonce"] for b in world.status_bodies}) == 3  # a fresh challenge per page
+    assert bad_cursor.is_error and "invalid_cursor" in bad_cursor.content[0].text
+
+
+async def test_get_credit_status_refuses_a_bad_limit_or_cursor_before_any_request() -> None:
+    world = CreditWorld()
+    async with Client(make_world_server(world)) as client:
+        for args in ({"limit": 0}, {"limit": 101}, {"before": ""}, {"before": "c" * 513}):
+            result = await client.call_tool("get_credit_status", {"slug": SLUG} | args)
+            assert result.is_error, args
+    assert world.challenge_calls == 0
+
+
+async def test_a_paid_call_confirms_a_credit_on_an_older_page_and_keeps_the_spend() -> None:
+    world = CreditWorld()
+    world.credits = [credit_item(f"{i:064x}") for i in range(150)]
+
+    def failing_then_bury(request: httpx.Request, parsed: dict[str, Any]) -> httpx.Response:
+        response = world.failing(request, parsed)
+        mine = world.credits.pop(0)
+        world.credits.append(mine)  # pretend 150 newer credits exist: the hinted one is on page 2
+        return response
+
+    world.fake.paid_handler = failing_then_bury
+    data, budget = await call(make_world_server(world), "call_with_budget")
+    credit = data["credit"]
+    assert credit["status"] == "confirmed" and credit["confirmation"]["pages_read"] == 2
+    assert [b["limit"] for b in world.status_bodies] == [100, 100]
+    assert budget["spent_sompi"] == PRICE  # a credit never reduces the spend
+
+
+def test_config_credit_page_budget() -> None:
+    assert Config.from_env({}).credit_page_budget == 10
+    assert Config.from_env({"KASGATE_CREDIT_PAGE_BUDGET": "3"}).credit_page_budget == 3
+    for bad in ("0", "101", "x"):
+        try:
+            Config.from_env({"KASGATE_CREDIT_PAGE_BUDGET": bad})
+        except SystemExit as exc:
+            assert "KASGATE_CREDIT_PAGE_BUDGET" in str(exc)
+        else:
+            raise AssertionError(bad)
