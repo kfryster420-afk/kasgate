@@ -1,5 +1,6 @@
 """FastAPI dependency providers for shared application resources."""
 
+import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from decimal import Decimal
@@ -63,7 +64,11 @@ class PaymentVerifier(Protocol):
     async def settle_exact_v2(self, verification: ExactV2Verification) -> VerifiedPaymentLike: ...
 
     # CONTRACT v2.13 prepaid refund payouts (merchant -> buyer, no platform fee)
-    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None: ...
+    async def verify_payout(
+        self, tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None: ...
+
+    def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str: ...
 
     async def submit_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int

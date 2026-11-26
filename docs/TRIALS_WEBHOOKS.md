@@ -91,7 +91,8 @@ not a private/loopback/link-local/reserved IP literal.
 Event types: `payment.settled` (every /p payment format: kaspa-exact-v1, k402-kaspa-utxo, kaspa-exact-v2),
 `prepaid.deposit`, `prepaid.debit`, `trial.used`, `endpoint.created`, `endpoint.updated`, plus `webhook.test` (only
 from the test-fire route, always delivered to that one webhook). CONTRACT v2.13 adds `prepaid.refund.requested`,
-`prepaid.refund.paid`, `prepaid.refund.rejected`, `prepaid.refund.cancelled` and `prepaid.credit.expired` (payloads
+`prepaid.refund.paid`, `prepaid.refund.rejected`, `prepaid.refund.cancelled`, `prepaid.refund.payout_reverted` and
+`prepaid.credit.expired` (payloads
 in docs/CONTRACTS.md, v2.13).
 
 ### 2.2 Delivery request

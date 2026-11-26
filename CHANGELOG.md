@@ -20,13 +20,42 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   paying calls and is swept into the ledger.
 - Balances report `refunded_sompi`, `expired_sompi`, `refund_hold_sompi`, `spendable_sompi` and `expires_at`.
 - Webhook events `prepaid.refund.requested`, `prepaid.refund.paid`, `prepaid.refund.rejected`,
-  `prepaid.refund.cancelled` and `prepaid.credit.expired`.
+  `prepaid.refund.cancelled`, `prepaid.refund.payout_reverted` and `prepaid.credit.expired`.
 - Buyer SDK: `prepaid_refund_request`, `prepaid_refund_cancel`, `prepaid_refunds` (async and sync).
   MCP server: `prepaid_refund_request`, `prepaid_refund_cancel`, `prepaid_refunds`.
-- Alembic migration `0008_prepaid_refunds` (tables `prepaid_refunds`, `prepaid_ledger_entries`; explicit indexes on
+- Alembic migration `0008_prepaid_refunds` (tables `prepaid_refunds`, `prepaid_refund_payouts`, `prepaid_ledger_entries`; explicit indexes on
   `tx_id`, guarded downgrade).
 - Settings: `LEDGER_WORKER_ENABLED`, `LEDGER_POLL_INTERVAL_SECONDS`, `LEDGER_BATCH_SIZE`,
   `PREPAID_PAYOUT_PENDING_MAX_SECONDS`.
+
+### Security: refund red-team fixes (CONTRACT v2.13, before release)
+
+- Claim/lock: new refund status `paying` (`POST /v1/prepaid/refunds/{id}/claim`, call it before broadcasting). The buyer
+  cannot cancel a claimed refund (the claim lapses after `PREPAID_REFUND_CLAIM_TTL_SECONDS`), and every payout is
+  recorded (`payout_submitted`) BEFORE the node is asked or the transaction is broadcast, so a cancel can no longer race
+  the payout and double-refund.
+- Late payout backstop: a payout that confirms after the refund was cancelled or rejected is still recorded (`paid`
+  with `late_paid_from`, re-debit, `shortfall_sompi`, ledger row, `prepaid.refund.paid`).
+- Payout attempt history: new table `prepaid_refund_payouts` keeps every attempted tx_id (unique index on `tx_id`);
+  pending attempts are re-checked even after a revert, so a payout that lands late is still recorded and the merchant is
+  not asked to pay twice. Only a definite `invalid_payout` resolves an attempt; node errors back off
+  (`PREPAID_PAYOUT_BACKOFF_BASE_SECONDS`, `PREPAID_PAYOUT_BACKOFF_MAX_SECONDS`); unseen attempts are abandoned after
+  `PREPAID_PAYOUT_ATTEMPT_MAX_SECONDS`. Cancel and reject are refused while an attempt is pending. A corrected tx_id is
+  a new attempt; both are kept (`GET /v1/prepaid/refunds/{id}/payouts`). New webhook `prepaid.refund.payout_reverted`.
+- Payload binding: tx_id payouts must carry `kasgate:v1:refund:<id hex>` too (KasWare
+  `sendKaspa(payout_address, amount_sompi, {payload})`), so a buyer's self-transfer or another merchant's payout of
+  the same amount cannot be claimed. `verify_payout` takes the `refund_id`.
+- Payouts are marked paid only after virtual-chain acceptance, also with `SETTLEMENT_MODE=mempool`.
+- `GET /v1/prepaid/refunds/status` no longer shows the merchant's reason or payout errors; the buyer reads them with a
+  signed `status` challenge and `POST /v1/prepaid/refunds/status` (SDK `prepaid_refunds(..., signed=True)`, MCP
+  `prepaid_refunds(include_reasons=true)`).
+- A cancel aimed at the wrong refund no longer burns the challenge. `POST /v1/prepaid/refunds`, `/cancel` and
+  `/status` are rate limited per IP (`RL_PREPAID_REFUND_PER_MINUTE`, default 30).
+- `TRUSTED_PROXY_IPS` (default off): per-IP rate limits honour `X-Forwarded-For` only from those proxies (e.g. the
+  dashboard's Next.js proxy), using the right-most untrusted hop.
+- The refund error codes are now part of the `X402ErrorBody.error` vocabulary; the documented error list also gains
+  `price_unavailable`, `invalid_exact_payment`, `payment_expired`, `insufficient_balance` and `trial_exhausted`.
+- Migration `0008_prepaid_refunds` was revised in place (it is not on main yet).
 
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.

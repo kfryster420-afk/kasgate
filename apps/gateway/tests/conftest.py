@@ -184,8 +184,9 @@ class StubEngine:
         # CONTRACT v2.13 refund payouts: (tx_id, to_address, amount) seen by verify_payout / submit_payout.
         self.payout_checks: list[tuple[str, str, int]] = []
         self.payout_submits: list[tuple[str, bytes, str, int]] = []
+        self.payout_refund_ids: list[uuid.UUID] = []
         self.payout_error: Exception | None = None
-        self.payout_tx_id = "e" * 64
+        self.payout_tx_id_value = "e" * 64
         self.payout_accepted = True
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
@@ -280,11 +281,17 @@ class StubEngine:
             raise self.error
         return verification.payment
 
-    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None:
+    async def verify_payout(
+        self, tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None:
         self.payout_checks.append((tx_id, to_address, amount_sompi))
+        self.payout_refund_ids.append(refund_id)
         self.events.append("verify_payout")
         if self.payout_error is not None:
             raise self.payout_error
+
+    def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
+        return self.payout_tx_id_value
 
     async def submit_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
@@ -293,7 +300,7 @@ class StubEngine:
         self.events.append("submit_payout")
         if self.payout_error is not None:
             raise self.payout_error
-        return self.payout_tx_id, self.payout_accepted
+        return self.payout_tx_id_value, self.payout_accepted
 
     def fail(self, code: str, message: str = "rejected") -> None:
         """Make the submission step (`settle`) fail with a verification error."""

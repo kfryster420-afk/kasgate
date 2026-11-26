@@ -37,6 +37,26 @@ class SubmittingNode(FakeNode):
         return {"transactionId": tx.id}
 
 
+class PayloadMempoolNode(SubmittingNode):
+    """Mempool replies carry each transaction's payload too (kaspad's RpcTransaction does)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payloads: dict[str, str] = {}
+
+    def add_to_mempool(self, tx: Transaction) -> None:
+        super().add_to_mempool(tx)
+        self.payloads[tx.id] = str(tx.to_dict().get("payload") or "")
+
+    async def get_mempool_entries_by_addresses(self, request: dict[str, Any]) -> dict[str, Any]:
+        reply = await super().get_mempool_entries_by_addresses(request)
+        for entry in reply["entries"]:
+            for received in entry["receiving"]:
+                tx = received["transaction"]
+                tx["payload"] = self.payloads.get(tx["verboseData"]["transactionId"], "")
+        return reply
+
+
 def payout_tx(
     outputs: list[tuple[str, int]], *, payload: bytes | None = None, key: PrivateKey = MERCHANT_KEY
 ) -> Transaction:
@@ -80,55 +100,89 @@ def test_output_check_requires_an_exact_output_to_the_buyer() -> None:
     assert info.value.code == "invalid_payout"
 
 
-async def test_engine_finds_an_exact_payout_in_the_mempool_and_the_utxo_index() -> None:
-    tx = payout_tx([(PAYER_ADDRESS, AMOUNT)])
-    node = FakeNode()
+PAYLOAD = refund_payout_payload(REFUND_ID)
+
+
+def bound_tx(outputs: list[tuple[str, int]], *, key: PrivateKey = MERCHANT_KEY) -> Transaction:
+    """A payout carrying THIS refund's payload."""
+    return payout_tx(outputs, payload=PAYLOAD, key=key)
+
+
+async def test_engine_requires_the_refund_payload_and_acceptance() -> None:
+    tx = bound_tx([(PAYER_ADDRESS, AMOUNT)])
+    assert tx.to_dict()["payload"] == PAYLOAD.hex()
+    node = PayloadMempoolNode()
     node.add_to_mempool(tx)
-    await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT)
+    await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
     assert node.calls[:2] == ["sink", "mempool"] and "chain" in node.calls
 
-    accepted = payout_tx([(PAYER_ADDRESS, AMOUNT)])
-    node = FakeNode()
-    node.accept_into_utxo_index(accepted)
-    await make_engine(node).verify_payout(accepted.id, PAYER_ADDRESS, AMOUNT)
-    assert node.calls == ["sink", "mempool", "utxos"]
-
-    node = FakeNode()
+    # Mempool settlement mode does not shortcut payouts: a refund is paid only once its payout is accepted.
+    node = PayloadMempoolNode()
     node.add_to_mempool(tx)
-    await make_engine(node, settlement_mode="mempool").verify_payout(tx.id, PAYER_ADDRESS, AMOUNT)
-    assert node.calls == ["mempool"]
+    node.accept_on_poll = False
+    with pytest.raises(PaymentVerificationError) as info:
+        await make_engine(node, settlement_mode="mempool", settlement_timeout_seconds=0.05).verify_payout(
+            tx.id, PAYER_ADDRESS, AMOUNT, REFUND_ID
+        )
+    assert info.value.code == "payout_unconfirmed"
 
 
-async def test_engine_refuses_a_payout_that_is_not_exact_or_not_to_the_buyer() -> None:
-    node = FakeNode()
-    short = payout_tx([(PAYER_ADDRESS, AMOUNT - 1)])
-    elsewhere = payout_tx([(OTHER_ADDRESS, AMOUNT)])
-    over = payout_tx([(PAYER_ADDRESS, AMOUNT + 1)])
-    for tx in (short, over):
+async def test_an_accepted_payout_counts_only_if_its_payload_was_seen() -> None:
+    accepted = bound_tx([(PAYER_ADDRESS, AMOUNT)])
+    node = PayloadMempoolNode()
+    node.accept_into_utxo_index(accepted)
+    with pytest.raises(PaymentVerificationError) as info:
+        await make_engine(node).verify_payout(accepted.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
+    assert info.value.code == "payload_unverified" and "transaction" in info.value.message
+    await make_engine(node).verify_payout(accepted.id, PAYER_ADDRESS, AMOUNT, REFUND_ID, payload_checked=True)
+    assert node.calls[-3:] == ["sink", "mempool", "utxos"]
+
+
+async def test_engine_refuses_a_payout_that_is_not_exact_unbound_or_not_to_the_buyer() -> None:
+    node = PayloadMempoolNode()
+    cases = [
+        (bound_tx([(PAYER_ADDRESS, AMOUNT - 1)]), f"exactly {AMOUNT}"),
+        (bound_tx([(PAYER_ADDRESS, AMOUNT + 1)]), f"exactly {AMOUNT}"),
+        (payout_tx([(PAYER_ADDRESS, AMOUNT)]), "payload"),  # the right amount, no payload
+        (payout_tx([(PAYER_ADDRESS, AMOUNT)], payload=refund_payout_payload(uuid.uuid4())), "payload"),
+        (payout_tx([(PAYER_ADDRESS, AMOUNT)], payload=b"kasgate:v1:refund:"), "payload"),
+    ]
+    for tx, needle in cases:
         node.add_to_mempool(tx)
         with pytest.raises(PaymentVerificationError) as info:
-            await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT)
-        assert info.value.code == "invalid_payout" and f"exactly {AMOUNT}" in info.value.message
+            await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
+        assert info.value.code == "invalid_payout" and needle in info.value.message, needle
+    elsewhere = bound_tx([(OTHER_ADDRESS, AMOUNT)])
     node.accept_into_utxo_index(elsewhere)
     with pytest.raises(PaymentVerificationError) as info:
-        await make_engine(node).verify_payout(elsewhere.id, PAYER_ADDRESS, AMOUNT)
+        await make_engine(node).verify_payout(elsewhere.id, PAYER_ADDRESS, AMOUNT, REFUND_ID, payload_checked=True)
     assert info.value.code == "payment_not_found"  # nothing reaches the buyer
     with pytest.raises(PaymentVerificationError) as info:
-        await make_engine(node).verify_payout(elsewhere.id, MAINNET_ADDRESS, AMOUNT)
+        await make_engine(node).verify_payout(elsewhere.id, MAINNET_ADDRESS, AMOUNT, REFUND_ID)
     assert info.value.code == "wrong_network"
 
 
-async def test_engine_payout_not_visible_or_not_accepted_is_payment_not_found() -> None:
-    tx = payout_tx([(PAYER_ADDRESS, AMOUNT)])
-    node = FakeNode()
+async def test_engine_payout_not_visible_or_not_accepted_yet() -> None:
+    tx = bound_tx([(PAYER_ADDRESS, AMOUNT)])
+    node = PayloadMempoolNode()
     with pytest.raises(PaymentVerificationError) as info:
-        await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT)
+        await make_engine(node).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
     assert info.value.code == "payment_not_found"
     node.add_to_mempool(tx)
     node.accept_on_poll = False
     with pytest.raises(PaymentVerificationError) as info:
-        await make_engine(node, settlement_timeout_seconds=0.05).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT)
-    assert info.value.code == "payment_not_found"
+        await make_engine(node, settlement_timeout_seconds=0.05).verify_payout(tx.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
+    assert info.value.code == "payout_unconfirmed"
+
+
+async def test_payout_tx_id_checks_locally_and_sends_nothing() -> None:
+    tx = bound_tx([(PAYER_ADDRESS, AMOUNT)])
+    node = SubmittingNode()
+    engine = make_engine(node)
+    assert engine.payout_tx_id(wire(tx), PAYLOAD, PAYER_ADDRESS, AMOUNT) == tx.id
+    with pytest.raises(PaymentVerificationError):
+        engine.payout_tx_id(wire(payout_tx([(PAYER_ADDRESS, AMOUNT)])), PAYLOAD, PAYER_ADDRESS, AMOUNT)
+    assert node.submitted == [] and node.calls == []
 
 
 async def test_engine_submits_a_signed_payout_bound_to_the_refund() -> None:

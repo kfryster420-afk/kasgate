@@ -37,6 +37,8 @@ class RefundGateway:
         if path == "/v1/prepaid/refunds/challenge":
             body = gw.PrepaidRefundChallengeRequest.model_validate(json.loads(request.content))
             amount = body.amount_sompi if body.amount_sompi is not None else self.spendable
+            if body.action == "status":
+                amount = 0
             if body.action == "request" and amount > self.spendable:
                 return httpx.Response(409, json={"error": "insufficient_balance", "message": "too much"})
             expires = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=60)
@@ -64,11 +66,13 @@ class RefundGateway:
                 expires_at=expires,
             )
             return httpx.Response(201, content=challenge.model_dump_json(), headers={"content-type": "application/json"})
-        if path == "/v1/prepaid/refunds/status":
+        if path == "/v1/prepaid/refunds/status" and request.method == "GET":
             return httpx.Response(200, json=self.refunds)
         signed = gw.PrepaidRefundSigned.model_validate(json.loads(request.content))
         public_key = kaspa.PrivateKey(PAYER_KEY).to_public_key().to_x_only_public_key().to_string()
         assert kaspa.verify_message(self.message, signed.signature, kaspa.PublicKey(public_key))
+        if path == "/v1/prepaid/refunds/status":
+            return httpx.Response(200, json=[{**row, "reason": "promo credit"} for row in self.refunds])
         now = datetime.now(UTC).isoformat()
         cancelled = self.action == "cancel"
         refund = {
@@ -143,3 +147,14 @@ async def test_request_all_credit_and_errors_are_tool_errors() -> None:
         assert bad_id.is_error and "UUID" in bad_id.content[0].text
         bad_slug = await client.call_tool("prepaid_refunds", {"slug": "../x"})
         assert bad_slug.is_error
+
+
+async def test_include_reasons_signs_a_status_challenge() -> None:
+    fake = RefundGateway()
+    async with Client(make_server(fake)) as client:
+        await client.call_tool("prepaid_refund_request", {"slug": "cheap-api", "amount_kas": "0.25"})
+        public = structured(await client.call_tool("prepaid_refunds", {"slug": "cheap-api"}))
+        assert public["refunds"][0]["reason"] is None
+        full = structured(await client.call_tool("prepaid_refunds", {"slug": "cheap-api", "include_reasons": True}))
+    assert full["refunds"][0]["reason"] == "promo credit" and full["refunds"][0]["shortfall_sompi"] == 0
+    assert fake.action == "status" and "Amount: 0" in fake.message

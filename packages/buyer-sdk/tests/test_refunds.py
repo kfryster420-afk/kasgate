@@ -51,6 +51,11 @@ class RefundGateway:
         path = request.url.path
         if path == "/v1/prepaid/refunds/challenge":
             return self.challenge(json.loads(request.content))
+        if path == "/v1/prepaid/refunds/status" and request.method == "POST":
+            body = gw.PrepaidRefundSigned.model_validate(json.loads(request.content))
+            assert self.last is not None and self.last["action"] == "status"
+            assert kaspa.verify_message(self.last["message"], body.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
+            return httpx.Response(200, json=[{**row, "reason": "promo credit"} for row in self.refunds])
         if path == "/v1/prepaid/refunds/status":
             return httpx.Response(200, json=self.refunds)
         if path == "/v1/prepaid/refunds" or path.endswith("/cancel"):
@@ -65,6 +70,8 @@ class RefundGateway:
         amount = parsed.amount_sompi if parsed.amount_sompi is not None else SPENDABLE
         if parsed.action == "cancel":
             amount = 25_000_000
+        if parsed.action == "status":
+            amount = 0
         expires = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=60)
         fields: dict[str, Any] = {
             "action": parsed.action,
@@ -113,6 +120,10 @@ class RefundGateway:
             "resolved_at": now.isoformat() if cancelled else None,
             "payout_address": PAYER,
             "payout_payload_hex": gw.refund_payout_payload(self.refund_id).hex(),
+            "payout_payload": gw.refund_payout_payload(self.refund_id).decode(),
+            "claimed_at": None,
+            "late_paid_from": None,
+            "shortfall_sompi": "0",
         }
         self.refunds.insert(0, refund)
         return httpx.Response(200 if cancelled else 201, json=refund)
@@ -237,3 +248,37 @@ async def test_balance_reads_the_v2_13_fields(make_client) -> None:
     balance = await client.prepaid_balance("http://gateway.test", "weather")
     assert (balance.refund_hold_sompi, balance.spendable_sompi) == ("20000000", "20000000")
     assert balance.expires_at is not None and balance.expires_at.year == 2027
+
+
+async def test_signed_status_returns_reasons_and_checks_the_challenge(rgw, make_client) -> None:
+    client: KasGateClient = make_client(rgw)
+    await client.prepaid_refund_request("http://gateway.test", "weather")
+    public = await client.prepaid_refunds("http://gateway.test", "weather")
+    assert public[0].reason is None
+    mine = await client.prepaid_refunds("http://gateway.test", "weather", signed=True)
+    assert mine[0].reason == "promo credit" and mine[0].shortfall_sompi == "0"
+    assert rgw.last is not None and "Action: status" in rgw.last["message"] and "Amount: 0" in rgw.last["message"]
+    rgw.overrides = {"amount_sompi": "1"}  # a status challenge that names an amount is never signed
+    with pytest.raises(InvalidChallengeError):
+        await client.prepaid_refunds("http://gateway.test", "weather", signed=True)
+
+
+def test_paying_and_late_payout_fields_decode() -> None:
+    now = datetime.now(UTC).isoformat()
+    refund = PrepaidRefund.model_validate(
+        {
+            "id": str(uuid.uuid4()),
+            "merchant_id": str(MERCHANT_ID),
+            "payer_address": PAYER,
+            "amount_sompi": "25000000",
+            "status": "paying",
+            "created_at": now,
+            "updated_at": now,
+            "claimed_at": now,
+            "payout_address": PAYER,
+            "payout_payload_hex": "00",
+            "late_paid_from": None,
+            "shortfall_sompi": "0",
+        }
+    )
+    assert refund.status == "paying" and refund.claimed_at is not None

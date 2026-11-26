@@ -78,13 +78,16 @@ Refunds of unused credit (CONTRACT v2.13):
 ```python
 refund = await client.prepaid_refund_request("https://gw.example", "weather")            # all spendable credit
 refund = await client.prepaid_refund_request("https://gw.example", "weather", 25_000_000)  # or an amount (>= 0.2 KAS)
-print(await client.prepaid_refunds("https://gw.example", "weather"))   # status: requested -> paid (tx_id set)
-await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  # only while still `requested`
+print(await client.prepaid_refunds("https://gw.example", "weather"))   # requested -> paying -> payout_submitted -> paid
+print(await client.prepaid_refunds("https://gw.example", "weather", signed=True))  # also the merchant's reasons
+await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  # only while `requested`, no payout pending
 ```
 
 - The request signs a refund text (purpose `kasgate:v1:prepaid-refund`) that the SDK rebuilds itself; it refuses to sign
   for another payer, endpoint, action, refund or amount, or for more than the spendable credit the gateway reported.
   The signature moves no coins: the merchant pays the amount back on-chain to this key's address, with no platform fee.
+- The public list hides the merchant's reject reason; `signed=True` signs a `status` text (amount 0) to read it.
+  `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
 - `prepaid_balance` now also reports `refunded_sompi`, `expired_sompi`, `refund_hold_sompi` (set aside by an open
   refund), `spendable_sompi` and `expires_at` (when the merchant set a credit expiry).
 
