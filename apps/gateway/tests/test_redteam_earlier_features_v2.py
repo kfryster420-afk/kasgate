@@ -31,7 +31,15 @@ from app.schemas import (
 )
 from app.security import UpstreamBlockedError, resolve_public_address
 from app.webhooks import compute_signature, verify_signature
-from tests.conftest import OTHER_ADDRESS, PAYER_ADDRESS, Seed, StubEngine, WebhookReceiver, bearer, seed_endpoint
+from tests.conftest import (
+    OTHER_ADDRESS,
+    PAYER_ADDRESS,
+    Seed,
+    StubEngine,
+    WebhookReceiver,
+    bearer,
+    seed_endpoint,
+)
 from tests.test_prepaid import (
     CREDIT_SOMPI,
     DEPOSIT_SOMPI,
@@ -222,6 +230,148 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
     assert balance <= cap
 
 
+async def test_ten_hanging_debits_and_deposits_never_land_past_the_cap(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_engine: StubEngine,
+    override_settings: Any,
+) -> None:
+    """10 hanging 20M debits and 10 40M deposits at once: in-flight debits serialize on the same row lock as the
+    deposit cap check, so a debit cannot appear after the sum is read. After every 5xx refund, the balance is
+    still at or under the cap."""
+    cap = 80_000_000
+    override_settings(prepaid_max_balance_sompi=cap)
+    await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
+    await fund(client)  # 40_000_000; room for one more 40M credit unless in-flight is ignored
+    release = asyncio.Event()
+
+    async def slow_failure(_request: httpx.Request) -> httpx.Response:
+        await release.wait()
+        return httpx.Response(503, json={"down": True})
+
+    original = app.state.http_client
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(slow_failure), follow_redirects=False)
+    try:
+        challenges = [await get_debit_challenge(client, slug="half") for _ in range(10)]
+        quotes = [await quote_deposit(client) for _ in range(10)]
+        debit_tasks = [
+            asyncio.create_task(client.get("/p/half", headers={HEADER_PREPAID_DEBIT: debit_header(c)}))
+            for c in challenges
+        ]
+        deposit_tasks = [
+            asyncio.create_task(post_deposit(client, q, tx_id=f"{i:02x}" * 32)) for i, q in enumerate(quotes)
+        ]
+        deposit_resps = await asyncio.gather(*deposit_tasks)
+        release.set()
+        debit_resps = await asyncio.gather(*debit_tasks)
+    finally:
+        await app.state.http_client.aclose()
+        app.state.http_client = original
+
+    assert all(r.status_code in {201, 422} for r in deposit_resps), [r.text for r in deposit_resps]
+    won = [t for t, r in zip((f"{i:02x}" * 32 for i in range(10)), deposit_resps, strict=True) if r.status_code == 201]
+    assert len(won) <= 1
+    assert set(won) <= set(stub_engine.calls)
+    # At most two 20M debits can leave the 40M (or 80M if a deposit landed first) spendable balance.
+    assert sum(r.status_code == 503 for r in debit_resps) <= 4
+    assert all(r.status_code in {200, 402, 409, 503} for r in debit_resps)
+    balance = await _balance(sessionmaker)
+    assert balance is not None and balance <= cap
+
+
+async def test_a_completed_2xx_debit_frees_cap_room(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: Any,
+) -> None:
+    """A finished 2xx debit (status=debited, code set) is not reserved, so a 40M top-up onto the remaining
+    20M fits the 60M cap. The same top-up is refused while a 20M debit is still in flight (next test)."""
+    cap = 60_000_000
+    override_settings(prepaid_max_balance_sompi=cap)
+    await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
+    await fund(client)
+    spent = await client.get(
+        "/p/half",
+        headers={HEADER_PREPAID_DEBIT: debit_header(await get_debit_challenge(client, slug="half"))},
+    )
+    assert spent.status_code == 200, spent.text
+    assert await _balance(sessionmaker) == 20_000_000
+    topped = await post_deposit(client, await quote_deposit(client), tx_id="2a" * 32)
+    assert topped.status_code == 201, topped.text
+    assert await _balance(sessionmaker) == cap
+
+
+async def test_an_in_flight_debit_has_no_sweeper_and_blocks_the_top_up_a_2xx_would_allow(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: Any,
+) -> None:
+    """Cap 60M, funded 40M, 20M debit hanging: the quote is issued (it sees only the 20M current balance)
+    but the deposit is 422 because of the in-flight reservation. A pause does not clear it (no ledger
+    sweep). After the 5xx refund the balance is 40M, under the cap."""
+    cap = 60_000_000
+    override_settings(prepaid_max_balance_sompi=cap)
+    await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
+    await fund(client)
+    release = asyncio.Event()
+    reached = asyncio.Event()
+
+    async def slow_failure(_request: httpx.Request) -> httpx.Response:
+        reached.set()
+        await release.wait()
+        return httpx.Response(503, json={"down": True})
+
+    original = app.state.http_client
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(slow_failure), follow_redirects=False)
+    try:
+        challenge = await get_debit_challenge(client, slug="half")
+        call = asyncio.create_task(client.get("/p/half", headers={HEADER_PREPAID_DEBIT: debit_header(challenge)}))
+        await asyncio.wait_for(reached.wait(), 5)
+        quote = await quote_deposit(client)
+        await asyncio.sleep(0.2)
+        blocked = await post_deposit(client, quote, tx_id="2b" * 32)
+        assert blocked.status_code == 422, blocked.text
+        assert blocked.json()["error"] == "prepaid_cap_exceeded"
+        release.set()
+        assert (await call).status_code == 503
+    finally:
+        await app.state.http_client.aclose()
+        app.state.http_client = original
+
+    assert await _balance(sessionmaker) == CREDIT_SOMPI
+
+
+async def test_a_2xx_debit_is_not_refunded_and_cannot_exceed_the_cap(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: Any,
+) -> None:
+    """The only refund_prepaid_debit callers are the 5xx and no-response branches; a 2xx records the status
+    code and leaves the debit in place, so there is no late refund that could rebuild the N1 overflow."""
+    from sqlalchemy import select as sel
+
+    from app.models import PrepaidDebit
+
+    cap = 60_000_000
+    override_settings(prepaid_max_balance_sompi=cap)
+    await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
+    await fund(client)
+    ok = await client.get(
+        "/p/half", headers={HEADER_PREPAID_DEBIT: debit_header(await get_debit_challenge(client, slug="half"))}
+    )
+    assert ok.status_code == 200, ok.text
+    async with sessionmaker() as session:
+        row = (await session.execute(sel(PrepaidDebit))).scalar_one()
+        assert (row.status, row.upstream_status_code) == ("debited", 200)
+    assert await _balance(sessionmaker) == 20_000_000
+
+
 # ---------------------------------------------------------------- L1 SSRF
 
 
@@ -232,7 +382,12 @@ SSRF_REFUSED = [
     "::ffff:127.0.0.1",  # v4-mapped
     "64:ff9b::7f00:1",  # NAT64 well-known
     "64:ff9b::a9fe:a9fe",
+    "64:ff9b::",  # the NAT64 prefix itself
     "64:ff9b:1::a9fe:a9fe",  # NAT64 local-use (RFC 8215)
+    "::ffff:0:7f00:1",  # SIIT IPv4-translated (N2)
+    "::ffff:0:a9fe:a9fe",
+    "::ffff:0:808:808",  # SIIT of a public IPv4, still refused as the whole block
+    "0:0:0:0:ffff:0:0:1",
     "2002:7f00:1::",  # 6to4 of 127.0.0.1
     "2002:a9fe:a9fe::",
     "2001:0:4136:e378:8000:63bf:80ff:fffe",  # Teredo
@@ -450,6 +605,102 @@ async def test_hole_unsigned_refund_status_still_reveals_the_hidden_refund_total
     open_amounts = [r["amount_sompi"] for r in refunds if r["status"] in ("requested", "paying", "payout_submitted")]
     assert open_amounts == ["20000000"]
     assert refunds[0]["reason"] is None
+
+
+async def test_refunds_status_rejects_cross_slug_cross_address_and_spoofed_domain(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+) -> None:
+    await fund(client)
+    await open_refund(client, 20_000_000)
+    params = {"slug": "cheap", "payer_address": PAYER_ADDRESS}
+    cross_slug = await client.get(
+        "/v1/prepaid/refunds/status", params=params, headers=refunds_status_headers(slug="weather")
+    )
+    assert cross_slug.status_code == 401, cross_slug.text
+    assert cross_slug.json()["error"] == "invalid_balance_signature"
+    assert "20000000" not in cross_slug.text
+
+    # Signed for the payer, but the query names someone else: the gateway rebuilds the message from the query.
+    cross_address = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": "cheap", "payer_address": OTHER_ADDRESS},
+        headers=refunds_status_headers(),
+    )
+    assert cross_address.status_code == 401, cross_address.text
+
+    spoofed = await client.get(
+        "/v1/prepaid/refunds/status", params=params, headers=refunds_status_headers(domain="evil.example")
+    )
+    assert spoofed.status_code == 401, spoofed.text
+
+    # Host is not the Domain: auth_domain() comes from PUBLIC_BASE_URL, so a spoofed Host still verifies.
+    host = await client.get(
+        "/v1/prepaid/refunds/status",
+        params=params,
+        headers={**refunds_status_headers(), "Host": "evil.example"},
+    )
+    assert host.status_code == 200, host.text
+    assert [r["amount_sompi"] for r in host.json()] == ["20000000"]
+
+
+async def test_refunds_status_timestamp_window_edges_and_replay(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """abs(now - timestamp) > 300 is refused; 300 is accepted. The same signed headers can be replayed for
+    the whole window: there is no nonce or jti (documented — a read-only signature)."""
+    import app.prepaid as prepaid
+
+    await fund(client)
+    await open_refund(client, 20_000_000)
+    now = 1_800_000_000
+    monkeypatch.setattr(prepaid.time, "time", lambda: now)
+    params = {"slug": "cheap", "payer_address": PAYER_ADDRESS}
+
+    for delta, status in ((-300, 200), (300, 200), (-301, 401), (301, 401)):
+        response = await client.get(
+            "/v1/prepaid/refunds/status", params=params, headers=refunds_status_headers(timestamp=now + delta)
+        )
+        assert response.status_code == status, (delta, response.text)
+        if status == 401:
+            assert response.json()["error"] == "invalid_balance_signature"
+            assert "20000000" not in response.text
+
+    headers = refunds_status_headers(timestamp=now)
+    first = await client.get("/v1/prepaid/refunds/status", params=params, headers=headers)
+    second = await client.get("/v1/prepaid/refunds/status", params=params, headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+
+
+async def test_unsigned_spendable_does_not_reveal_the_hidden_totals(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+) -> None:
+    """spendable_sompi is public, so a drop can be observed, but deposited, debited, refunded, expired, hold
+    and balance stay hidden and cannot be recovered from one unsigned read (on-chain deposits are a separate
+    public source)."""
+    await fund(client)
+    params = {"slug": "cheap", "payer_address": PAYER_ADDRESS}
+    before = (await client.get("/v1/prepaid/balance", params=params)).json()
+    await open_refund(client, 20_000_000)
+    after = (await client.get("/v1/prepaid/balance", params=params)).json()
+    hidden = (
+        "merchant_id",
+        "payer_address",
+        "balance_sompi",
+        "deposited_sompi",
+        "debited_sompi",
+        "updated_at",
+        "refunded_sompi",
+        "expired_sompi",
+        "refund_hold_sompi",
+    )
+    assert all(after[name] is None for name in hidden)
+    assert after["spendable_sompi"] == str(int(before["spendable_sompi"]) - 20_000_000)
+    # The drop equals the new hold, but the hold field itself stays null, and lifetime totals are absent.
 
 
 # ---------------------------------------------------------------- 429 shape
