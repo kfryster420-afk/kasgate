@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     # POST /v1/webhooks/{id}/test per merchant per minute, and how many settled test events are kept per webhook.
     rl_webhook_test_per_minute: int = Field(default=10, ge=1)
     webhook_test_events_kept: int = Field(default=20, ge=1, le=1000)
+    # rotate-secret: how long the previous secret keeps signing deliveries alongside the new one.
+    webhook_secret_overlap_seconds: int = Field(default=86_400, ge=0, le=7 * 86_400)
 
     @property
     def address_prefix(self) -> str:

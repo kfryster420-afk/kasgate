@@ -1786,6 +1786,11 @@ class WebhookRead(ReadModel):
 class WebhookCreated(BaseModel):
     webhook: WebhookRead
     secret: str = Field(description="HMAC-SHA256 signing secret (whsec_...). Shown once; store it now.")
+    previous_secret_expires_at: datetime | None = Field(
+        default=None,
+        description="rotate-secret only: until then every delivery also carries a v1= signature made with the "
+        "secret this rotation replaced (null on create, or when the overlap is configured to 0).",
+    )
 
 
 class WebhookDeliveryRead(BaseModel):

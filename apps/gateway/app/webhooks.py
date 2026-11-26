@@ -23,14 +23,15 @@ import logging
 import secrets
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
 import httpx
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis.asyncio import Redis
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -88,15 +89,62 @@ def generate_webhook_secret() -> str:
     return f"{SECRET_PREFIX}{secrets.token_urlsafe(32)}"
 
 
+class _SecretEnvelope(BaseModel):
+    """What `webhooks.secret_encrypted` decrypts to after a rotation: the new secret plus the replaced one and the
+    unix second its overlap ends. A webhook never rotated stores the bare secret string (no schema change)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    v: Literal[1]
+    current: str = Field(min_length=1)
+    previous: str = Field(min_length=1)
+    previous_until: int = Field(ge=0)
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookSecrets:
+    current: str
+    previous: str | None = None
+    previous_until: int | None = None  # unix seconds
+
+    def signing_secrets(self, now: int) -> list[str]:
+        """The secrets a delivery made at `now` is signed with: the current one first, then the previous one while
+        its overlap lasts."""
+        if self.previous is not None and self.previous_until is not None and now < self.previous_until:
+            return [self.current, self.previous]
+        return [self.current]
+
+
 def encrypt_secret(secret: str) -> bytes:
     return get_fernet().encrypt(secret.encode("utf-8"))
 
 
-def decrypt_secret(token: bytes) -> str:
+def encrypt_secrets(secrets_: WebhookSecrets) -> bytes:
+    if secrets_.previous is None or secrets_.previous_until is None:
+        return encrypt_secret(secrets_.current)
+    envelope = _SecretEnvelope(
+        v=1, current=secrets_.current, previous=secrets_.previous, previous_until=secrets_.previous_until
+    )
+    return get_fernet().encrypt(envelope.model_dump_json().encode("utf-8"))
+
+
+def decrypt_secrets(token: bytes) -> WebhookSecrets:
     try:
-        return get_fernet().decrypt(bytes(token)).decode("utf-8")
+        plain = get_fernet().decrypt(bytes(token)).decode("utf-8")
     except InvalidToken as exc:
         raise ValueError("webhook secret cannot be decrypted with the configured ENCRYPTION_KEY") from exc
+    if not plain.startswith("{"):  # a bare whsec_ secret (never rotated, or rotated with no overlap)
+        return WebhookSecrets(current=plain)
+    try:
+        envelope = _SecretEnvelope.model_validate_json(plain)
+    except ValidationError as exc:
+        raise ValueError("stored webhook secret envelope is malformed") from exc
+    return WebhookSecrets(current=envelope.current, previous=envelope.previous, previous_until=envelope.previous_until)
+
+
+def decrypt_secret(token: bytes) -> str:
+    """The current signing secret."""
+    return decrypt_secrets(token).current
 
 
 def compute_signature(secret: str, timestamp: int, body: bytes) -> str:
@@ -105,8 +153,12 @@ def compute_signature(secret: str, timestamp: int, body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
 
 
-def signature_header(secret: str, timestamp: int, body: bytes) -> str:
-    return f"t={timestamp},v1={compute_signature(secret, timestamp, body)}"
+def signature_header(secret: str, timestamp: int, body: bytes, *, also: Sequence[str] = ()) -> str:
+    """`t=<unix>,v1=<hex>`; with `also` (the previous secret during a rotation overlap) one more `v1=` per extra
+    secret, current first, Stripe-style. Receivers accept the delivery when any `v1=` verifies."""
+    parts = [f"t={timestamp}"]
+    parts.extend(f"v1={compute_signature(key, timestamp, body)}" for key in (secret, *also))
+    return ",".join(parts)
 
 
 def verify_signature(
@@ -327,6 +379,7 @@ async def send_webhook(
     *,
     url: str,
     secret: str,
+    previous_secrets: Sequence[str] = (),
     delivery_id: uuid.UUID,
     event_id: str,
     event_type: str,
@@ -343,7 +396,7 @@ async def send_webhook(
         WEBHOOK_EVENT_TYPE_HEADER: event_type,
         WEBHOOK_DELIVERY_ID_HEADER: str(delivery_id),
         WEBHOOK_TIMESTAMP_HEADER: str(stamp),
-        WEBHOOK_SIGNATURE_HEADER: signature_header(secret, stamp, body),
+        WEBHOOK_SIGNATURE_HEADER: signature_header(secret, stamp, body, also=previous_secrets),
     }
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -478,13 +531,17 @@ async def attempt(client: httpx.AsyncClient, claimed: ClaimedDelivery, settings:
     if not claimed.webhook_active:
         return AttemptResult(ok=False, status_code=None, error="webhook is disabled", retry=False)
     try:
-        secret = decrypt_secret(claimed.secret_encrypted)
+        stored = decrypt_secrets(claimed.secret_encrypted)
     except ValueError as exc:
         return AttemptResult(ok=False, status_code=None, error=str(exc), retry=False)
+    stamp = int(time.time())
+    current, *previous = stored.signing_secrets(stamp)
     return await send_webhook(
         client,
         url=claimed.url,
-        secret=secret,
+        secret=current,
+        previous_secrets=previous,
+        timestamp=stamp,
         delivery_id=claimed.id,
         event_id=claimed.event_id,
         event_type=claimed.event_type,
@@ -709,13 +766,28 @@ async def delete_webhook(webhook_id: uuid.UUID, merchant: CurrentMerchant, sessi
 
 @router.post("/{webhook_id}/rotate-secret", response_model=WebhookCreated)
 async def rotate_secret(webhook_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession) -> WebhookCreated:
+    """New secret, shown once. The replaced secret keeps signing too (a second `v1=`) for
+    `webhook_secret_overlap_seconds` (default 24 h) so receivers can switch over without dropping deliveries.
+    Rotating again inside the window replaces the previous secret with the one being rotated out now."""
     hook = await _owned_webhook(session, merchant, webhook_id)
+    try:
+        replaced = decrypt_secret(bytes(hook.secret_encrypted))
+    except ValueError:
+        replaced = None  # undecryptable (ENCRYPTION_KEY changed): nothing usable to keep, rotate without overlap
     secret = generate_webhook_secret()
-    hook.secret_encrypted = encrypt_secret(secret)
+    overlap = get_settings().webhook_secret_overlap_seconds
+    expires_at: datetime | None = None
+    stored = WebhookSecrets(current=secret)
+    if replaced is not None and overlap > 0:
+        expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=overlap)
+        stored = WebhookSecrets(current=secret, previous=replaced, previous_until=int(expires_at.timestamp()))
+    hook.secret_encrypted = encrypt_secrets(stored)
     hook.secret_prefix = _secret_prefix(secret)
     await session.commit()
     await session.refresh(hook)
-    return WebhookCreated(webhook=WebhookRead.model_validate(hook), secret=secret)
+    return WebhookCreated(
+        webhook=WebhookRead.model_validate(hook), secret=secret, previous_secret_expires_at=expires_at
+    )
 
 
 @router.post("/{webhook_id}/test", response_model=WebhookDeliveryRead)

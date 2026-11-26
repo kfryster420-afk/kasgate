@@ -179,7 +179,8 @@ def verify_webhook_signature(
 ) -> bool:
     """True when `X-KasGate-Signature` (`t=<unix>,v1=<hex>`) signs exactly `body` (the RAW request bytes, before any
     JSON parsing) with `secret` and its timestamp is within `tolerance_seconds` of now. Constant-time compare;
-    reject the delivery when this is False and dedupe accepted ones on `X-KasGate-Event-Id`."""
+    reject the delivery when this is False and dedupe accepted ones on `X-KasGate-Event-Id`. For 24 h after a
+    rotate-secret the header carries a second `v1=` (the replaced secret); a match on any `v1=` is enough."""
     timestamp: int | None = None
     candidates: list[str] = []
     for part in signature_header.split(","):

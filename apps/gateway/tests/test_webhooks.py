@@ -30,11 +30,15 @@ from app.schemas import (
 from app.security import build_webhook_client
 from app.webhooks import (
     WebhookDispatcher,
+    WebhookSecrets,
     backoff_seconds,
     claim_due,
     compute_signature,
     decrypt_secret,
+    decrypt_secrets,
     deliver_due,
+    encrypt_secret,
+    encrypt_secrets,
     enqueue_event,
     record_result,
     send_webhook,
@@ -164,6 +168,73 @@ async def test_create_shows_secret_once_and_stores_it_encrypted(
     assert rotated.status_code == 200
     assert rotated.json()["secret"] != created.secret
 
+
+async def test_rotation_keeps_the_previous_secret_signing_for_the_overlap(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+) -> None:
+    created = await create_hook(client, seeded, ["trial.used"])
+    before = datetime.now(UTC)
+    response = await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))
+    assert response.status_code == 200, response.text
+    rotated = WebhookCreated.model_validate(response.json())
+    assert rotated.previous_secret_expires_at is not None
+    assert abs((rotated.previous_secret_expires_at - before).total_seconds() - 86_400) < 5
+    assert rotated.webhook.secret_prefix == rotated.secret[:10]
+    async with sessionmaker() as session:
+        stored = bytes((await session.execute(select(Webhook.secret_encrypted))).scalar_one())
+    assert decrypt_secret(stored) == rotated.secret
+    assert created.secret.encode() not in stored and rotated.secret.encode() not in stored
+
+    fired = await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    assert fired.json()["status"] == "succeeded"
+    [request] = webhook_receiver.requests
+    header = request.headers[WEBHOOK_SIGNATURE_HEADER]
+    stamp = int(request.headers[WEBHOOK_TIMESTAMP_HEADER])
+    assert header == (
+        f"t={stamp},v1={compute_signature(rotated.secret, stamp, request.content)}"
+        f",v1={compute_signature(created.secret, stamp, request.content)}"
+    )
+    assert verify_signature(rotated.secret, header, request.content)
+    assert verify_signature(created.secret, header, request.content)  # receivers not yet switched keep working
+
+    again = WebhookCreated.model_validate(
+        (await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))).json()
+    )
+    await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    header = webhook_receiver.requests[-1].headers[WEBHOOK_SIGNATURE_HEADER]
+    body = webhook_receiver.requests[-1].content
+    assert header.count("v1=") == 2
+    assert verify_signature(again.secret, header, body) and verify_signature(rotated.secret, header, body)
+    assert not verify_signature(created.secret, header, body)  # only the most recently replaced secret overlaps
+
+
+async def test_rotation_with_no_overlap_signs_with_the_new_secret_only(
+    client: httpx.AsyncClient, seeded: Seed, webhook_receiver: WebhookReceiver, override_settings: Any
+) -> None:
+    override_settings(webhook_secret_overlap_seconds=0)
+    created = await create_hook(client, seeded, ["trial.used"])
+    rotated = (await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key)))
+    assert rotated.json()["previous_secret_expires_at"] is None
+    await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    [request] = webhook_receiver.requests
+    header = request.headers[WEBHOOK_SIGNATURE_HEADER]
+    assert header.count("v1=") == 1
+    assert verify_signature(rotated.json()["secret"], header, request.content)
+    assert not verify_signature(created.secret, header, request.content)
+
+
+def test_previous_secret_stops_signing_when_the_overlap_ends() -> None:
+    stored = WebhookSecrets(current="whsec_new", previous="whsec_old", previous_until=1_800_086_400)
+    assert stored.signing_secrets(1_800_086_399) == ["whsec_new", "whsec_old"]
+    assert stored.signing_secrets(1_800_086_400) == ["whsec_new"]
+    assert decrypt_secrets(encrypt_secrets(stored)) == stored
+    assert decrypt_secrets(encrypt_secret("whsec_bare")) == WebhookSecrets(current="whsec_bare")
+    assert signature_header("whsec_new", 5, b"{}", also=["whsec_old"]) == (
+        f"t=5,v1={compute_signature('whsec_new', 5, b'{}')},v1={compute_signature('whsec_old', 5, b'{}')}"
+    )
 
 async def test_webhook_crud_is_merchant_scoped(
     client: httpx.AsyncClient, seeded: Seed, sessionmaker: async_sessionmaker[AsyncSession]
