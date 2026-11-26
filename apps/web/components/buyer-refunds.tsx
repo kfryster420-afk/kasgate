@@ -395,7 +395,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                           <p className={`mt-1 max-w-[280px] text-[11px] ${Date.parse(refund.hold_until) > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
                             {Date.parse(refund.hold_until) > now
                               ? `Cooldown: this amount stays held until ${formatDateTime(refund.hold_until)} because the merchant had started paying it. If their payout lands before then, it is recorded as paid; otherwise the credit is spendable again.`
-                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released.`}
+                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released once no payout of this refund is still being checked.`}
                           </p>
                         ) : null}
                         {payoutFound?.refundId === refund.id ? (

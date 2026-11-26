@@ -348,7 +348,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
             <p className={`mt-1 max-w-[280px] text-[11px] ${holdEnds > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
               {holdEnds > now
                 ? `Cooldown: the amount stays held until ${formatDateTime(refund.hold_until ?? "")} because you had claimed it. A payout that lands before then is still recorded and debited in full.`
-                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released.`}
+                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released once no payout attempt for this refund is still pending.`}
             </p>
           ) : null}
           {reverted ? (
