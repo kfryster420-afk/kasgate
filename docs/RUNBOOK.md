@@ -78,6 +78,20 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"                   
 | `REDELIVERY_WINDOW_SECONDS` | `600` | How long after settlement a buyer may re-present the same signature to get the upstream response again (0 to 3600). |
 | `REDELIVERY_MAX_ATTEMPTS` | `3` | Maximum upstream deliveries per settlement (0 to 10). |
 | `SESSION_TTL_SECONDS` | `604800` | Dashboard session lifetime (7 days). |
+| `LEDGER_WORKER_ENABLED` | `true` | CONTRACT v2.13 prepaid ledger worker: expires due credit and re-checks refund payouts that were not visible yet. Safe on several replicas. |
+| `LEDGER_POLL_INTERVAL_SECONDS` | `30` | Pause between ledger worker passes. |
+| `LEDGER_BATCH_SIZE` | `100` | Balances expired and payouts re-checked per pass. |
+| `PREPAID_PAYOUT_PENDING_MAX_SECONDS` | `86400` | A refund still not confirmed after this long goes back to `requested` (the merchant can pay again); its attempted tx_ids stay on record and keep being re-checked. |
+| `PREPAID_PAYOUT_ATTEMPT_MAX_SECONDS` | `604800` | An attempted payout tx_id never confirmed for this long is `abandoned` (re-checks stop; the buyer may cancel again). |
+| `PREPAID_PAYOUT_BACKOFF_BASE_SECONDS` / `PREPAID_PAYOUT_BACKOFF_MAX_SECONDS` | `30` / `1800` | Re-check backoff after a node error on an attempted payout (doubles per error). Node errors never revert a payout. |
+| `PREPAID_REFUND_CLAIM_TTL_SECONDS` | `900` | How long a merchant's claim (`paying`) blocks the buyer's cancel without a posted payout. |
+| `PREPAID_REFUND_CLAIM_MAX_SECONDS` | `3600` | Total claim time from the first claim (`first_claimed_at`); renewals past it are refused. `first_claimed_at` survives a payout revert, so after this window a reverted refund cannot be claimed again (the merchant pays unclaimed, or rejects); the pre-cancel scan and cooldown still apply. |
+| `PREPAID_REFUND_CANCEL_COOLDOWN_SECONDS` | `1800` | After the buyer cancels a refund the merchant had claimed, the amount stays held this long (`hold_until`) before it is spendable again. `0` releases at once. |
+| `PREPAID_PAYOUT_MAX_PENDING_ATTEMPTS` | `3` | Unconfirmed payout attempts allowed per refund (409 `too_many_attempts` beyond). |
+| `PREPAID_PAYOUT_UNSEEN_BACKOFF_FRACTION` | `0.1` | An unseen attempt is re-checked after its age x this fraction (capped by `PREPAID_PAYOUT_BACKOFF_MAX_SECONDS`). |
+| `RL_REFUND_PAYOUT_PER_MERCHANT_PER_MINUTE` | `20` | `POST /v1/prepaid/refunds/{id}/payout` per merchant per minute. |
+| `RL_PREPAID_REFUND_PER_MINUTE` | `30` | Signed refund writes per client IP per minute (`POST /v1/prepaid/refunds`, `/cancel`, `/status`). |
+| `TRUSTED_PROXY_IPS` | `[]` | JSON list of the exact IPs of your own reverse proxies, e.g. `["172.30.0.10"]` for a proxy container with a fixed address on the compose network (`ipv4_address`). Only from these peers is `X-Forwarded-For` used for per-IP rate limits (right-most hop that is not a trusted proxy). Empty = off: behind a proxy every client then shares the proxy's bucket. **Never list a Docker bridge or host network range** (e.g. `172.16.0.0/12`, `10.0.0.0/8`): with port publishing, every client's traffic can arrive from the bridge gateway IP, and it could then pick its own rate-limit bucket via `X-Forwarded-For`. The proxy must set `X-Forwarded-For` to the real client IP; the web app's server-side gateway calls do not do that yet, so listing the Next.js container changes nothing until they do. |
 
 ### Web variables
 
@@ -513,7 +527,40 @@ SQL
 ```
 
 Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows, contact the affected merchant about their upstream, and decide on a manual refund policy (the gateway has no refund function). Tell merchants this behaviour in your terms.
+- [ ] **Prepaid refunds and expiry (CONTRACT v2.13).** A buyer's refund request only sets credit aside; the merchant claims it (`POST /v1/prepaid/refunds/{id}/claim`), pays it on-chain from their own wallet (exactly `amount_sompi` to `payout_address`, payload `payout_payload`, no platform fee) and posts the txId, or the signed transaction, to `POST /v1/prepaid/refunds/{id}/payout`. The ledger is debited only when that payout is accepted on-chain. Watch for refunds stuck in `payout_submitted`, attempts that stay `pending`, and requests merchants leave open:
+
+```bash
+cd infra
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT id, merchant_id, status, amount_sompi, tx_id, last_error, created_at, payout_submitted_at
+FROM prepaid_refunds
+WHERE status IN ('requested', 'paying', 'payout_submitted')
+ORDER BY created_at LIMIT 50;
+SELECT p.refund_id, p.tx_id, p.method, p.payload_verified, p.check_count, p.error_count, p.last_error, p.created_at
+FROM prepaid_refund_payouts p
+WHERE p.status = 'pending'
+ORDER BY p.created_at LIMIT 50;
+SQL
+```
+
+  `payload_unverified` in `last_error` means the payout was accepted before the gateway ever saw its payload (it left the mempool before the txId was posted): ask the merchant to post the signed transaction JSON (`transaction`; KasWare `sendKaspa` returns it), which proves the payload. A growing `error_count` means node trouble (backoff, never a revert). After `PREPAID_PAYOUT_PENDING_MAX_SECONDS` a refund reverts to `requested` (`prepaid.refund.payout_reverted`) but its attempts are still re-checked until `PREPAID_PAYOUT_ATTEMPT_MAX_SECONDS`, so a late landing is recorded instead of being paid twice; the buyer cannot cancel meanwhile. Refunds with `late_paid_from` set were paid after a cancel or reject; `shortfall_sompi > 0` means the buyer had already spent that credit, which is between the merchant and the buyer. `duplicate` attempts mean the merchant paid twice. `scan` attempts were found by the gateway itself when a buyer tried to cancel a refund the merchant had claimed. Cancelled refunds with `hold_until` set still hold their amount until the ledger worker releases it; if `hold_until` is far in the past the worker is not running. Expiry runs in the ledger worker; keep `LEDGER_WORKER_ENABLED=true` on at least one replica. Tell merchants that an expiry policy applies only from a buyer's next deposit.
 - [ ] Watch disk, memory and Postgres connections on the host. Redis uses AOF, so its volume grows.
+
+### Migration 0008 revised in place
+
+Revision `0008_prepaid_refunds` (CONTRACT v2.13) was revised in place twice before release (after 15d7bd4 and after 706855a) under the same revision id. A database migrated with an earlier draft is stamped `0008_prepaid_refunds` but lacks `prepaid_refund_payouts` and/or `prepaid_refunds.first_claimed_at`, `hold_until`. `alembic upgrade head` and the gateway's startup detect this and stop with a message instead of running on the wrong schema. To fix such a database (testnet/dev data only; nothing is deployed with the drafts):
+
+```bash
+cd infra
+# The gateway container stops at start (its `alembic upgrade head` refuses), so run Alembic in a one-off container:
+docker compose run --rm --entrypoint alembic gateway downgrade 0007_trials_webhooks   # works from every 0008 draft
+docker compose run --rm --entrypoint alembic gateway upgrade head
+docker compose up -d gateway
+```
+
+Outside Docker: `cd apps/gateway && alembic downgrade 0007_trials_webhooks && alembic upgrade head`. The downgrade refuses while refund or expiry data exists.
+
+If the downgrade refuses because refunds, ledger rows or expiry settings exist, export what you need and rebuild the database from scratch (`alembic downgrade base` or drop and recreate it, then `alembic upgrade head`). Revision 0009 and later stack on `0008_prepaid_refunds` unchanged.
 
 ## 8. Optional own node
 

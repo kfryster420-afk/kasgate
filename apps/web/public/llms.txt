@@ -39,6 +39,14 @@ Deposit once (an ordinary payment of at least 0.6 KAS, same split), then pay cal
 POST /v1/prepaid/deposits/quote, POST /v1/prepaid/deposits, then per call POST /v1/prepaid/challenge and
 X-KasGate-Prepaid: Base64(JSON{nonce, signature}). Balance: GET /v1/prepaid/balance?slug=&payer_address=.
 
+Refunds of unused credit: POST /v1/prepaid/refunds/challenge {slug, payer_address, action: "request",
+amount_sompi?} (omit the amount for all spendable credit, at least 0.2 KAS), sign the message (Purpose
+kasgate:v1:prepaid-refund) with the depositing key, POST /v1/prepaid/refunds {nonce, signature}. The merchant
+pays it back on-chain to the depositing address with no platform fee (payload kasgate:v1:refund:<id hex>);
+follow it with GET /v1/prepaid/refunds/status?slug=&payer_address= (public, no reasons) or a signed "status"
+challenge and POST /v1/prepaid/refunds/status {nonce, signature} (with the merchant's reasons). Credit may expire if the merchant set an expiry (see
+expires_at and spendable_sompi on the balance).
+
 ## Free trial calls (kasgate-trial-v1)
 
 Some endpoints give each buyer key a few free calls. Their 402 carries X-KasGate-Trial-Offer and the catalog
@@ -55,7 +63,8 @@ lists kasgate-trial-v1. On the gateway host:
 ## Merchant webhooks
 
 Merchants can register HTTPS webhooks for payment.settled, prepaid.deposit, prepaid.debit, trial.used,
-endpoint.created and endpoint.updated. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
+endpoint.created, endpoint.updated, prepaid.refund.requested, prepaid.refund.paid, prepaid.refund.rejected,
+prepaid.refund.cancelled, prepaid.refund.payout_reverted and prepaid.credit.expired. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
 HMAC-SHA256(secret, "<t>.<raw body>")>; reject timestamps older than 5 minutes and dedupe on X-KasGate-Event-Id.
 
 ## Catalog
@@ -90,7 +99,8 @@ price before signing, enforces a per-call maximum and a session spend cap (sompi
 on failure, and never logs buyer keys. get_budget reports spent, reserved, and remaining sompi.
 
 Prepaid: KasGateClient.prepaid_deposit, prepaid_request and prepaid_balance; MCP prepaid_deposit,
-call_prepaid_endpoint and prepaid_balance. Free trials: KasGateClient.request uses an offered trial before
+call_prepaid_endpoint and prepaid_balance. Refunds: KasGateClient.prepaid_refund_request, prepaid_refund_cancel and
+prepaid_refunds; MCP prepaid_refund_request, prepaid_refund_cancel and prepaid_refunds. Free trials: KasGateClient.request uses an offered trial before
 paying (use_free_trials=True), plus trial_request and trial_status; MCP call_free_trial and trial_status, and
 the paying tools try a trial first. Webhook receivers can verify signatures with
 kasgate_client.verify_webhook_signature.

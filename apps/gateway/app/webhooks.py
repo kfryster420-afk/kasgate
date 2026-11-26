@@ -250,6 +250,7 @@ def endpoint_event_data(endpoint: Endpoint, changed: list[str] | None = None) ->
         "is_public_listed": endpoint.is_public_listed,
         "prepaid_only": endpoint.prepaid_only,
         "free_trial_calls": endpoint.free_trial_calls,
+        "prepaid_expiry_days": endpoint.prepaid_expiry_days,
     }
     if changed is not None:
         data["changed_fields"] = sorted(changed)

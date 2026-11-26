@@ -17,9 +17,12 @@ from app.config import get_settings
 from app.db import engine as db_engine
 from app.deps import get_sessionmaker
 from app.kaspa_engine import engine as kaspa_engine
+from app.ledger import LedgerWorker
 from app.oracle import KasUsdOracle
 from app.prepaid import router as prepaid_router
 from app.proxy import router as proxy_router
+from app.refunds import router as refunds_router
+from app.schema_guard import check_database_schema
 from app.schemas import (
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
@@ -46,6 +49,7 @@ __all__ = ["app", "create_app", "kaspa_engine"]
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    await check_database_schema(db_engine)
     redis: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
     http_client = build_upstream_client()
     app.state.redis = redis
@@ -58,11 +62,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.webhook_dispatcher = dispatcher
     if settings.webhook_dispatcher_enabled:
         dispatcher.start()
+    ledger_worker = LedgerWorker(get_sessionmaker(), kaspa_engine)
+    app.state.ledger_worker = ledger_worker
+    if settings.ledger_worker_enabled:
+        ledger_worker.start()
     await kaspa_engine.start()
     try:
         yield
     finally:
         await dispatcher.stop()
+        await ledger_worker.stop()
         await kaspa_engine.stop()
         await webhook_client.aclose()
         await http_client.aclose()
@@ -97,6 +106,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(api_router)
     app.include_router(well_known_router)
+    app.include_router(refunds_router)
     app.include_router(prepaid_router)
     app.include_router(trials_router)
     app.include_router(webhooks_router)

@@ -53,6 +53,7 @@ import json
 import logging
 import random
 import re
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -82,7 +83,9 @@ from app.config import (
     get_settings,
 )
 from app.exact_v2 import ExactV2Verification, verify_exact_v2
+from app.kaspa_types import TX_ID_RE
 from app.payments import PaymentVerificationError as PaymentVerificationError
+from app.payments import PayoutSighting
 from app.payments import RpcUnavailableError as RpcUnavailableError
 from app.payments import VerifiedPayment as VerifiedPayment
 from app.schemas import (
@@ -92,6 +95,7 @@ from app.schemas import (
     k402_network_label,
     payer_proof_message,
     payment_payload,
+    refund_payout_payload,
 )
 from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements
 
@@ -176,6 +180,8 @@ class RpcClientProtocol(Protocol):
     async def get_utxos_by_addresses(self, request: dict[str, Any]) -> Any: ...
 
     async def get_mempool_entries_by_addresses(self, request: dict[str, Any]) -> Any: ...
+
+    async def get_block_dag_info(self, request: dict[str, Any] | None = None) -> Any: ...
 
 
 RpcClientFactory = Callable[[], RpcClientProtocol]
@@ -300,6 +306,45 @@ def check_k402_outputs(tx_id: str, outputs: OutputMap, offer: K402UtxoOffer, min
     return VerifiedPayment(
         tx_id=tx_id, payer_address=None, total_sompi=total, merchant_sompi=merchant_value, fee_sompi=fee_value
     )
+
+
+def check_payout_outputs(tx_id: str, outputs: OutputMap, to_address: str, amount_sompi: int) -> int:
+    """CONTRACT v2.13: a refund payout must have an output paying ``to_address`` EXACTLY ``amount_sompi``.
+
+    ``outputs`` maps output index -> ``(value, script)`` (the whole transaction, or only its unspent outputs to
+    ``to_address``). A refund payout is an ordinary merchant -> buyer payment: no treasury output, no platform fee.
+    The exact amount is what ties a txid to one refund request (a merchant cannot pass off an unrelated payment that
+    happens to reach the same address). Returns the matching output index.
+    """
+    script = _script_key(to_address, what="payout address", code="invalid_payout")
+    paying = sorted(index for index, (_, out_script) in outputs.items() if out_script == script)
+    if not paying:
+        raise PaymentVerificationError("invalid_payout", f"transaction {tx_id} has no output to the buyer's address")
+    for index in paying:
+        if outputs[index][0] == amount_sompi:
+            return index
+    values = ", ".join(str(outputs[index][0]) for index in paying)
+    raise PaymentVerificationError(
+        "invalid_payout", f"no output of {tx_id} pays the buyer exactly {amount_sompi} sompi (found {values})"
+    )
+
+
+def _utxo_daa_score(utxo: dict[str, Any]) -> int | None:
+    """The accepting block's DAA score, or None when the node omitted it (the output still counts)."""
+    raw = utxo.get("blockDaaScore")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise PaymentVerificationError("invalid_payment_header", "a UTXO DAA score is malformed in the node's reply")
+    if isinstance(raw, int):
+        if raw < 0:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "a UTXO DAA score is malformed in the node's reply"
+            )
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    raise PaymentVerificationError("invalid_payment_header", "a UTXO DAA score is malformed in the node's reply")
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -646,6 +691,221 @@ class KaspaEngine:
                 )
             outputs[index] = (amount, script)
         return outputs
+
+    # ------------------------------------------------------------------ prepaid refund payouts (CONTRACT v2.13)
+
+    def _check_payout_address(self, to_address: str) -> None:
+        prefix = NETWORK_ADDRESS_PREFIX[self._settings.kaspa_network]
+        if not _has_prefix(to_address, prefix):
+            raise PaymentVerificationError(
+                "wrong_network", f"the payout address must use the '{prefix}:' prefix on {self._settings.kaspa_network}"
+            )
+
+    @staticmethod
+    def _mempool_payload(response: object, tx_id: str) -> str | None:
+        """The lower-case payload hex of ``tx_id`` in a mempool reply ("" when it carries none), None if absent."""
+        for by_address in _as_list(_as_dict(response).get("entries")):
+            for mempool_entry in _as_list(_as_dict(by_address).get("receiving")):
+                transaction = _as_dict(_as_dict(mempool_entry).get("transaction"))
+                entry_id = _as_dict(transaction.get("verboseData")).get("transactionId")
+                if not isinstance(entry_id, str) or entry_id.lower() != tx_id:
+                    continue
+                payload = transaction.get("payload")
+                if payload is None:
+                    return ""
+                if not isinstance(payload, str):
+                    raise PaymentVerificationError(
+                        "invalid_payment_header", f"the payload of {tx_id} is malformed in the node's reply"
+                    )
+                return payload.lower()
+        return None
+
+    async def verify_payout(
+        self, tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None:
+        """Check that ``tx_id`` is THIS refund's payout: an output paying ``to_address`` exactly ``amount_sompi``,
+        the payload ``kasgate:v1:refund:<refund_id hex>``, and accepted by the virtual chain.
+
+        Nothing is submitted. The sink hash is read first; then the mempool entries received by ``to_address`` give
+        the whole transaction (outputs AND payload), and the virtual chain is polled until it accepts ``tx_id``
+        (UTXO index once as a fallback). Acceptance is required in every ``settlement_mode``: a refund is marked paid
+        only once its payout is accepted. When the transaction is only in the UTXO index (accepted, left the mempool)
+        its payload cannot be read there, so it counts only if ``payload_checked`` (the payload was seen earlier).
+
+        Raises ``invalid_payout`` (wrong amount, wrong or missing payload: never this refund's payout),
+        ``payout_unconfirmed`` (right outputs and payload, not accepted yet), ``payload_unverified`` (accepted, payload
+        never seen: post the signed transaction JSON), ``payment_not_found`` (not visible), ``wrong_network``, a
+        malformed-reply ``invalid_payment_header``, or ``RpcUnavailableError``.
+        """
+        self._check_payout_address(to_address)
+        expected_payload = refund_payout_payload(refund_id)
+        addresses = [to_address.lower()]
+        start_hash = await self._sink_hash()
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        in_mempool = self._k402_mempool_outputs(mempool_response, tx_id)
+        if in_mempool is not None:
+            check_payout_outputs(tx_id, in_mempool, to_address, amount_sompi)
+            if self._mempool_payload(mempool_response, tx_id) != expected_payload.hex():
+                raise PaymentVerificationError(
+                    "invalid_payout",
+                    f"payout {tx_id} does not carry the payload {expected_payload.decode('ascii')!r} of this refund",
+                )
+            try:
+                await self._wait_for_acceptance(tx_id, start_hash)
+            except RpcUnavailableError as exc:
+                if not await self._k402_utxo_outputs(addresses, tx_id):
+                    raise PaymentVerificationError(
+                        "payout_unconfirmed", f"payout {tx_id} is valid but not accepted yet; check again shortly"
+                    ) from exc
+            return
+        accepted_outputs = await self._k402_utxo_outputs(addresses, tx_id)
+        if not accepted_outputs:
+            raise PaymentVerificationError(
+                "payment_not_found", f"payout {tx_id} does not pay the buyer on this node yet; check again shortly"
+            )
+        check_payout_outputs(tx_id, accepted_outputs, to_address, amount_sompi)
+        if not payload_checked:
+            raise PaymentVerificationError(
+                "payload_unverified",
+                f"payout {tx_id} is accepted but its payload was never seen by the gateway; post the signed "
+                "transaction JSON (KasWare sendKaspa returns it) as `transaction` to prove it is this refund's payout",
+            )
+
+    async def virtual_daa_score(self) -> int:
+        """The node's current virtual DAA score (`get_block_dag_info().virtualDaaScore`). Stored at first claim so
+        the pre-cancel UTXO scan can ignore outputs accepted before that moment."""
+        response = await self._rpc("get_block_dag_info", lambda client: client.get_block_dag_info())
+        score = _as_dict(response).get("virtualDaaScore")
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "the node's virtual DAA score is missing or malformed"
+            )
+        return score
+
+    async def find_refund_payouts(
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, min_daa_score: int = 0
+    ) -> list[PayoutSighting]:
+        """Every transaction the node shows that may be this refund's payout, before a buyer cancel of a refund the
+        merchant had claimed. Nothing is submitted.
+
+        * Mempool (entries received by ``to_address``): any transaction carrying the payload
+          ``kasgate:v1:refund:<refund_id hex>``, whatever it pays (``payload_seen=True``).
+        * UTXO index (accepted, payload not readable there): any non-coinbase output paying ``to_address`` exactly
+          ``amount_sompi`` whose ``blockDaaScore`` is greater than ``min_daa_score`` (the virtual DAA stored at the
+          first claim; outputs accepted at or before the claim are ignored). ``min_daa_score=0`` does not filter.
+          The caller skips transactions it already knows.
+
+        Raises ``wrong_network``, a malformed-reply ``invalid_payment_header`` or ``RpcUnavailableError`` (the caller
+        must then refuse the cancel: it cannot rule out a payout in flight).
+        """
+        self._check_payout_address(to_address)
+        expected_payload = refund_payout_payload(refund_id).hex()
+        addresses = [to_address.lower()]
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        found: dict[str, PayoutSighting] = {}
+        for by_address in _as_list(_as_dict(mempool_response).get("entries")):
+            for mempool_entry in _as_list(_as_dict(by_address).get("receiving")):
+                transaction = _as_dict(_as_dict(mempool_entry).get("transaction"))
+                entry_id = _as_dict(transaction.get("verboseData")).get("transactionId")
+                payload = transaction.get("payload")
+                if isinstance(entry_id, str) and isinstance(payload, str) and payload.lower() == expected_payload:
+                    found[entry_id.lower()] = PayoutSighting(entry_id.lower(), payload_seen=True)
+        utxo_response = await self._rpc(
+            "get_utxos_by_addresses", lambda client: client.get_utxos_by_addresses({"addresses": addresses})
+        )
+        for entry in _as_list(_as_dict(utxo_response).get("entries")):
+            entry_dict = _as_dict(entry)
+            entry_tx = _as_dict(entry_dict.get("outpoint")).get("transactionId")
+            utxo = _as_dict(entry_dict.get("utxoEntry"))
+            amount = utxo.get("amount")
+            if not isinstance(entry_tx, str) or not TX_ID_RE.fullmatch(entry_tx.lower()):
+                raise PaymentVerificationError("invalid_payment_header", "a UTXO is malformed in the node's reply")
+            if utxo.get("isCoinbase") is True or isinstance(amount, bool) or amount != amount_sompi:
+                continue
+            if min_daa_score > 0:
+                daa = _utxo_daa_score(utxo)
+                if daa is not None and daa <= min_daa_score:
+                    continue
+            found.setdefault(entry_tx.lower(), PayoutSighting(entry_tx.lower(), payload_seen=False))
+        return list(found.values())
+
+    def _parse_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[Transaction, str]:
+        """Parse and check a merchant-signed payout locally (no network): payload, exact output, native subnetwork."""
+        self._check_payout_address(to_address)
+        try:
+            raw = json.loads(transaction)
+        except (ValueError, RecursionError) as exc:
+            raise PaymentVerificationError("invalid_payout", "transaction is not valid JSON") from exc
+        if not isinstance(raw, dict):
+            raise PaymentVerificationError("invalid_payout", "transaction must be a JSON object")
+        try:
+            tx = Transaction.from_dict(raw)
+            tx.finalize()
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise PaymentVerificationError("invalid_payout", f"not a valid Kaspa transaction: {exc}") from exc
+        if not tx.inputs:
+            raise PaymentVerificationError("invalid_payout", "transaction has no inputs")
+        if tx.subnetwork != NATIVE_SUBNETWORK_ID or tx.gas != 0:
+            raise PaymentVerificationError("invalid_payout", "only native-subnetwork transactions are accepted")
+        if str(tx.payload or "").lower() != payload.hex():
+            raise PaymentVerificationError(
+                "invalid_payout", f"transaction payload must be {payload.decode('ascii')!r} (hex {payload.hex()})"
+            )
+        outputs: OutputMap = {}
+        for index, output in enumerate(tx.outputs):
+            script = parse_script_key(output.script_public_key)
+            if script is None:
+                raise PaymentVerificationError("invalid_payout", f"output {index} has an unreadable script")
+            outputs[index] = (int(output.value), script)
+        tx_id = str(tx.id)
+        check_payout_outputs(tx_id, outputs, to_address, amount_sompi)
+        return tx, tx_id
+
+    def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
+        """The id of a merchant-signed payout after the same local checks as ``submit_payout``; nothing is sent.
+
+        The gateway records this id (refund -> ``payout_submitted``) BEFORE broadcasting, so a buyer cancel can never
+        slip in between the broadcast and the record.
+        """
+        return self._parse_payout(transaction, payload, to_address, amount_sompi)[1]
+
+    async def submit_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[str, bool]:
+        """Broadcast a merchant-signed refund payout and wait for virtual-chain acceptance.
+
+        Returns ``(tx_id, accepted)``: ``accepted`` is False when the node took the transaction but did not accept it
+        within ``settlement_timeout_seconds`` (the caller keeps it submitted and re-checks later). Acceptance is
+        required in every ``settlement_mode``.
+
+        The transaction must carry ``payload`` (``kasgate:v1:refund:<refund id hex>``) and pay ``to_address`` exactly
+        ``amount_sompi``; the node checks the merchant's inputs and signatures. Raises ``invalid_payout``,
+        ``tx_rejected`` (node refused it) or ``RpcUnavailableError``.
+        """
+        tx, tx_id = self._parse_payout(transaction, payload, to_address, amount_sompi)
+        start_hash = await self._sink_hash()
+        already_accepted = await self._submit(tx, tx_id)
+        if not already_accepted:
+            try:
+                await self._wait_for_acceptance(tx_id, start_hash)
+            except RpcUnavailableError as exc:
+                logger.warning("refund payout %s submitted but not accepted yet: %s", tx_id, exc.message)
+                return tx_id, False
+        return tx_id, True
 
     # ------------------------------------------------------------------ kaspa-exact-v2 (CONTRACT v2.10)
 

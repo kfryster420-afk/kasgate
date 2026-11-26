@@ -5,7 +5,7 @@ import ipaddress
 import re
 import secrets
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from typing import Annotated, Any, Literal, Self
 
@@ -35,6 +35,7 @@ from app.kaspa_types import SOMPI_STR_RE as SOMPI_STR_RE
 from app.kaspa_types import TX_ID_RE as TX_ID_RE
 from app.kaspa_types import Sompi, SompiStr, validate_kaspa_address, validate_tx_id
 from app.models import (
+    PREPAID_EXPIRY_DAYS_MAX,
     TRIAL_DAILY_CAP_DEFAULT,
     TRIAL_DAILY_CAP_MAX,
     TRIAL_MAX_CALLS,
@@ -101,6 +102,14 @@ MAX_PREPAID_HEADER_CHARS = 512
 TRIAL_SCHEME = "kasgate-trial-v1"
 TRIAL_CALL_PURPOSE = "kasgate:v1:trial-call"
 
+# CONTRACT v2.13 prepaid refunds.
+PREPAID_REFUND_PURPOSE = "kasgate:v1:prepaid-refund"
+PREPAID_REFUND_PAYLOAD_PREFIX = "kasgate:v1:refund:"
+PREPAID_REFUND_REASON_MAX_LENGTH = 300
+PrepaidRefundAction = Literal["request", "cancel", "status"]
+PrepaidRefundStatus = Literal["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"]
+PrepaidRefundPayoutStatus = Literal["pending", "confirmed", "invalid", "duplicate", "abandoned"]
+
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 USD_MICROS_PER_DOLLAR = 1_000_000
 MAX_USD_MICROS = 1_000_000_000_000_000  # $1e9
@@ -108,6 +117,7 @@ UsdMicros = Annotated[int, Field(gt=0, le=MAX_USD_MICROS)]
 UsdDecimal = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=8)]
 FreeTrialCalls = Annotated[int, Field(strict=True, ge=0, le=TRIAL_MAX_CALLS)]
 TrialDailyCap = Annotated[int, Field(strict=True, ge=1, le=TRIAL_DAILY_CAP_MAX)]
+PrepaidExpiryDays = Annotated[int, Field(strict=True, ge=1, le=PREPAID_EXPIRY_DAYS_MAX)]
 
 
 def sompi_to_kas(sompi: int) -> str:
@@ -309,6 +319,46 @@ def build_prepaid_debit_message(
         f"Nonce: {nonce}\n"
         f"Expires: {expires_at.isoformat()}"
     )
+
+
+def build_prepaid_refund_message(
+    *,
+    domain: str,
+    action: str,
+    address: str,
+    merchant_id: uuid.UUID,
+    amount_sompi: int,
+    refund_id: uuid.UUID | None,
+    nonce: str,
+    expires_at: datetime,
+) -> str:
+    """The exact text a buyer signs (kaspa sign_message, the depositing P2PK key) to open or cancel ONE refund, or
+    to read their own refunds with the merchant's reasons (`status`, Amount 0, Refund `-`).
+
+    Its Purpose differs from a prepaid debit, a trial call, a payerProof and a login, so no other signature can stand
+    in for it. A refund signature moves no coins: it only asks the merchant to pay `amount_sompi` back on-chain to
+    `address` (the depositing address), and the gateway debits the ledger only once that payout is seen on-chain.
+    """
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_REFUND_PURPOSE}\n"
+        f"Action: {action}\n"
+        f"Address: {address}\n"
+        f"Merchant: {merchant_id}\n"
+        f"Amount: {amount_sompi}\n"
+        f"Refund: {refund_id if refund_id is not None else '-'}\n"
+        f"Nonce: {nonce}\n"
+        f"Expires: {expires_at.isoformat()}"
+    )
+
+
+def refund_payout_payload(refund_id: uuid.UUID) -> bytes:
+    """Payload every refund payout transaction must carry (`kasgate:v1:refund:<refund id hex>`), in both modes.
+
+    KasWare: `sendKaspa(payout_address, amount_sompi, {payload: "kasgate:v1:refund:<hex>"})` (the wallet hex-encodes
+    the UTF-8 string, which gives exactly these bytes)."""
+    return f"{PREPAID_REFUND_PAYLOAD_PREFIX}{refund_id.hex}".encode("ascii")
 
 
 def build_trial_call_message(
@@ -824,6 +874,23 @@ class X402ErrorBody(StrictModel):
         "insufficient_balance",
         "prepaid_cap_exceeded",
         "trial_exhausted",
+        # CONTRACT v2.13 prepaid refunds
+        "invalid_payer",
+        "invalid_signature",
+        "invalid_status",
+        "challenge_expired",
+        "challenge_replayed",
+        "refund_too_small",
+        "refund_already_open",
+        "refund_not_found",
+        "refund_not_cancellable",
+        "refund_not_claimable",
+        "refund_not_rejectable",
+        "refund_closed",
+        "invalid_payout",
+        "payout_replayed",
+        "payout_abandoned",
+        "too_many_attempts",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -866,6 +933,23 @@ class MerchantRead(ReadModel):
     email: str | None
     is_active: bool
     created_at: datetime
+    prepaid_expiry_days: int | None = None
+    """CONTRACT v2.13: default prepaid credit expiry in days after the latest deposit (None = never expires)."""
+
+
+class MerchantUpdate(StrictModel):
+    """PATCH /v1/merchants/me. Only fields present in the body change; `prepaid_expiry_days: null` = never expire."""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    prepaid_expiry_days: PrepaidExpiryDays | None = None
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field to change")
+        if "display_name" in self.model_fields_set and self.display_name is None:
+            raise ValueError("display_name cannot be null")
+        return self
 
 
 class MerchantCreated(BaseModel):
@@ -948,6 +1032,9 @@ class EndpointCreate(StrictModel):
     """CONTRACT v2.12: unpaid calls each buyer key gets on this endpoint (0 = no free trial)."""
     trial_daily_cap: TrialDailyCap = TRIAL_DAILY_CAP_DEFAULT
     """CONTRACT v2.12: total free trial calls this endpoint serves per UTC day, across all buyers."""
+    prepaid_expiry_days: PrepaidExpiryDays | None = None
+    """CONTRACT v2.13: prepaid credit bought through this endpoint expires this many days after the latest deposit;
+    None = use the merchant default (`MerchantRead.prepaid_expiry_days`)."""
 
     @field_validator("upstream_url")
     @classmethod
@@ -991,6 +1078,8 @@ class EndpointUpdate(StrictModel):
     prepaid_only: bool | None = None
     free_trial_calls: FreeTrialCalls | None = None
     trial_daily_cap: TrialDailyCap | None = None
+    prepaid_expiry_days: PrepaidExpiryDays | None = None
+    """CONTRACT v2.13: send null to fall back to the merchant default."""
 
     @field_validator("upstream_url")
     @classmethod
@@ -1034,6 +1123,7 @@ class EndpointRead(ReadModel):
     prepaid_only: bool = False
     free_trial_calls: int = 0
     trial_daily_cap: int = TRIAL_DAILY_CAP_DEFAULT
+    prepaid_expiry_days: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -1562,6 +1652,14 @@ class PrepaidBalanceRead(BaseModel):
     deposited_sompi: BalanceSompiStr | None
     debited_sompi: BalanceSompiStr | None
     updated_at: datetime | None
+    # CONTRACT v2.13
+    refunded_sompi: BalanceSompiStr = "0"
+    expired_sompi: BalanceSompiStr = "0"
+    refund_hold_sompi: BalanceSompiStr = "0"
+    """Set aside by an open refund request: still in the balance, but not spendable."""
+    spendable_sompi: BalanceSompiStr = "0"
+    """What calls can be paid from right now: balance - refund hold, or 0 once `expires_at` has passed."""
+    expires_at: datetime | None = None
 
 
 class PrepaidDebitRead(ReadModel):
@@ -1596,6 +1694,208 @@ class PrepaidDepositRead(ReadModel):
     created_at: datetime
 
     @field_validator("deposit_sompi", "fee_sompi", "credit_sompi", mode="before")
+    @classmethod
+    def _sompi(cls, v: object) -> object:
+        return str(v) if isinstance(v, int) else v
+
+
+# ---------------------------------------------------------------- prepaid refunds and expiry (CONTRACT v2.13)
+
+
+class PrepaidRefundChallengeRequest(StrictModel):
+    """Ask for the text to sign to open (`request`) or cancel (`cancel`) a refund of unused prepaid credit, or to
+    read this key's refunds including the merchant's reject reasons (`status`).
+
+    `request`: `amount_sompi` is how much to get back (omit it for all spendable credit); `refund_id` must be absent.
+    `cancel`: `refund_id` names the open request; `amount_sompi` must be absent.
+    `status`: neither `amount_sompi` nor `refund_id`.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    payer_address: str
+    action: PrepaidRefundAction = "request"
+    amount_sompi: Sompi | None = None
+    refund_id: Annotated[uuid.UUID, Field(strict=False)] | None = None
+
+    @field_validator("payer_address")
+    @classmethod
+    def _payer(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @model_validator(mode="after")
+    def _shape(self) -> Self:
+        if self.action == "request" and self.refund_id is not None:
+            raise ValueError("refund_id is only used to cancel a refund")
+        if self.action == "cancel":
+            if self.refund_id is None:
+                raise ValueError("refund_id is required to cancel a refund")
+            if self.amount_sompi is not None:
+                raise ValueError("amount_sompi must be omitted when cancelling a refund")
+        if self.action == "status" and (self.amount_sompi is not None or self.refund_id is not None):
+            raise ValueError("a status challenge takes neither amount_sompi nor refund_id")
+        return self
+
+
+class PrepaidRefundChallenge(BaseModel):
+    nonce: str
+    message: str
+    """Sign exactly this text with the depositing key (kaspa sign_message) and POST {nonce, signature} to
+    /v1/prepaid/refunds (request), /v1/prepaid/refunds/{refund_id}/cancel (cancel) or /v1/prepaid/refunds/status
+    (status)."""
+    action: PrepaidRefundAction
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: BalanceSompiStr
+    """The refund amount; "0" for a status challenge."""
+    refund_id: uuid.UUID | None
+    spendable_sompi: BalanceSompiStr
+    expires_at: datetime
+
+
+class PrepaidRefundSigned(StrictModel):
+    """The buyer's signature over a refund challenge."""
+
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    signature: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _signature(cls, v: object) -> object:
+        return normalise_signature(v)
+
+
+class PrepaidRefundRead(ReadModel):
+    id: uuid.UUID
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: SompiStr
+    status: PrepaidRefundStatus
+    tx_id: str | None
+    reason: str | None
+    """The merchant's reject reason. Null in the public GET /refunds/status view; read it with a signed status."""
+    last_error: str | None
+    """The latest payout problem the gateway saw. Null in the public GET /refunds/status view."""
+    created_at: datetime
+    updated_at: datetime
+    claimed_at: datetime | None
+    """When the merchant last claimed it (`paying`). Null in the public view (signed status shows it)."""
+    first_claimed_at: datetime | None
+    """The first claim; claims are not renewed past it + PREPAID_REFUND_CLAIM_MAX_SECONDS. Null in the public view."""
+    hold_until: datetime | None
+    """A cancelled refund the merchant had claimed: its amount stays held (not spendable) until then."""
+    payout_submitted_at: datetime | None
+    paid_at: datetime | None
+    resolved_at: datetime | None
+    late_paid_from: Literal["cancelled", "rejected"] | None
+    """Set when the payout was confirmed after the refund had been cancelled or rejected (it is still recorded)."""
+    shortfall_sompi: BalanceSompiStr
+    """For a late payout: the part of amount_sompi the balance no longer held (already spent or expired)."""
+
+    @field_validator("amount_sompi", "shortfall_sompi", mode="before")
+    @classmethod
+    def _sompi(cls, v: object) -> object:
+        return str(v) if isinstance(v, int) else v
+
+    def public(self) -> "PrepaidRefundRead":
+        """The unsigned public view: no merchant reason, no payout error text, and no claim details (`paying` reads
+        as `requested`, claim times are null), so nobody can time a cancel to the moment a claim lapses."""
+        hidden: dict[str, object] = {"reason": None, "last_error": None, "claimed_at": None, "first_claimed_at": None}
+        if self.status == "paying":
+            hidden["status"] = "requested"
+        return self.model_copy(update=hidden)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def claim_expires_at(self) -> datetime | None:
+        """While `paying`: when the merchant's claim lapses (the buyer may cancel after it). Do not broadcast a payout
+        close to this time; renew the claim first (renewals stop at first_claimed_at + the claim maximum)."""
+        if self.status != "paying" or self.claimed_at is None:
+            return None
+        settings = get_settings()
+        expires = self.claimed_at + timedelta(seconds=settings.prepaid_refund_claim_ttl_seconds)
+        if self.first_claimed_at is not None:
+            expires = min(expires, self.first_claimed_at + timedelta(seconds=settings.prepaid_refund_claim_max_seconds))
+        return expires
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def payout_address(self) -> str:
+        """Pay exactly `amount_sompi` to this address (the depositing address). No platform fee applies."""
+        return self.payer_address
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def payout_payload_hex(self) -> str:
+        """Payload every payout transaction must carry (both modes), hex-encoded."""
+        return refund_payout_payload(self.id).hex()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def payout_payload(self) -> str:
+        """The same payload as text: pass it as KasWare `sendKaspa(..., {payload})`."""
+        return refund_payout_payload(self.id).decode("ascii")
+
+
+class PrepaidRefundPayoutRead(ReadModel):
+    """One attempted payout transaction of a refund (every tx_id a merchant posted or the gateway broadcast)."""
+
+    id: uuid.UUID
+    refund_id: uuid.UUID
+    tx_id: str
+    method: Literal["tx_id", "transaction", "scan"]
+    status: PrepaidRefundPayoutStatus
+    payload_verified: bool
+    check_count: int
+    last_error: str | None
+    next_check_at: datetime
+    confirmed_at: datetime | None
+    resolved_at: datetime | None
+    created_at: datetime
+
+
+class PrepaidRefundPayout(StrictModel):
+    """The merchant's payout of a refund: EITHER the `tx_id` of a payment already broadcast (e.g. KasWare
+    `sendKaspa` with the refund payload), OR a signed `transaction` (kaspa Transaction JSON) for the gateway to
+    broadcast. Both must carry the payload `kasgate:v1:refund:<refund id hex>`."""
+
+    tx_id: str | None = None
+    transaction: str | None = Field(default=None, min_length=2, max_length=MAX_RAW_TX_CHARS)
+
+    @field_validator("tx_id")
+    @classmethod
+    def _tx(cls, v: str | None) -> str | None:
+        return None if v is None else validate_tx_id(v)
+
+    @model_validator(mode="after")
+    def _one(self) -> Self:
+        if (self.tx_id is None) == (self.transaction is None):
+            raise ValueError("send exactly one of tx_id or transaction")
+        return self
+
+
+class PrepaidRefundReject(StrictModel):
+    reason: str = Field(min_length=1, max_length=PREPAID_REFUND_REASON_MAX_LENGTH)
+
+
+PrepaidLedgerKindName = Literal["refund", "expiry"]
+
+
+class PrepaidLedgerEntryRead(ReadModel):
+    id: uuid.UUID
+    payer_address: str
+    kind: PrepaidLedgerKindName
+    direction: Literal["credit", "debit"]
+    amount_sompi: SompiStr
+    balance_after_sompi: BalanceSompiStr
+    tx_id: str | None
+    refund_id: uuid.UUID | None
+    note: str | None
+    created_at: datetime
+
+    @field_validator("amount_sompi", "balance_after_sompi", mode="before")
     @classmethod
     def _sompi(cls, v: object) -> object:
         return str(v) if isinstance(v, int) else v
@@ -1683,7 +1983,18 @@ WEBHOOK_EVENT_TYPE_HEADER = "X-KasGate-Event-Type"
 WEBHOOK_DELIVERY_ID_HEADER = "X-KasGate-Delivery-Id"
 WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
 WebhookEventType = Literal[
-    "payment.settled", "prepaid.deposit", "prepaid.debit", "trial.used", "endpoint.created", "endpoint.updated"
+    "payment.settled",
+    "prepaid.deposit",
+    "prepaid.debit",
+    "trial.used",
+    "endpoint.created",
+    "endpoint.updated",
+    "prepaid.refund.requested",
+    "prepaid.refund.paid",
+    "prepaid.refund.rejected",
+    "prepaid.refund.cancelled",
+    "prepaid.refund.payout_reverted",
+    "prepaid.credit.expired",
 ]
 WebhookDeliveryStatus = Literal["pending", "delivering", "succeeded", "dead"]
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain")

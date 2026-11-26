@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import stat
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,7 @@ from kasgate_client import (
     KasGateError,
     PaymentReceipt,
     PrepaidReceipt,
+    PrepaidRefund,
     TrialReceipt,
     kas_to_sompi,
     prepaid_receipt_of,
@@ -222,7 +224,9 @@ def build_server(
             "quote_endpoint for a live price. Pay with call_with_budget (session spend cap + per-call max) "
             "or call_paid_endpoint. Check remaining funds with get_budget. For many small calls, fund a prepaid "
             "balance once with prepaid_deposit (counts against the session budget), then use call_prepaid_endpoint "
-            "(signed debits, no transaction per call) and prepaid_balance. Endpoints may offer free trial calls: "
+            "(signed debits, no transaction per call) and prepaid_balance. Unused credit can be asked back with "
+            "prepaid_refund_request (the merchant pays it on-chain, no platform fee; follow it with prepaid_refunds, "
+            "withdraw it with prepaid_refund_cancel). Endpoints may offer free trial calls: "
             "the paying tools use them automatically before paying (see `trial` in the result), trial_status shows "
             "what is left and call_free_trial makes a call that can never pay. A tighter max_price_kas can only "
             "lower the configured ceiling, never raise it. Keys are never logged."
@@ -489,7 +493,80 @@ def build_server(
             "balance_sompi": int(balance.balance_sompi),
             "deposited_sompi": None if balance.deposited_sompi is None else int(balance.deposited_sompi),
             "debited_sompi": None if balance.debited_sompi is None else int(balance.debited_sompi),
+            "refunded_sompi": None if balance.refunded_sompi is None else int(balance.refunded_sompi),
+            "expired_sompi": None if balance.expired_sompi is None else int(balance.expired_sompi),
+            "refund_hold_sompi": None if balance.refund_hold_sompi is None else int(balance.refund_hold_sompi),
+            "spendable_sompi": int(balance.spendable_sompi)
+            if balance.spendable_sompi is not None
+            else int(balance.balance_sompi),
+            "expires_at": balance.expires_at.isoformat() if balance.expires_at else None,
         }
+
+    def _describe_refund(refund: PrepaidRefund) -> dict[str, Any]:
+        return {
+            "refund_id": str(refund.id),
+            "status": refund.status,
+            "amount_kas": sompi_to_kas(int(refund.amount_sompi)),
+            "amount_sompi": int(refund.amount_sompi),
+            "payout_address": refund.payout_address,
+            "tx_id": refund.tx_id,
+            "reason": refund.reason,
+            "late_paid_from": refund.late_paid_from,
+            "shortfall_sompi": int(refund.shortfall_sompi),
+            "claim_expires_at": refund.claim_expires_at.isoformat() if refund.claim_expires_at else None,
+            "hold_until": refund.hold_until.isoformat() if refund.hold_until else None,
+            "created_at": refund.created_at.isoformat(),
+            "paid_at": refund.paid_at.isoformat() if refund.paid_at else None,
+        }
+
+    @server.tool()
+    async def prepaid_refund_request(slug: str, amount_kas: float | str | None = None) -> dict[str, Any]:
+        """Ask the merchant behind `slug` to pay unused prepaid credit back to this buyer's address (CONTRACT v2.13).
+
+        Omit `amount_kas` for all spendable credit (at least 0.2 KAS). The amount is held at once and can no longer
+        pay calls; the merchant pays it on-chain from their own wallet (no platform fee) and the refund becomes
+        "paid". Signs one refund request, never a transaction; it does not touch the session budget.
+        """
+        slug = validate_slug(slug)
+        amount = None if amount_kas is None else _parse_optional_max_price_kas(amount_kas)
+        try:
+            refund = await paying_client().prepaid_refund_request(cfg.gateway_url, slug, amount)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return _describe_refund(refund)
+
+    @server.tool()
+    async def prepaid_refund_cancel(slug: str, refund_id: str) -> dict[str, Any]:
+        """Withdraw a refund request the merchant has not paid yet; the held credit becomes spendable again."""
+        slug = validate_slug(slug)
+        try:
+            parsed = uuid.UUID(refund_id)
+        except ValueError as exc:
+            raise ToolError("refund_id must be a UUID") from exc
+        try:
+            refund = await paying_client().prepaid_refund_cancel(cfg.gateway_url, slug, parsed)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return _describe_refund(refund)
+
+    @server.tool()
+    async def prepaid_refunds(slug: str, include_reasons: bool = False) -> dict[str, Any]:
+        """This buyer key's refund requests at the merchant behind `slug`, newest first.
+
+        By default a public read that signs nothing (the merchant's reject reasons are withheld). With
+        include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
+        slug = validate_slug(slug)
+        try:
+            refunds = await paying_client().prepaid_refunds(cfg.gateway_url, slug, signed=include_reasons)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return {"refunds": [_describe_refund(refund) for refund in refunds]}
 
     @server.tool()
     async def call_prepaid_endpoint(

@@ -73,6 +73,26 @@ async with KasGateClient(PRIVATE_KEY_HEX, max_price_kas="0.01") as client:
   (409, nonce already used), `InvalidChallengeError` / `PriceCapExceededError` (nothing signed).
 - The balance belongs to the depositing key at that merchant; use the same key for deposits and debits.
 
+Refunds of unused credit (CONTRACT v2.13):
+
+```python
+refund = await client.prepaid_refund_request("https://gw.example", "weather")            # all spendable credit
+refund = await client.prepaid_refund_request("https://gw.example", "weather", 25_000_000)  # or an amount (>= 0.2 KAS)
+print(await client.prepaid_refunds("https://gw.example", "weather"))   # requested -> paying -> payout_submitted -> paid
+print(await client.prepaid_refunds("https://gw.example", "weather", signed=True))  # also the merchant's reasons
+await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  # only while `requested`, no payout pending
+```
+
+- The request signs a refund text (purpose `kasgate:v1:prepaid-refund`) that the SDK rebuilds itself; it refuses to sign
+  for another payer, endpoint, action, refund or amount, or for more than the spendable credit the gateway reported.
+  The signature moves no coins: the merchant pays the amount back on-chain to this key's address, with no platform fee.
+- The public list hides the merchant's reject reason and claim (`paying` reads as `requested`); `signed=True` signs a
+  `status` text (amount 0) to read them (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
+  claimed it keeps its amount set aside until `hold_until`; a cancel is refused while a payout of it is on-chain.
+  `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
+- `prepaid_balance` now also reports `refunded_sompi`, `expired_sompi`, `refund_hold_sompi` (set aside by an open
+  refund), `spendable_sompi` and `expires_at` (when the merchant set a credit expiry).
+
 ## Free trial calls (CONTRACT v2.12)
 
 Merchants can give every buyer key N free calls per endpoint. `request()` uses them automatically before paying:
