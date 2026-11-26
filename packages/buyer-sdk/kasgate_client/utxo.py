@@ -8,6 +8,7 @@ and adds our own unconfirmed change outputs, each for a bounded time.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -106,7 +107,5 @@ class RpcUtxoProvider:
     async def aclose(self) -> None:
         if self._rpc is not None:
             rpc, self._rpc = self._rpc, None
-            try:
+            with contextlib.suppress(Exception):  # closing: a failed disconnect leaves nothing to recover
                 await rpc.disconnect()
-            except Exception:
-                pass
