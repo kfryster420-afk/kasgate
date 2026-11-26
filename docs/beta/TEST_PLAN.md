@@ -125,6 +125,18 @@ Use the official `@kaspa-x402/client` 1.0.1 on testnet-10 with a funded testnet 
 - Replay the settled txId in a KasGate `PAYMENT-SIGNATURE` or an `X-K402-Payment` header. Expected: **409** `payment_replayed`.
 - On a USD-priced endpoint, compare the `exact` amount with the `kaspa-exact-v1` `amount` from the same 402. Expected: they are equal.
 
+### 10. Prepaid credit (`kasgate-prepaid-v1`)
+
+Merchant: create one endpoint with **Prepaid only** on and a price below the minimum, e.g. 0.001 KAS. Buyer: use the buyer SDK (`prepaid_deposit`, `prepaid_request`, `prepaid_balance`) or the MCP tools (`prepaid_deposit`, `call_prepaid_endpoint`, `prepaid_balance`).
+
+- Call the prepaid-only endpoint without paying. Expected: **402** with no `PAYMENT-REQUIRED` header and `accepts` holding exactly one `kasgate-prepaid-v1` offer (`amount` the price in sompi, `prepaidOnly: true`, `minDepositSompi` `"60000000"`). The catalog lists only `kasgate-prepaid-v1` for it.
+- Ask for a debit challenge before depositing. Expected: **402** `insufficient_balance`, and nothing is debited.
+- Deposit 1 KAS. Expected: one transaction with output 0 = 0.8 KAS to the merchant and output 1 = 0.2 KAS to the treasury, payload `kasgate:v1:` plus the quote nonce; the receipt shows `credit_sompi` 80000000 and the balance read shows 0.8 KAS. Re-posting the same deposit returns the same receipt (200); using its txId to pay a normal `/p` call is **409** `payment_replayed`.
+- Make a prepaid call. Expected: the upstream response and an `X-KasGate-Prepaid-Receipt` with `status` `debited`, `amountSompi` the price and `balanceSompi` reduced by it; no new transaction on the explorer. Send the same `X-KasGate-Prepaid` header again. Expected: **409** `payment_replayed` and the balance unchanged.
+- Sign a challenge, then change the query string or body before sending. Expected: **402** `invalid_payment_header` and nothing debited.
+- If you can make the upstream fail (5xx or offline), make one prepaid call. Expected: the receipt says `refunded` and the balance is back where it was.
+- Merchant: the dashboard "Prepaid credit" panel shows the buyer's balance, the deposit (with credit and fee) and each debit.
+
 ## When you are done
 
 File one bug report per distinct failure, using the [bug report form](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.

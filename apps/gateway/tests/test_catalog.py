@@ -223,6 +223,10 @@ async def test_llms_txt_describes_agent_payment_and_leaks_no_secrets(
         "KasGateClient.discover",
         "call_with_budget",
         "kasgate-mcp",
+        "kasgate-prepaid-v1",
+        "/v1/prepaid/challenge",
+        "X-KasGate-Prepaid",
+        "call_prepaid_endpoint",
     ):
         assert needle in body
     _assert_no_secrets(body)

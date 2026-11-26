@@ -35,6 +35,12 @@ Every 402 also offers the community [kaspa-x402](https://github.com/elldeeone/ka
 
 The KasGate buyer SDK reads the new envelope. Copies of the SDK from before CONTRACT v2.10 reject the envelope header and need to be updated.
 
+### Prepaid credit for micro-priced calls
+
+A buyer can deposit once and then pay many calls without a transaction each (CONTRACT v2.11, scheme `kasgate-prepaid-v1`). The deposit is an ordinary KasGate payment of at least 0.6 KAS to the merchant: output 0 pays the merchant, output 1 pays the platform fee (`max(1.5%, 0.2 KAS)`), and the merchant share becomes credit for that buyer key at that merchant. Each later call asks `POST /v1/prepaid/challenge` for a one-time challenge bound to the exact method, path, query and body hash, signs it with the depositing key and sends it as `X-KasGate-Prepaid`. The gateway debits the balance atomically (it can never go negative, and a replayed signature debits at most once) and returns an `X-KasGate-Prepaid-Receipt`. If the upstream gives no response or a 5xx, the debit is refunded.
+
+Merchants can mark an endpoint **prepaid only** and price it below the 0.6 KAS on-chain minimum (down to 1 sompi); its 402 then offers only the prepaid terms. Every other endpoint accepts both per-call payments and prepaid debits. KasGate still holds no coins: the deposit already paid the merchant on-chain, and unused credit is something the merchant owes in calls (there is no withdrawal, and no expiry or refund tooling yet). The buyer SDK (`prepaid_deposit`, `prepaid_request`, `prepaid_balance`) and the MCP server (`prepaid_deposit`, `call_prepaid_endpoint`, `prepaid_balance`) support it, and the dashboard shows balances, deposits and debits.
+
 ### Non-custodial by construction
 
 Funds never pass through KasGate. Every payment is a single on-chain transaction signed by the buyer:
