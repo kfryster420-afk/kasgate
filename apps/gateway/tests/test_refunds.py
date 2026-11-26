@@ -38,7 +38,7 @@ from tests.conftest import (
     seed_endpoint,
 )
 from tests.test_prepaid import CREDIT_SOMPI, DEPOSIT_SOMPI, add_endpoint, fund, request_challenge
-from tests.test_prepaid_balance_privacy import signed_headers
+from tests.test_prepaid_balance_privacy import refunds_status_headers, signed_headers
 
 MIN_REFUND = 20_000_000
 PAYOUT_TX = "ab" * 32
@@ -200,7 +200,7 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     blocked = await request_challenge(client)
     assert blocked.status_code == 402 and "spendable" in blocked.json()["message"]
     public = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    assert public["spendable_sompi"] == "0" and public["balance_sompi"] == str(CREDIT_SOMPI)
+    assert public["spendable_sompi"] == "0" and public["balance_sompi"] is None
     assert public["refund_hold_sompi"] is public["refunded_sompi"] is public["expired_sompi"] is None
     totals = (
         await client.get(
@@ -382,9 +382,15 @@ async def test_merchant_rejects_with_a_reason(
     twice = await client.post(path, json={"reason": "again"}, headers=bearer(shop.api_key))
     assert twice.status_code == 409 and twice.json()["error"] == "refund_not_rejectable"
     assert await event_types(sessionmaker) == ["prepaid.refund.requested", "prepaid.refund.rejected"]
-    public = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
+    unsigned = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
+    assert unsigned.status_code == 401 and unsigned.json()["error"] == "invalid_balance_signature"
+    public = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": "cheap", "payer_address": PAYER_ADDRESS},
+        headers=refunds_status_headers(),
+    )
     assert public.status_code == 200 and [r["status"] for r in public.json()] == ["rejected"]
-    assert public.json()[0]["reason"] is None  # reasons are not public
+    assert public.json()[0]["reason"] is None  # reasons stay hidden on the signed GET
     status_challenge = await challenge_of(client, action="status")
     assert status_challenge.amount_sompi == "0" and "Action: status" in status_challenge.message
     mine = await client.post("/v1/prepaid/refunds/status", json=signed(status_challenge))
@@ -647,7 +653,7 @@ async def test_expired_credit_stops_paying_and_is_swept_into_the_ledger(
     assert blocked.status_code == 402
     assert (await refund_challenge(client)).status_code == 422  # nothing spendable to refund
     balance = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    assert (balance["balance_sompi"], balance["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
+    assert (balance["balance_sompi"], balance["spendable_sompi"]) == (None, "0")
 
     async with sessionmaker() as session:
         assert await expire_due_balances(session, 10) == 1

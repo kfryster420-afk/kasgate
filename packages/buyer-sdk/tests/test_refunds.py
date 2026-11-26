@@ -32,6 +32,21 @@ def xonly(key_hex: str) -> str:
     return kaspa.PrivateKey(key_hex).to_public_key().to_x_only_public_key().to_string()
 
 
+
+def refunds_read_is_signed(request: httpx.Request) -> bool:
+    """What the gateway checks on GET /v1/prepaid/refunds/status."""
+    stamp = request.headers.get(gw.HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(gw.HEADER_BALANCE_SIGNATURE)
+    if stamp is None or signature is None:
+        return False
+    message = gw.build_prepaid_refunds_read_message(
+        domain=request.url.netloc.decode("ascii").lower(),
+        address=request.url.params["payer_address"],
+        slug=request.url.params["slug"],
+        timestamp=int(stamp),
+    )
+    return bool(kaspa.verify_message(message, signature, kaspa.PrivateKey(PAYER_KEY).to_public_key()))
+
 class RefundGateway:
     """Fake /v1/prepaid/refunds*: validates the SDK's bodies with the gateway's strict models and builds the
     challenge text with the gateway's builder, so a drifting SDK fails here."""
@@ -57,6 +72,8 @@ class RefundGateway:
             assert kaspa.verify_message(self.last["message"], body.signature, kaspa.PublicKey(xonly(PAYER_KEY)))
             return httpx.Response(200, json=[{**row, "reason": "promo credit"} for row in self.refunds])
         if path == "/v1/prepaid/refunds/status":
+            if not refunds_read_is_signed(request):
+                return httpx.Response(401, json={"error": "invalid_balance_signature", "message": "unsigned"})
             return httpx.Response(200, json=self.refunds)
         if path == "/v1/prepaid/refunds" or path.endswith("/cancel"):
             return self.signed(request)

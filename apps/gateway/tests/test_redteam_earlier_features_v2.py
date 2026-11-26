@@ -43,6 +43,7 @@ from tests.test_prepaid import (
     quote_deposit,
     shop,  # noqa: F401
 )
+from tests.test_prepaid_balance_privacy import refunds_status_headers
 from tests.test_refunds import open_refund, payout
 from tests.test_webhooks import create_hook
 
@@ -117,8 +118,9 @@ async def test_concurrent_deposits_across_the_backstop_dead_letter_once_and_neve
     """12 concurrent deposits; the cap drops while the third is being submitted. Every deposit that reached the node
     after that is dead-lettered exactly once (never credited, never lost) and a replay cannot credit it later.
 
-    Note (review Info I1): the cap is read before the row-lock wait, so deposits already queued on the lock compare
-    against the old cap, are submitted, and land in the DLQ instead of getting a 422 before submit."""
+    After I1 the cap is re-read under the row lock, so waiters that have not yet submitted see the new cap and
+    get 422 instead of a DLQ 503. The third deposit, already past the pre-check when the cap drops mid-settle,
+    is still dead-lettered exactly once."""
     override_settings(prepaid_max_balance_sompi=5 * CREDIT_SOMPI)
     quotes = [await quote_deposit(client) for _ in range(12)]
     tx_ids = [f"{i + 0x40:02x}" * 32 for i in range(12)]
@@ -183,10 +185,9 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
     sessionmaker: async_sessionmaker[AsyncSession],
     override_settings: Any,
 ) -> None:
-    """The deposit re-check sees the balance net of debits whose upstream call is still in flight. When such a debit
-    is then refunded (upstream 5xx or no response), `refund_prepaid_debit` (app/proxy.py:2077-2109) adds it back
-    with no cap condition, so the balance ends above prepaid_max_balance_sompi. Repeating the cycle grows it without
-    bound."""
+    """Option (a): in-flight debits (status=debited, upstream_status_code IS NULL) count toward the cap under the
+    same FOR UPDATE lock. A deposit that would pass only by ignoring a hanging debit is 422; the later 5xx refund
+    cannot land the balance past the cap."""
     cap = 60_000_000
     override_settings(prepaid_max_balance_sompi=cap)
     await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
@@ -206,7 +207,9 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
         call = asyncio.create_task(client.get("/p/half", headers={HEADER_PREPAID_DEBIT: debit_header(challenge)}))
         await asyncio.wait_for(reached.wait(), 5)  # debited: balance 20_000_000 while the upstream hangs
         deposited = await post_deposit(client, await quote_deposit(client), tx_id="5e" * 32)
-        assert deposited.status_code == 201, deposited.text  # 20_000_000 + 40_000_000 <= cap
+        # 20M balance + 20M in-flight + 40M credit > 60M cap
+        assert deposited.status_code == 422, deposited.text
+        assert deposited.json()["error"] == "prepaid_cap_exceeded"
         release.set()
         failed = await call
         assert failed.status_code == 503
@@ -215,7 +218,8 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
         app.state.http_client = original
 
     balance = await _balance(sessionmaker)
-    assert balance is not None and balance <= cap, f"balance {balance} is above the {cap} cap"
+    assert balance == CREDIT_SOMPI, f"balance {balance} after the 5xx refund"
+    assert balance <= cap
 
 
 # ---------------------------------------------------------------- L1 SSRF
@@ -409,26 +413,43 @@ async def test_unsigned_balance_returns_only_public_fields(
 ) -> None:
     await fund(client)
     body = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    hidden = ("deposited_sompi", "debited_sompi", "refunded_sompi", "expired_sompi", "refund_hold_sompi")
+    hidden = (
+        "merchant_id",
+        "payer_address",
+        "balance_sompi",
+        "deposited_sompi",
+        "debited_sompi",
+        "updated_at",
+        "refunded_sompi",
+        "expired_sompi",
+        "refund_hold_sompi",
+    )
     assert all(body[name] is None for name in hidden)
-    assert body["balance_sompi"] == body["spendable_sompi"] == str(CREDIT_SOMPI)
+    assert body["spendable_sompi"] == str(CREDIT_SOMPI)
+    assert "expires_at" in body
 
 
 async def test_hole_unsigned_refund_status_still_reveals_the_hidden_refund_totals(
     client: httpx.AsyncClient,
     shop: Seed,  # noqa: F811
 ) -> None:
-    """0dff846 nulls refunded_sompi and refund_hold_sompi on the unsigned GET /balance, but the unsigned
-    GET /v1/prepaid/refunds/status lists every refund's amount_sompi and status for any address, so anyone can
-    rebuild both totals (and, with on-chain deposits, debited_sompi). balance - spendable also equals the hold."""
+    """GET /v1/prepaid/refunds/status is buyer-signed. Unsigned or invalid requests are 401 and do not list
+    amounts; a valid signature returns the public refund rows (reasons still withheld)."""
     await fund(client)
     await open_refund(client, 20_000_000)
     params = {"slug": "cheap", "payer_address": PAYER_ADDRESS}
     balance = (await client.get("/v1/prepaid/balance", params=params)).json()
-    assert balance["refund_hold_sompi"] is None  # hidden here
-    refunds = (await client.get("/v1/prepaid/refunds/status", params=params)).json()
+    assert balance["refund_hold_sompi"] is None
+    assert balance["balance_sompi"] is None
+    assert balance["spendable_sompi"] == str(CREDIT_SOMPI - 20_000_000)
+    unsigned = await client.get("/v1/prepaid/refunds/status", params=params)
+    assert unsigned.status_code == 401, unsigned.text
+    assert unsigned.json()["error"] == "invalid_balance_signature"
+    assert "20000000" not in unsigned.text
+    refunds = (await client.get("/v1/prepaid/refunds/status", params=params, headers=refunds_status_headers())).json()
     open_amounts = [r["amount_sompi"] for r in refunds if r["status"] in ("requested", "paying", "payout_submitted")]
-    assert open_amounts == [], f"unsigned refund status shows the hidden hold: {open_amounts}"
+    assert open_amounts == ["20000000"]
+    assert refunds[0]["reason"] is None
 
 
 # ---------------------------------------------------------------- 429 shape

@@ -41,6 +41,7 @@ from tests.conftest import (
 from tests.test_k402 import FakeNode, make_engine
 from tests.test_migration import _diff
 from tests.test_prepaid import CREDIT_SOMPI, fund
+from tests.test_prepaid_balance_privacy import refunds_status_headers
 from tests.test_refund_hardening import age, attempts_of, cancel, claim
 from tests.test_refund_payouts import AMOUNT, REFUND_ID, payout_tx, wire
 from tests.test_refunds import (
@@ -78,7 +79,11 @@ async def test_hole_claim_lapse_lets_the_buyer_cancel_and_spend_a_payout_already
     await fund(client)
     refund = await open_refund(client)
     assert (await claim(client, shop, refund.id)).status_code == 200
-    public = await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
+    public = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": shop.slug, "payer_address": PAYER_ADDRESS},
+        headers=refunds_status_headers(slug=shop.slug),
+    )
     # The public view no longer shows the claim (`paying` reads as `requested`, no claim times): no lapse to time.
     assert public.json()[0]["status"] == "requested" and public.json()[0]["claimed_at"] is None
     await age(sessionmaker, refund.id, claimed_at=datetime.now(UTC) - LAPSED)
@@ -235,7 +240,11 @@ async def test_held_signed_status_is_single_use_key_bound_and_action_bound(
         f"/v1/prepaid/refunds/{refund.id}/reject", json={"reason": "secret merchant note"}, headers=bearer(shop.api_key)
     )
     assert rejected.status_code == 200
-    public = await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
+    public = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": shop.slug, "payer_address": PAYER_ADDRESS},
+        headers=refunds_status_headers(slug=shop.slug),
+    )
     assert "secret merchant note" not in public.text
     status = await challenge_of(client, action="status")
     assert (await client.post("/v1/prepaid/refunds/status", json=signed(status, OTHER_KEY))).status_code == 400

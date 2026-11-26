@@ -74,6 +74,7 @@ from .prepaid import (
     PrepaidRefundChallenge,
     RefundAction,
     build_prepaid_balance_read_message,
+    build_prepaid_refunds_read_message,
     prepaid_body_hash,
     slug_of,
     validate_debit_challenge,
@@ -674,15 +675,26 @@ class KasGateClient:
     ) -> list[PrepaidRefund]:
         """This key's refunds at the merchant behind `slug`, newest first.
 
-        Unsigned (default) it is the public read: the merchant's reject `reason` and payout errors are withheld.
+        The default GET is buyer-signed with the same headers as `prepaid_balance` (Purpose
+        `kasgate:v1:refunds-status-read`); the merchant's reject `reason` and payout errors stay withheld.
         With `signed=True` it signs a `status` challenge (moves nothing) and the rows include them."""
         if signed:
             origin, (_, signed_body) = await self._sign_refund_challenge(gateway_url, slug, "status", None, None)
             response = await self._http.post(origin + REFUND_STATUS_PATH, json=signed_body)
         else:
-            origin = self._origin(self._absolute(gateway_url))
+            url = self._absolute(gateway_url)
+            origin = self._origin(url)
+            timestamp = int(time.time())
+            message = build_prepaid_refunds_read_message(
+                domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
+            )
             response = await self._http.get(
-                origin + REFUND_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
+                origin + REFUND_STATUS_PATH,
+                params={"slug": slug, "payer_address": self.address},
+                headers={
+                    HEADER_BALANCE_TIMESTAMP: str(timestamp),
+                    HEADER_BALANCE_SIGNATURE: kaspa.sign_message(message, self._private_key),
+                },
             )
         if response.status_code != 200:
             code, message = error_details(response)

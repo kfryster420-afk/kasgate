@@ -19,8 +19,10 @@ returned is never taxed). The gateway only keeps the record:
 3. Merchant may ``reject`` a ``requested``/``paying`` refund with a reason; the buyer may ``cancel`` a ``requested``
    one (or a ``paying`` one whose claim is older than ``prepaid_refund_claim_ttl_seconds``) with a signed challenge,
    never while an attempted payout is pending. Both release the hold. A payout that lands anyway is still recorded.
-4. ``GET /v1/prepaid/refunds/status`` is public without reasons or payout errors; ``POST /v1/prepaid/refunds/status``
-   with a signed ``status`` challenge returns the full rows.
+4. ``GET /v1/prepaid/refunds/status`` is buyer-signed (same headers as the balance read, Purpose
+   ``kasgate:v1:refunds-status-read``) and still withholds reasons and payout errors; unsigned or invalid -> 401
+   ``invalid_balance_signature``. ``POST /v1/prepaid/refunds/status`` with a signed ``status`` challenge returns the
+   full rows.
 
 Every step queues a webhook event (``prepaid.refund.requested|paid|rejected|cancelled|payout_reverted``).
 """
@@ -79,8 +81,11 @@ from app.models import (
     Settlement,
 )
 from app.payments import PaymentVerificationError, PayoutSighting, RpcUnavailableError
+from app.prepaid import buyer_read_signed
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     SLUG_RE,
     PrepaidLedgerEntryRead,
     PrepaidRefundChallenge,
@@ -90,6 +95,7 @@ from app.schemas import (
     PrepaidRefundReject,
     PrepaidRefundSigned,
     build_prepaid_refund_message,
+    build_prepaid_refunds_read_message,
     new_payment_nonce,
     refund_payout_payload,
 )
@@ -694,12 +700,14 @@ async def _release_hold(session: AsyncSession, refund: PrepaidRefund) -> int:
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
 async def refund_status(
+    request: Request,
     session: DbSession,
     slug: Annotated[str, Query(min_length=3, max_length=64, pattern=SLUG_RE)],
     payer_address: Annotated[str, Query(min_length=10, max_length=100)],
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> Response:
-    """Public: this key's refunds at the merchant behind `slug`, newest first (like GET /balance, no signature).
+    """This key's refunds at the merchant behind `slug`, newest first. Buyer-signed (same headers as the
+    balance read, Purpose `kasgate:v1:refunds-status-read`); unsigned or invalid is 401.
 
     The merchant's `reason` and the payout `last_error` are withheld (null) here; POST /refunds/status with a
     signed `status` challenge returns them to the buyer.
@@ -711,6 +719,17 @@ async def refund_status(
     public_key = payer_public_key(address)
     if public_key is None:
         return _error(400, "invalid_payer", "payer_address must be a P2PK Schnorr address (kaspa:q...)")
+    signed = buyer_read_signed(
+        request,
+        address=address,
+        slug=slug,
+        public_key=public_key,
+        build_message=build_prepaid_refunds_read_message,
+        required=True,
+        kind="refunds",
+    )
+    if isinstance(signed, JSONResponse):
+        return signed
     try:
         endpoint = await _endpoint_merchant(session, slug)
         if endpoint is None:
@@ -733,7 +752,7 @@ async def refund_status(
         return _store_unavailable()
     return JSONResponse(
         content=[PrepaidRefundRead.model_validate(row).public().model_dump(mode="json") for row in rows],
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store", "Vary": f"{HEADER_BALANCE_TIMESTAMP}, {HEADER_BALANCE_SIGNATURE}"},
     )
 
 

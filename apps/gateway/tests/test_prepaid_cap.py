@@ -112,3 +112,37 @@ async def test_backstop_dead_letters_a_settled_deposit_that_would_pass_the_cap(
     assert len(letters) == 1
     assert letters[0]["reason"] == "prepaid_cap_exceeded" and letters[0]["creditSompi"] == CREDIT_SOMPI
     assert letters[0]["prepaidDeposit"]["txId"] == "d1" * 32
+
+
+async def test_cap_drop_while_queued_on_the_row_lock_is_refused_before_submit(
+    client: httpx.AsyncClient,
+    shop: Seed,  # noqa: F811
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_engine: StubEngine,
+    override_settings: Any,
+) -> None:
+    """I1: the cap is re-read after the row lock, so a drop while a deposit waits yields 422, not a DLQ 503."""
+    override_settings(prepaid_max_balance_sompi=100_000_000)
+    first = await quote_deposit(client)
+    second = await quote_deposit(client)
+    first_settling = asyncio.Event()
+    allow_first = asyncio.Event()
+
+    async def hold_first(signature: PaymentSignature) -> None:
+        first_settling.set()
+        override_settings(prepaid_max_balance_sompi=60_000_000)
+        await allow_first.wait()
+
+    stub_engine.before_submit = hold_first
+    first_task = asyncio.create_task(post_deposit(client, first, tx_id="e1" * 32))
+    await asyncio.wait_for(first_settling.wait(), 5)
+    second_task = asyncio.create_task(post_deposit(client, second, tx_id="e2" * 32))
+    await asyncio.sleep(0.15)  # let the second reach the balance row lock
+    allow_first.set()
+    first_resp, second_resp = await asyncio.gather(first_task, second_task)
+    assert first_resp.status_code == 201, first_resp.text
+    assert second_resp.status_code == 422, second_resp.text
+    assert second_resp.json()["error"] == "prepaid_cap_exceeded"
+    assert stub_engine.calls == ["e1" * 32]  # the waiter never reached the node
+    assert await _balance(sessionmaker) == CREDIT_SOMPI
+

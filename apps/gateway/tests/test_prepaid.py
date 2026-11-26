@@ -453,7 +453,8 @@ async def test_deposit_credits_the_merchant_share_and_records_the_split(
     assert await count(sessionmaker, PrepaidBalance) == 1 and await count(sessionmaker, PrepaidDeposit) == 2
 
     public = await client.get("/v1/prepaid/balance", params={"slug": "weather", "payer_address": PAYER_ADDRESS})
-    assert public.status_code == 200 and public.json()["balance_sompi"] == str(CREDIT_SOMPI + 1_970_000_000)
+    assert public.status_code == 200 and public.json()["spendable_sompi"] == str(CREDIT_SOMPI + 1_970_000_000)
+    assert public.json()["balance_sompi"] is None
 
 
 async def test_deposit_replay_is_idempotent_and_never_credits_twice(
@@ -914,4 +915,5 @@ async def test_merchant_ledger_routes(
     other = await seed_endpoint(sessionmaker, slug="elsewhere", address=OTHER_ADDRESS)
     assert (await client.get("/v1/prepaid/balances", headers=bearer(other.api_key))).json() == []
     empty = await client.get("/v1/prepaid/balance", params={"slug": "elsewhere", "payer_address": PAYER_ADDRESS})
-    assert empty.status_code == 200 and empty.json()["balance_sompi"] == "0"
+    assert empty.status_code == 200 and empty.json()["spendable_sompi"] == "0"
+    assert empty.json()["balance_sompi"] is None

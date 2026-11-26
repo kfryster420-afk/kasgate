@@ -473,6 +473,8 @@ def test_unsigned_public_balance_parses_without_totals() -> None:
 def test_balance_read_message_and_headers_match_the_gateway() -> None:
     args = {"domain": "gw.example", "address": PAYER, "slug": "weather", "timestamp": 1_800_000_000}
     assert sdk.build_prepaid_balance_read_message(**args) == gw.build_prepaid_balance_read_message(**args)
+    assert sdk.build_prepaid_refunds_read_message(**args) == gw.build_prepaid_refunds_read_message(**args)
+    assert sdk.PREPAID_REFUNDS_READ_PURPOSE == gw.PREPAID_REFUNDS_READ_PURPOSE
     assert (sdk.HEADER_BALANCE_TIMESTAMP, sdk.HEADER_BALANCE_SIGNATURE) == (
         gw.HEADER_BALANCE_TIMESTAMP,
         gw.HEADER_BALANCE_SIGNATURE,

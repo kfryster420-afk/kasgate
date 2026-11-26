@@ -97,5 +97,21 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - CONTRACTS Limits adds the shortfall case of a payout accepted at or before `first_claimed_daa_score` (broadcast
   before or at the first claim), and keeps the null-score skip. Merchants should claim before broadcasting.
 
+### Security: earlier-features v2 (CONTRACT v2.12.1 / v2.13, before release)
+
+- SSRF: the SIIT IPv4-translated prefix `0:0:0:0:ffff:0:0:0/96` (`::ffff:0:a.b.c.d`) is refused by `is_forbidden_ip`
+  and webhook URL validation, like `::/96` and `fec0::/10`.
+- Prepaid cap: the cap is re-read after the balance row lock, so a drop while a deposit is queued is 422 before
+  submit, not a settled-then-DLQ 503. In-flight prepaid debits (`prepaid_debits` with `status = 'debited'` and
+  `upstream_status_code` IS NULL) are counted under that same lock; a deposit that would pass only by ignoring a
+  hanging debit is 422, so a later 5xx refund cannot land the balance past the cap. Refunds are not clamped.
+- Unsigned `GET /v1/prepaid/balance` returns only `spendable_sompi` and `expires_at`; `balance_sompi`, `updated_at`,
+  identity and ledger totals are null. 402 prepaid offers' `balanceUrl` is this read: use `spendable_sompi`. A
+  buyer-signed read (and merchant `GET /balances`) still fills every field.
+- `GET /v1/prepaid/refunds/status` is buyer-signed with the same headers as the balance read over Purpose
+  `kasgate:v1:refunds-status-read`. Unsigned or invalid -> 401 `invalid_balance_signature`. Reasons and the claim
+  stay withheld; `POST /refunds/status` with a `status` challenge is unchanged. The buyer SDK signs the default
+  `prepaid_refunds` GET; MCP `prepaid_refunds` follows it.
+
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.

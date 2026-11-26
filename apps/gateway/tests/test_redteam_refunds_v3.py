@@ -25,6 +25,7 @@ from tests.conftest import GATEWAY_DIR, PAYER_ADDRESS, PgServer, Seed, StubEngin
 from tests.test_k402 import FakeNode, _script_hex, make_engine
 from tests.test_migration import _diff
 from tests.test_prepaid import fund
+from tests.test_prepaid_balance_privacy import refunds_status_headers
 from tests.test_refund_hardening import age, attempts_of, cancel, claim
 from tests.test_refund_payouts import AMOUNT, REFUND_ID, PayloadMempoolNode, bound_tx, payout_tx
 from tests.test_refunds import (
@@ -178,12 +179,20 @@ async def test_info_claim_state_is_still_observable_without_a_signature(
     await fund(client)
     refund = await open_refund(client)
     before = (
-        await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
+        await client.get(
+            "/v1/prepaid/refunds/status",
+            params={"slug": shop.slug, "payer_address": PAYER_ADDRESS},
+            headers=refunds_status_headers(slug=shop.slug),
+        )
     ).json()[0]
     await asyncio.sleep(0.01)
     assert (await claim(client, shop, refund.id)).status_code == 200
     after = (
-        await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
+        await client.get(
+            "/v1/prepaid/refunds/status",
+            params={"slug": shop.slug, "payer_address": PAYER_ADDRESS},
+            headers=refunds_status_headers(slug=shop.slug),
+        )
     ).json()[0]
     assert after["status"] == "requested" and after["updated_at"] != before["updated_at"]
     probe = await refund_challenge(client, action="cancel", refund_id=refund.id)

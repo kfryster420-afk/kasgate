@@ -12,7 +12,7 @@ Routes (all under /v1/prepaid):
   ``resolve_inputs`` + ``settle``, then ONE transaction: settlement row (kaspa-exact-v1, fee > 0, treasury), balance
   upsert (credit = merchant share only) and the prepaid_deposits row (unique tx_id and settlement_id).
 * ``POST /challenge`` (public, unpaid rate limit) -> 201 PrepaidChallenge: the exact text to sign for ONE debit.
-* ``GET /balance?slug=&payer_address=`` (public balance and spendable; ledger totals only when buyer-signed)
+* ``GET /balance?slug=&payer_address=`` (public spendable and expiry; everything else only when buyer-signed)
   -> PrepaidBalanceRead.
 * ``GET /balances``, ``GET /deposits``, ``GET /debits`` [Bearer] -> the merchant's own prepaid ledger.
 
@@ -25,6 +25,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Final
@@ -44,7 +45,15 @@ from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
 from app.ledger import expire_balance_for, spendable_sompi
-from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
+from app.models import (
+    PREPAID_DEBIT_DEBITED,
+    Endpoint,
+    Merchant,
+    PrepaidBalance,
+    PrepaidDebit,
+    PrepaidDeposit,
+    Settlement,
+)
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
 from app.proxy import (
@@ -141,8 +150,10 @@ class _CapBackstopError(Exception):
     """The conditional credit found the balance already at the cap: the settled deposit must not be credited."""
 
 
-async def _lock_balance_row(session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str) -> int:
-    """Lock the (merchant, key) balance row FOR UPDATE and return its balance.
+async def _lock_balance_row(
+    session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str
+) -> tuple[uuid.UUID, int]:
+    """Lock the (merchant, key) balance row FOR UPDATE and return its id and balance.
 
     A zero row is inserted first (ON CONFLICT DO NOTHING) so a buyer's very first deposits serialize too: a second
     insert of the same unique key waits for the first transaction. The row is held until the deposit commits or
@@ -161,14 +172,31 @@ async def _lock_balance_row(session: AsyncSession, merchant_id: uuid.UUID, payer
         )
         .on_conflict_do_nothing(index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key])
     )
-    balance = (
+    row = (
         await session.execute(
-            select(PrepaidBalance.balance_sompi)
+            select(PrepaidBalance.id, PrepaidBalance.balance_sompi)
             .where(PrepaidBalance.merchant_id == merchant_id, PrepaidBalance.payer_public_key == public_key)
             .with_for_update()
         )
+    ).one()
+    return row[0], int(row[1])
+
+
+async def _in_flight_debit_sompi(session: AsyncSession, balance_id: uuid.UUID) -> int:
+    """Sompi already taken for a debit whose upstream has not been recorded yet (status still debited, no
+    upstream_status_code). Successful completed debits stay `debited` but have a status code; refunded rows do not
+    count. Must be read under the balance row's FOR UPDATE lock, which also serialises refunds of those debits.
+    """
+    total = (
+        await session.execute(
+            select(func.coalesce(func.sum(PrepaidDebit.amount_sompi), 0)).where(
+                PrepaidDebit.balance_id == balance_id,
+                PrepaidDebit.status == PREPAID_DEBIT_DEBITED,
+                PrepaidDebit.upstream_status_code.is_(None),
+            )
+        )
     ).scalar_one()
-    return int(balance)
+    return int(total)
 
 
 def _cap_exceeded(cap: int, current: int) -> JSONResponse:
@@ -202,20 +230,33 @@ def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDeposit
 def _balance_read(
     merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None, *, totals: bool = True
 ) -> PrepaidBalanceRead:
-    """`totals=False` (the unsigned public read) leaves deposited/debited/refunded/expired/hold null.
-
-    `balance_sompi` and `spendable_sompi` stay public so agents can see what they can still spend without signing.
+    """`totals=False` (the unsigned public read) returns only `spendable_sompi` and `expires_at`; everything else
+    is null. A signed read and merchant views fill every field.
     """
+    if not totals:
+        return PrepaidBalanceRead(
+            merchant_id=None,
+            payer_address=None,
+            balance_sompi=None,
+            deposited_sompi=None,
+            debited_sompi=None,
+            updated_at=None,
+            refunded_sompi=None,
+            expired_sompi=None,
+            refund_hold_sompi=None,
+            spendable_sompi=str(spendable_sompi(balance)),
+            expires_at=None if balance is None else balance.expires_at,
+        )
     return PrepaidBalanceRead(
         merchant_id=merchant_id,
         payer_address=payer_address if balance is None else balance.payer_address,
         balance_sompi=str(0 if balance is None else balance.balance_sompi),
-        deposited_sompi=str(0 if balance is None else balance.deposited_sompi) if totals else None,
-        debited_sompi=str(0 if balance is None else balance.debited_sompi) if totals else None,
+        deposited_sompi=str(0 if balance is None else balance.deposited_sompi),
+        debited_sompi=str(0 if balance is None else balance.debited_sompi),
         updated_at=None if balance is None else balance.updated_at,
-        refunded_sompi=str(0 if balance is None else balance.refunded_sompi) if totals else None,
-        expired_sompi=str(0 if balance is None else balance.expired_sompi) if totals else None,
-        refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi) if totals else None,
+        refunded_sompi=str(0 if balance is None else balance.refunded_sompi),
+        expired_sompi=str(0 if balance is None else balance.expired_sompi),
+        refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi),
         spendable_sompi=str(spendable_sompi(balance)),
         expires_at=None if balance is None else balance.expires_at,
     )
@@ -225,16 +266,32 @@ _BALANCE_TIMESTAMP_RE: Final = re.compile(r"^[0-9]{1,12}$")
 _BALANCE_SIGNATURE_RE: Final = re.compile(r"^[0-9a-f]{128}$")
 
 
-def _balance_read_signed(request: Request, *, address: str, slug: str, public_key: str) -> bool | JSONResponse:
-    """False when the request carries no balance signature (public read), True when it verifies, otherwise a 401.
+def buyer_read_signed(
+    request: Request,
+    *,
+    address: str,
+    slug: str,
+    public_key: str,
+    build_message: Callable[..., str],
+    required: bool = False,
+    kind: str = "balance",
+) -> bool | JSONResponse:
+    """False when the request carries no signature (and `required` is False), True when it verifies, else a 401.
 
-    The buyer signs `build_prepaid_balance_read_message` with the key behind `payer_address`; the timestamp must be
-    within PREPAID_BALANCE_READ_TOLERANCE_SECONDS of now. A read only, so a replay inside the window reveals
-    nothing the signer did not already choose to read.
+    The buyer signs `build_message` (balance-read or refunds-status-read) with the key behind `payer_address`; the
+    timestamp must be within PREPAID_BALANCE_READ_TOLERANCE_SECONDS of now. A read only, so a replay inside the
+    window reveals nothing the signer did not already choose to read. Used by GET /balance (optional) and
+    GET /refunds/status (required). Same headers and 401 `invalid_balance_signature` shape for both.
     """
     stamp = request.headers.get(HEADER_BALANCE_TIMESTAMP)
     signature = request.headers.get(HEADER_BALANCE_SIGNATURE)
     if stamp is None and signature is None:
+        if required:
+            return _error(
+                401,
+                "invalid_balance_signature",
+                f"send both {HEADER_BALANCE_TIMESTAMP} and {HEADER_BALANCE_SIGNATURE}",
+            )
         return False
     if stamp is None or signature is None:
         return _error(
@@ -250,11 +307,26 @@ def _balance_read_signed(request: Request, *, address: str, slug: str, public_ke
         )
     timestamp = int(stamp)
     if abs(int(time.time()) - timestamp) > PREPAID_BALANCE_READ_TOLERANCE_SECONDS:
-        return _error(401, "invalid_balance_signature", "balance signature timestamp is outside the allowed window")
-    message = build_prepaid_balance_read_message(domain=auth_domain(), address=address, slug=slug, timestamp=timestamp)
+        return _error(
+            401, "invalid_balance_signature", f"{kind} signature timestamp is outside the allowed window"
+        )
+    message = build_message(domain=auth_domain(), address=address, slug=slug, timestamp=timestamp)
     if not verify_prepaid_signature(message, signature.lower(), public_key):
-        return _error(401, "invalid_balance_signature", "balance signature does not verify for payer_address")
+        return _error(401, "invalid_balance_signature", f"{kind} signature does not verify for payer_address")
     return True
+
+
+def _balance_read_signed(request: Request, *, address: str, slug: str, public_key: str) -> bool | JSONResponse:
+    """False when the request carries no balance signature (public read), True when it verifies, otherwise a 401."""
+    return buyer_read_signed(
+        request,
+        address=address,
+        slug=slug,
+        public_key=public_key,
+        build_message=build_prepaid_balance_read_message,
+        required=False,
+        kind="balance",
+    )
 
 
 async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
@@ -474,10 +546,14 @@ async def deposit(
         return _error(409, "payment_replayed", "this transaction or payment nonce is already being processed")
 
     # Cap re-check under a row lock on the (merchant, key) balance, BEFORE anything reaches the node: quotes only
-    # checked the balance of their own moment, so N quotes taken together would otherwise all be credited.
-    cap = get_settings().prepaid_max_balance_sompi
+    # checked the balance of their own moment, so N quotes taken together would otherwise all be credited. The cap
+    # is read *after* the lock so a mid-queue drop is a 422, not a settled-then-DLQ 503. In-flight debits (already
+    # subtracted from the balance, still refundable if the upstream fails) are reserved so a later 5xx refund cannot
+    # land the balance past the cap.
     try:
-        current = await _lock_balance_row(session, endpoint.merchant_id, signature.payerAddress, public_key)
+        balance_id, current = await _lock_balance_row(
+            session, endpoint.merchant_id, signature.payerAddress, public_key
+        )
         # Paid refunds and expiry lower balance_sompi (a refund hold stays in the balance until payout). Expire
         # overdue credit under this same row lock so the cap sees the post-expiry balance.
         await expire_balance_for(session, endpoint.merchant_id, public_key)
@@ -491,12 +567,14 @@ async def deposit(
                 )
             ).scalar_one()
         )
+        in_flight = await _in_flight_debit_sompi(session, balance_id)
+        cap = get_settings().prepaid_max_balance_sompi
     except SQLAlchemyError:
         await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         logger.exception("prepaid balance lock failed")
         return _store_unavailable()
-    if current + required.merchant_amount_sompi > cap:
+    if current + in_flight + required.merchant_amount_sompi > cap:
         await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         return _cap_exceeded(cap, current)
@@ -546,7 +624,8 @@ async def deposit(
                 .where(
                     PrepaidBalance.merchant_id == endpoint.merchant_id,
                     PrepaidBalance.payer_public_key == public_key,
-                    PrepaidBalance.balance_sompi + credit <= get_settings().prepaid_max_balance_sompi,
+                    PrepaidBalance.balance_sompi + credit + in_flight
+                    <= get_settings().prepaid_max_balance_sompi,
                 )
                 .values(
                     balance_sompi=PrepaidBalance.balance_sompi + credit,
