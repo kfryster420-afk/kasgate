@@ -111,6 +111,11 @@ export function EndpointsPanel({ endpoints, onChanged, onUnauthorized }: Props) 
                     <StatusBadge status={endpoint.is_active ? "active" : "inactive"} />
                     {endpoint.is_public_listed ? <span className="badge border-zinc-700 bg-zinc-900 text-zinc-400">listed</span> : null}
                     {endpoint.prepaid_only ? <span className="badge border-kas-800 bg-kas-500/10 text-kas-300">prepaid only</span> : null}
+                    {endpoint.free_trial_calls > 0 ? (
+                      <span className="badge border-emerald-800 bg-emerald-500/10 text-emerald-300" title={`${endpoint.trial_daily_cap} trial calls per day across all buyers`}>
+                        {endpoint.free_trial_calls} free {endpoint.free_trial_calls === 1 ? "call" : "calls"}
+                      </span>
+                    ) : null}
                     {endpoint.category ? <span className="badge border-zinc-700 bg-zinc-900 text-zinc-400">{endpoint.category}</span> : null}
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">

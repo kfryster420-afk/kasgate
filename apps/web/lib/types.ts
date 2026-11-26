@@ -287,6 +287,10 @@ export interface EndpointCreate {
   is_public_listed?: boolean;
   /** CONTRACT v2.11: payable only from prepaid balances; the price may then be below the 0.6 KAS on-chain minimum. */
   prepaid_only?: boolean;
+  /** CONTRACT v2.12: free calls per buyer key (0..100, default 0 = no trial). */
+  free_trial_calls?: number;
+  /** CONTRACT v2.12: trial calls this endpoint serves per UTC day across all buyers (1..100000, default 100). */
+  trial_daily_cap?: number;
 }
 
 export interface EndpointUpdate {
@@ -302,6 +306,9 @@ export interface EndpointUpdate {
   is_active?: boolean | null;
   is_public_listed?: boolean | null;
   prepaid_only?: boolean | null;
+  /** Not nullable on the gateway: omit to keep. */
+  free_trial_calls?: number;
+  trial_daily_cap?: number;
 }
 
 export interface EndpointRead {
@@ -319,6 +326,8 @@ export interface EndpointRead {
   is_active: boolean;
   is_public_listed: boolean;
   prepaid_only: boolean;
+  free_trial_calls: number;
+  trial_daily_cap: number;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
   /** computed_field; null when price_currency is USD. */
@@ -360,6 +369,8 @@ export interface OpenApiImportBody {
   upstream_headers?: Record<string, string>;
   category?: string;
   is_public_listed?: boolean;
+  /** CONTRACT v2.12: free trial calls per buyer key on every imported endpoint (0..100, default 0). */
+  free_trial_calls?: number;
   selections?: OpenApiImportSelection[];
 }
 
@@ -514,6 +525,8 @@ export interface DirectoryEntry {
   proxy_url: string;
   /** CONTRACT v2.11: payable only from a prepaid balance (absent on gateways before v2.11). */
   prepaid_only?: boolean;
+  /** CONTRACT v2.12: free trial calls per buyer key (absent on gateways before v2.12). */
+  free_trial_calls?: number;
 }
 
 export interface DirectoryManifest {
@@ -553,4 +566,102 @@ export interface ApiErrorBody {
   code?: string;
   /** POST /api/endpoints/import only: per-selection errors keyed by the selection's index in the request. */
   row_errors?: Record<string, string>;
+}
+
+/* ------------------------------------------------------------------ free trial calls (CONTRACT v2.12) */
+
+/** On a 402: Base64(JSON TrialOffer) when the endpoint offers free trial calls. */
+export const HEADER_TRIAL_OFFER = "X-KasGate-Trial-Offer";
+/** Request header: Base64(JSON {nonce, signature}) for ONE trial call. */
+export const HEADER_TRIAL_CALL = "X-KasGate-Trial";
+/** Response headers on a trial call. */
+export const HEADER_TRIAL_RECEIPT = "X-KasGate-Trial-Receipt";
+export const HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit";
+export const HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining";
+export const TRIAL_MAX_CALLS = 100;
+export const TRIAL_DAILY_CAP_DEFAULT = 100;
+export const TRIAL_DAILY_CAP_MAX = 100_000;
+
+export interface TrialOffer {
+  scheme: "kasgate-trial-v1";
+  freeTrialCalls: number;
+  challengeUrl: string;
+  statusUrl: string;
+}
+
+export type TrialCallStatus = "used" | "refunded";
+
+export interface TrialCallRead {
+  id: Uuid;
+  endpoint_id: Uuid;
+  payer_address: string;
+  nonce: string;
+  status: TrialCallStatus;
+  request_method: string;
+  request_path: string;
+  upstream_status_code: number | null;
+  created_at: IsoDateTime;
+  refunded_at: IsoDateTime | null;
+}
+
+/* ------------------------------------------------------------------ merchant webhooks (CONTRACT v2.12) */
+
+export const WEBHOOK_EVENT_TYPES = [
+  "payment.settled",
+  "prepaid.deposit",
+  "prepaid.debit",
+  "trial.used",
+  "endpoint.created",
+  "endpoint.updated",
+] as const;
+export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+export type WebhookDeliveryStatus = "pending" | "delivering" | "succeeded" | "dead";
+export const WEBHOOK_SIGNATURE_HEADER = "X-KasGate-Signature";
+export const WEBHOOK_TIMESTAMP_HEADER = "X-KasGate-Timestamp";
+export const WEBHOOK_EVENT_ID_HEADER = "X-KasGate-Event-Id";
+
+export interface WebhookCreate {
+  url: string;
+  event_types: WebhookEventType[];
+  description?: string | null;
+}
+
+export interface WebhookUpdate {
+  url?: string;
+  event_types?: WebhookEventType[];
+  description?: string | null;
+  is_active?: boolean;
+}
+
+export interface WebhookRead {
+  id: Uuid;
+  url: string;
+  description: string | null;
+  event_types: string[];
+  /** First characters of the signing secret, to tell secrets apart. Never the secret. */
+  secret_prefix: string;
+  is_active: boolean;
+  created_at: IsoDateTime;
+  updated_at: IsoDateTime;
+}
+
+/** Returned by create and rotate-secret only: the signing secret is shown once. */
+export interface WebhookCreated {
+  webhook: WebhookRead;
+  secret: string;
+}
+
+export interface WebhookDeliveryRead {
+  id: Uuid;
+  webhook_id: Uuid;
+  event_id: string;
+  event_type: string;
+  status: WebhookDeliveryStatus;
+  attempts: number;
+  next_attempt_at: IsoDateTime | null;
+  last_attempt_at: IsoDateTime | null;
+  last_status_code: number | null;
+  last_error: string | null;
+  delivered_at: IsoDateTime | null;
+  created_at: IsoDateTime;
 }

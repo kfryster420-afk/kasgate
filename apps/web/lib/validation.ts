@@ -1,6 +1,15 @@
 import { ADDRESS_PREFIX, MAX_SOMPI, MAX_USD_MICROS } from "./config";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, minPriceSompi } from "./sompi";
-import { HTTP_METHODS, PRICE_CURRENCIES, type HttpMethod, type PriceCurrency } from "./types";
+import {
+  HTTP_METHODS,
+  PRICE_CURRENCIES,
+  TRIAL_DAILY_CAP_MAX,
+  TRIAL_MAX_CALLS,
+  WEBHOOK_EVENT_TYPES,
+  type HttpMethod,
+  type PriceCurrency,
+  type WebhookEventType,
+} from "./types";
 
 /** Mirrors KASPA_ADDRESS_RE in schemas.py. */
 const KASPA_ADDRESS_RE = /^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$/;
@@ -167,4 +176,65 @@ export function checkPriceUsdMicros(input: unknown): Check<string> {
   const value = BigInt(input.trim());
   if (value > MAX_USD_MICROS) return fail("Price exceeds the maximum of $1,000,000,000");
   return ok(value.toString());
+}
+
+/** CONTRACT v2.12: free trial calls per buyer key, a whole number 0..100 (0 = no trial). */
+export function checkFreeTrialCalls(input: unknown): Check<number> {
+  if (typeof input !== "number" || !Number.isInteger(input) || input < 0 || input > TRIAL_MAX_CALLS) {
+    return fail(`Free trial calls must be a whole number from 0 to ${TRIAL_MAX_CALLS}`);
+  }
+  return ok(input);
+}
+
+/** CONTRACT v2.12: trial calls per UTC day across all buyers, a whole number 1..100000. */
+export function checkTrialDailyCap(input: unknown): Check<number> {
+  if (typeof input !== "number" || !Number.isInteger(input) || input < 1 || input > TRIAL_DAILY_CAP_MAX) {
+    return fail(`Daily trial cap must be a whole number from 1 to ${TRIAL_DAILY_CAP_MAX.toLocaleString("en-US")}`);
+  }
+  return ok(input);
+}
+
+const WEBHOOK_LOCAL_SUFFIXES = [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain"];
+
+/** Mirrors validate_webhook_url in schemas.py: HTTPS only, no credentials or fragment, no local or private host.
+ * The gateway re-resolves the name on every delivery and refuses non-public addresses. */
+export function checkWebhookUrl(input: unknown): Check<string> {
+  if (typeof input !== "string") return fail("Webhook URL is required");
+  const value = input.trim();
+  if (value.length > 2048) return fail("Webhook URL must be at most 2048 characters");
+  if (/[^\x21-\x7e]/.test(value)) return fail("Webhook URL must be printable ASCII without spaces");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return fail("Enter a full URL such as https://hooks.example.com/kasgate");
+  }
+  if (url.protocol !== "https:") return fail("Webhook URL must use https://");
+  if (url.username || url.password) return fail("Webhook URL must not contain credentials");
+  if (url.hash) return fail("Webhook URL must not contain a fragment");
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
+  if (!host || host === "localhost" || host === "localhost.localdomain" || WEBHOOK_LOCAL_SUFFIXES.some((s) => host.endsWith(s))) {
+    return fail("Webhook URL may not target a local host");
+  }
+  if (host.includes(":")) {
+    if (host === "::1" || host === "::" || /^f[cd]/.test(host) || host.startsWith("fe80:") || host.startsWith("::ffff:")) {
+      return fail("Webhook URL may not target a private, loopback or link-local IP");
+    }
+  } else if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    if (isPrivateIpv4(host)) return fail("Webhook URL may not target a private, loopback or link-local IP");
+  } else if (!host.includes(".")) {
+    return fail("Webhook URL host must be a public domain name");
+  }
+  return ok(value);
+}
+
+export function checkWebhookEventTypes(input: unknown): Check<WebhookEventType[]> {
+  if (!Array.isArray(input) || input.length === 0) return fail("Choose at least one event type");
+  const known = WEBHOOK_EVENT_TYPES as readonly string[];
+  const out: WebhookEventType[] = [];
+  for (const item of input) {
+    if (typeof item !== "string" || !known.includes(item)) return fail(`Unknown event type: ${String(item)}`);
+    if (!out.includes(item as WebhookEventType)) out.push(item as WebhookEventType);
+  }
+  return ok(out.sort());
 }

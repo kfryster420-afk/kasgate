@@ -9,7 +9,15 @@ import {
 } from "../openapi-import";
 import type { OpenApiImportBody, OpenApiImportSelection } from "../types";
 import type { PriceCurrency } from "../types";
-import { checkOptionalText, checkPriceCurrency, checkPriceSompi, checkPriceUsdMicros, checkUpstreamHeaders, checkUpstreamUrl } from "../validation";
+import {
+  checkFreeTrialCalls,
+  checkOptionalText,
+  checkPriceCurrency,
+  checkPriceSompi,
+  checkPriceUsdMicros,
+  checkUpstreamHeaders,
+  checkUpstreamUrl,
+} from "../validation";
 
 export type ImportInputResult =
   | { ok: true; payload: OpenApiImportBody }
@@ -163,6 +171,12 @@ export function buildImportPayload(body: Record<string, unknown>, floor: bigint)
   const listed = body.is_public_listed === undefined ? true : body.is_public_listed;
   if (typeof listed !== "boolean") errors.push("is_public_listed must be a boolean");
   else payload.is_public_listed = listed;
+
+  if (body.free_trial_calls !== undefined) {
+    const trials = checkFreeTrialCalls(body.free_trial_calls);
+    if (trials.ok) payload.free_trial_calls = trials.value;
+    else errors.push(trials.error);
+  }
 
   if (mode === "create") {
     const checked = checkSelections(body.selections, currency, floor);

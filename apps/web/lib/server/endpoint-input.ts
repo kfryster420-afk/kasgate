@@ -1,6 +1,7 @@
 import "server-only";
 import {
   checkEndpointName,
+  checkFreeTrialCalls,
   checkMethods,
   checkOptionalSlug,
   checkOptionalText,
@@ -8,6 +9,7 @@ import {
   checkPriceCurrency,
   checkPriceSompi,
   checkPriceUsdMicros,
+  checkTrialDailyCap,
   checkUpstreamHeaders,
   checkUpstreamUrl,
   type Check,
@@ -42,6 +44,8 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
   const currency = collect(checkPriceCurrency(body.price_currency === undefined ? "KAS" : body.price_currency), errors);
   const listed = body.is_public_listed === undefined ? true : body.is_public_listed;
   if (typeof listed !== "boolean") errors.push("is_public_listed must be a boolean");
+  const freeTrialCalls = collect(checkFreeTrialCalls(body.free_trial_calls === undefined ? 0 : body.free_trial_calls), errors);
+  const trialDailyCap = body.trial_daily_cap === undefined ? undefined : collect(checkTrialDailyCap(body.trial_daily_cap), errors);
   let priceSompi: string | undefined;
   let priceUsdMicros: string | undefined;
   if (currency === "USD") {
@@ -65,7 +69,9 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
     is_public_listed: listed,
     prepaid_only: prepaidOnly,
     upstream_headers: headers ?? {},
+    free_trial_calls: freeTrialCalls,
   };
+  if (trialDailyCap !== undefined) payload.trial_daily_cap = trialDailyCap;
   if (currency === "USD") payload.price_usd_micros = priceUsdMicros;
   else payload.price_sompi = priceSompi;
   if (slug) payload.slug = slug;
@@ -143,6 +149,14 @@ export async function buildUpdatePayload(body: Payload): Promise<PayloadResult> 
   if (body.allowed_methods !== undefined && body.allowed_methods !== null) {
     const v = collect(checkMethods(body.allowed_methods), errors);
     if (v !== undefined) payload.allowed_methods = v;
+  }
+  if (body.free_trial_calls !== undefined) {
+    const v = collect(checkFreeTrialCalls(body.free_trial_calls), errors);
+    if (v !== undefined) payload.free_trial_calls = v;
+  }
+  if (body.trial_daily_cap !== undefined) {
+    const v = collect(checkTrialDailyCap(body.trial_daily_cap), errors);
+    if (v !== undefined) payload.trial_daily_cap = v;
   }
   for (const flag of ["is_active", "is_public_listed", "prepaid_only"] as const) {
     const v = body[flag];

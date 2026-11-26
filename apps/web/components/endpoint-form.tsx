@@ -6,8 +6,8 @@ import { ADDRESS_PREFIX } from "@/lib/config";
 import { microsToUsdPlain, parseUsdToMicros } from "@/lib/format";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
-import { HTTP_METHODS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod, type PriceCurrency } from "@/lib/types";
-import { checkEndpointName, checkOptionalSlug, checkUpstreamUrl } from "@/lib/validation";
+import { HTTP_METHODS, TRIAL_DAILY_CAP_DEFAULT, TRIAL_DAILY_CAP_MAX, TRIAL_MAX_CALLS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod, type PriceCurrency } from "@/lib/types";
+import { checkEndpointName, checkFreeTrialCalls, checkOptionalSlug, checkTrialDailyCap, checkUpstreamUrl } from "@/lib/validation";
 import { FeeSplitView } from "./fee-split";
 import { CurrencyToggle, ErrorBanner, Field, Toggle } from "./ui";
 
@@ -45,6 +45,8 @@ export function EndpointForm(props: Props) {
   const [description, setDescription] = useState(initial?.description ?? "");
   const [listed, setListed] = useState(initial?.is_public_listed ?? true);
   const [prepaidOnly, setPrepaidOnly] = useState(initial?.prepaid_only ?? false);
+  const [freeTrials, setFreeTrials] = useState(String(initial?.free_trial_calls ?? 0));
+  const [dailyCap, setDailyCap] = useState(String(initial?.trial_daily_cap ?? TRIAL_DAILY_CAP_DEFAULT));
   const [slug, setSlug] = useState("");
   const [headerName, setHeaderName] = useState("");
   const [headerValue, setHeaderValue] = useState("");
@@ -54,7 +56,11 @@ export function EndpointForm(props: Props) {
   const micros = useMemo(() => parseUsdToMicros(priceUsd), [priceUsd]);
 
   const errors = useMemo(() => {
-    const out: Partial<Record<"name" | "url" | "price" | "methods" | "slug" | "header", string>> = {};
+    const out: Partial<Record<"name" | "url" | "price" | "methods" | "slug" | "header" | "trials" | "cap", string>> = {};
+    const trials = checkFreeTrialCalls(/^\d{1,3}$/.test(freeTrials.trim()) ? Number(freeTrials.trim()) : NaN);
+    if (!trials.ok) out.trials = trials.error;
+    const cap = checkTrialDailyCap(/^\d{1,6}$/.test(dailyCap.trim()) ? Number(dailyCap.trim()) : NaN);
+    if (!cap.ok) out.cap = cap.error;
     const n = checkEndpointName(name);
     if (!n.ok) out.name = n.error;
     const u = checkUpstreamUrl(upstreamUrl);
@@ -78,7 +84,7 @@ export function EndpointForm(props: Props) {
       else if (headerValue === "" || /[\r\n]/.test(headerValue)) out.header = "Enter a single-line header value";
     }
     return out;
-  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing, prepaidOnly]);
+  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing, prepaidOnly, freeTrials, dailyCap]);
 
   const minPriceHint = prepaidOnly
     ? currency === "USD"
@@ -117,6 +123,8 @@ export function EndpointForm(props: Props) {
         is_public_listed: listed,
         prepaid_only: prepaidOnly,
         upstream_headers: headers ?? {},
+        free_trial_calls: Number(freeTrials.trim()),
+        trial_daily_cap: Number(dailyCap.trim()),
       };
       if (category.trim()) payload.category = category.trim();
       if (description.trim()) payload.description = description.trim();
@@ -130,6 +138,8 @@ export function EndpointForm(props: Props) {
         allowed_methods: methods,
         is_public_listed: listed,
         prepaid_only: prepaidOnly,
+        free_trial_calls: Number(freeTrials.trim()),
+        trial_daily_cap: Number(dailyCap.trim()),
         category: category.trim() === "" ? null : category.trim(),
         description: description.trim() === "" ? null : description.trim(),
       };
@@ -230,6 +240,25 @@ export function EndpointForm(props: Props) {
           Buyers deposit once on-chain (at least 0.6 KAS; you receive the deposit minus the platform fee) and each call is a signed debit from
           that balance. Without this, the endpoint accepts both per-call payments and prepaid debits.
         </p>
+      </div>
+
+      <div className="grid gap-5 sm:grid-cols-2">
+        <Field
+          label="Free trial calls per buyer"
+          htmlFor={`${uid}-trials`}
+          error={show("trials")}
+          hint={`0 = no trial. Each buyer key gets this many unpaid calls (0–${TRIAL_MAX_CALLS}), proven with a wallet signature; then the normal price applies. No fee is charged on trial calls.`}
+        >
+          <input id={`${uid}-trials`} className="input font-mono" value={freeTrials} onChange={(e) => setFreeTrials(e.target.value)} inputMode="numeric" autoComplete="off" />
+        </Field>
+        <Field
+          label="Trial calls per day (all buyers)"
+          htmlFor={`${uid}-cap`}
+          error={show("cap")}
+          hint={`Caps the free calls this endpoint serves per UTC day (1–${TRIAL_DAILY_CAP_MAX.toLocaleString("en-US")}), so new wallets cannot drain your upstream.`}
+        >
+          <input id={`${uid}-cap`} className="input font-mono" value={dailyCap} onChange={(e) => setDailyCap(e.target.value)} inputMode="numeric" autoComplete="off" />
+        </Field>
       </div>
 
       <ErrorBanner message={props.error} />
