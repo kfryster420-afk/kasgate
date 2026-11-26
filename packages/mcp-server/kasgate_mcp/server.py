@@ -512,6 +512,8 @@ def build_server(
             "reason": refund.reason,
             "late_paid_from": refund.late_paid_from,
             "shortfall_sompi": int(refund.shortfall_sompi),
+            "claim_expires_at": refund.claim_expires_at.isoformat() if refund.claim_expires_at else None,
+            "hold_until": refund.hold_until.isoformat() if refund.hold_until else None,
             "created_at": refund.created_at.isoformat(),
             "paid_at": refund.paid_at.isoformat() if refund.paid_at else None,
         }

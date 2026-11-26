@@ -15,6 +15,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Explicit `settlements.delivery_outcome` (`pending` before the upstream call, then `delivered`, `failed` +
   `delivery_failure`, or `credited`). Only `failed` is credited; NULL/`pending` never. A failed outcome write is
   logged at ERROR and dead-lettered to `kasgate:deadletter:delivery-outcomes`.
+- A settlement still `pending` after the redelivery window plus grace is logged at ERROR once (ledger-worker
+  sweep; deduped by `pending_alerted_at`) and is not credited. Alert on that line in the runbook.
 - Never credited: oversized responses, any status below 500, k402 `kaspa-utxo` payments, non-P2PK payers, prepaid
   deposits.
 - The merchant policy in force at settle time is stamped on the settlement (`failed_delivery_credit_policy`), so a
@@ -22,8 +24,9 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Merchant policy: `GET`/`PUT /v1/prepaid/failed-delivery-policy` `{enabled, credit_timeouts}` (on by default,
   timeouts included).
 - Failure credit is call-only and non-refundable: tracked in `credit_balance_sompi`, spent before deposited sompi
-  (`prepaid_debits.credit_sompi`), excluded from refunds and refund holds (`refundable = balance - hold -
-  credit_balance`); a late v2.13 payout re-debits deposited sompi first.
+  (`prepaid_debits.credit_sompi`), excluded from refunds, refund holds and cancel cooldown holds
+  (`refundable = max(0, balance - hold - credit_balance)`); a late v2.13 payout re-debits deposited sompi first.
+  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown).
 - Credits are clamped to `PREPAID_MAX_BALANCE_SOMPI`; the cut part is `shortfall_sompi` on the ledger row and a
   signed `prepaid.credit.failed_delivery_shortfall` webhook.
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`
@@ -92,11 +95,32 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   `prepaid_refunds(include_reasons=true)`).
 - A cancel aimed at the wrong refund no longer burns the challenge. `POST /v1/prepaid/refunds`, `/cancel` and
   `/status` are rate limited per IP (`RL_PREPAID_REFUND_PER_MINUTE`, default 30).
-- `TRUSTED_PROXY_IPS` (default off): per-IP rate limits honour `X-Forwarded-For` only from those proxies (e.g. the
-  dashboard's Next.js proxy), using the right-most untrusted hop.
+- `TRUSTED_PROXY_IPS` (default off): per-IP rate limits honour `X-Forwarded-For` only from those proxies, using the
+  right-most untrusted hop. List only your proxy's fixed IP, never a Docker bridge range.
 - The refund error codes are now part of the `X402ErrorBody.error` vocabulary; the documented error list also gains
   `price_unavailable`, `invalid_exact_payment`, `payment_expired`, `insufficient_balance` and `trial_exhausted`.
 - Migration `0008_prepaid_refunds` was revised in place (it is not on main yet).
+
+### Security: refund red-team fixes, round 2 (CONTRACT v2.13, before release)
+
+- Claim lapse: cancelling a refund the merchant ever claimed first asks the node (mempool and UTXO index of the
+  payout address) for a transaction that may be its payout; a new one is recorded as a `scan` attempt and the cancel
+  is refused (409), and a node outage refuses it (503) without burning the challenge. Such a cancel keeps the amount
+  held until `hold_until` (`PREPAID_REFUND_CANCEL_COOLDOWN_SECONDS`, 1800) before it is spendable; a payout landing in
+  that window is debited in full. The public status no longer shows the claim (`paying` reads as `requested`, claim
+  times null); the merchant (and the signed buyer status) get `claim_expires_at`.
+- Bounded claims: `first_claimed_at`; renewals stop after `PREPAID_REFUND_CLAIM_MAX_SECONDS` (3600).
+- Attempt flooding: at most `PREPAID_PAYOUT_MAX_PENDING_ATTEMPTS` (3) pending attempts per refund (409
+  `too_many_attempts`); an abandoned attempt is never revived by a bare tx_id (409 `payout_abandoned`), and a
+  transaction proof keeps its original age; unseen attempts back off with their age
+  (`PREPAID_PAYOUT_UNSEEN_BACKOFF_FRACTION`); `POST /payout` is rate limited per merchant
+  (`RL_REFUND_PAYOUT_PER_MERCHANT_PER_MINUTE`, 20).
+- A late payout never closes a newer refund that the merchant is paying (an unlapsed claim, a pending attempt or
+  `payout_submitted`); the difference is recorded as shortfall.
+- Migration guard: `alembic upgrade`/`stamp` and the gateway startup refuse a database migrated with an earlier draft
+  of `0008_prepaid_refunds` and say how to fix it (downgrade to 0007, upgrade again); 0008's downgrade now works from
+  the first draft too. See RUNBOOK "Migration 0008 revised in place".
+- Webhook data of refund events gains `hold_until`. `prepaid_refund_payouts.method` gains `scan`.
 
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.

@@ -264,7 +264,7 @@ async def test_held_cancel_nonce_is_single_use_and_bound_to_its_refund(client: h
     again = await cancel(client, cancel_challenge, refund.id)
     assert again.status_code == 200
     # Still single use: the same signed challenge never cancels twice.
-    assert (await cancel(client, cancel_challenge, refund.id)).status_code == 410
+    assert (await cancel(client, cancel_challenge, refund.id)).status_code in (409, 410)  # consumed or nonce-locked
     stale = await refund_challenge(client, action="cancel", refund_id=refund.id)
     assert stale.status_code == 404  # nothing open to cancel any more
 

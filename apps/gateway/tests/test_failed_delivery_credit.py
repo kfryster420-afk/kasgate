@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.failed_delivery import (
+    alert_stale_pending_deliveries,
     credit_failed_delivery,
     policy_enabled,
     redelivery_closed,
@@ -954,3 +955,102 @@ async def test_an_unrecorded_delivery_outcome_is_alerted_and_never_credited(
     await _age(sessionmaker, WINDOW_PAST)
     assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
     assert await _credits(sessionmaker) == []
+
+
+# ---------------------------------------------------------------- stale pending alert (crash / lost outcome write)
+
+
+async def test_a_settlement_still_pending_after_the_window_is_alerted_once(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A settlement left `pending` past the redelivery window plus grace (crash mid-call or a lost outcome write)
+    is logged at ERROR once; it is never credited. A second pass is a no-op."""
+    served = await client.get("/p/weather", headers=await paid_headers(client, TX))
+    assert served.status_code == 200
+    async with sessionmaker() as session:
+        await session.execute(
+            update(Settlement).values(delivery_outcome="pending", delivery_failure=None, upstream_status_code=None)
+        )
+        await session.commit()
+    # Still inside the window: no alert, no credit.
+    assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    await _age(sessionmaker, WINDOW_PAST)
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 1
+    settlement = await _settlement(sessionmaker)
+    assert settlement.delivery_outcome == "pending"
+    assert settlement.pending_alerted_at is not None
+    assert any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage()
+        and str(settlement.id) in rec.getMessage()
+        and TX in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelname == "ERROR"
+    )
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    assert not any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage() for rec in caplog.records
+    )
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 0
+    assert await _credits(sessionmaker) == []
+
+
+async def test_delivered_and_failed_settlements_are_not_pending_alerts(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX))).status_code == 200
+    _fail_upstream(upstream, 503)
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX2))).status_code == 503
+    await _age(sessionmaker, WINDOW_PAST)
+    assert await alert_stale_pending_deliveries(sessionmaker, limit=10) == 0
+    async with sessionmaker() as session:
+        outcomes = {
+            row[0]: (row[1], row[2])
+            for row in (
+                await session.execute(
+                    select(Settlement.tx_id, Settlement.delivery_outcome, Settlement.pending_alerted_at)
+                )
+            ).all()
+        }
+    assert outcomes[TX] == ("delivered", None)
+    assert outcomes[TX2] == ("failed", None)
+
+
+async def test_ledger_worker_pass_alerts_stale_pending_and_credits_failures(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    stub_engine: StubEngine,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    served = await client.get("/p/weather", headers=await paid_headers(client, TX))
+    assert served.status_code == 200
+    async with sessionmaker() as session:
+        await session.execute(
+            update(Settlement).where(Settlement.tx_id == TX).values(delivery_outcome="pending", delivery_failure=None)
+        )
+        await session.commit()
+    _fail_upstream(upstream, 503)
+    assert (await client.get("/p/weather", headers=await paid_headers(client, TX2))).status_code == 503
+    await _age(sessionmaker, WINDOW_PAST)
+    with caplog.at_level("ERROR", logger="kasgate.failed_delivery"):
+        assert await run_ledger_pass(sessionmaker, stub_engine, [sweep_pass]) == 2
+    assert any(
+        "delivery outcome still pending after the redelivery window" in rec.getMessage() for rec in caplog.records
+    )
+    async with sessionmaker() as session:
+        pending = (await session.execute(select(Settlement).where(Settlement.tx_id == TX))).scalar_one()
+        failed = (await session.execute(select(Settlement).where(Settlement.tx_id == TX2))).scalar_one()
+    assert pending.delivery_outcome == "pending" and pending.pending_alerted_at is not None
+    assert failed.delivery_outcome == "credited"
+    assert len(await _credits(sessionmaker)) == 1

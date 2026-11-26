@@ -5,7 +5,7 @@ import ipaddress
 import re
 import secrets
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from typing import Annotated, Any, Literal, Self
 
@@ -875,6 +875,8 @@ class X402ErrorBody(StrictModel):
         "refund_closed",
         "invalid_payout",
         "payout_replayed",
+        "payout_abandoned",
+        "too_many_attempts",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -1771,6 +1773,11 @@ class PrepaidRefundRead(ReadModel):
     created_at: datetime
     updated_at: datetime
     claimed_at: datetime | None
+    """When the merchant last claimed it (`paying`). Null in the public view (signed status shows it)."""
+    first_claimed_at: datetime | None
+    """The first claim; claims are not renewed past it + PREPAID_REFUND_CLAIM_MAX_SECONDS. Null in the public view."""
+    hold_until: datetime | None
+    """A cancelled refund the merchant had claimed: its amount stays held (not spendable) until then."""
     payout_submitted_at: datetime | None
     paid_at: datetime | None
     resolved_at: datetime | None
@@ -1785,8 +1792,25 @@ class PrepaidRefundRead(ReadModel):
         return str(v) if isinstance(v, int) else v
 
     def public(self) -> "PrepaidRefundRead":
-        """The unsigned public view: no merchant reason and no payout error text."""
-        return self.model_copy(update={"reason": None, "last_error": None})
+        """The unsigned public view: no merchant reason, no payout error text, and no claim details (`paying` reads
+        as `requested`, claim times are null), so nobody can time a cancel to the moment a claim lapses."""
+        hidden: dict[str, object] = {"reason": None, "last_error": None, "claimed_at": None, "first_claimed_at": None}
+        if self.status == "paying":
+            hidden["status"] = "requested"
+        return self.model_copy(update=hidden)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def claim_expires_at(self) -> datetime | None:
+        """While `paying`: when the merchant's claim lapses (the buyer may cancel after it). Do not broadcast a payout
+        close to this time; renew the claim first (renewals stop at first_claimed_at + the claim maximum)."""
+        if self.status != "paying" or self.claimed_at is None:
+            return None
+        settings = get_settings()
+        expires = self.claimed_at + timedelta(seconds=settings.prepaid_refund_claim_ttl_seconds)
+        if self.first_claimed_at is not None:
+            expires = min(expires, self.first_claimed_at + timedelta(seconds=settings.prepaid_refund_claim_max_seconds))
+        return expires
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1813,7 +1837,7 @@ class PrepaidRefundPayoutRead(ReadModel):
     id: uuid.UUID
     refund_id: uuid.UUID
     tx_id: str
-    method: Literal["tx_id", "transaction"]
+    method: Literal["tx_id", "transaction", "scan"]
     status: PrepaidRefundPayoutStatus
     payload_verified: bool
     check_count: int

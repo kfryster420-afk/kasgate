@@ -25,6 +25,12 @@ Only `failed` can be credited. NULL (settled before migration 0009) and `pending
 process died during the call) are never credited. If the outcome cannot be stored, KasGate logs at ERROR and pushes
 the outcome JSON to the Redis list `kasgate:deadletter:delivery-outcomes`; the buyer still gets the upstream's answer.
 
+If a settlement is still `pending` after the redelivery window plus grace (the same wait as a `window_expired`
+credit, on the database clock, inside the lookback), the ledger worker logs ERROR once (`delivery outcome still
+pending after the redelivery window`) and sets `pending_alerted_at`. That is the alert (operators already alert on
+ERROR lines). The row is not credited; reconcile `delivery_outcome` by hand from the dead-letter list or the
+process log.
+
 ## When a call is credited
 
 A settlement is credited at most once when all of these hold:
@@ -70,7 +76,8 @@ refund_hold_sompi)`):
 
 * **Calls spend credit first**, then deposited sompi. `prepaid_debits.credit_sompi` is the part of each debit paid
   from credit; a debit restored after an upstream failure gives that part back to the credit.
-* **Refunds take deposited, unspent sompi only**: `refundable = balance - refund_hold - credit_balance`. The refund
+* **Refunds take deposited, unspent sompi only**: `refundable = max(0, balance - refund_hold - credit_balance)`
+  (`refund_hold` includes an open refund and a cancel cooldown). The refund
   challenge's default amount is `refundable_sompi`; asking for more is `409 insufficient_balance`. So the refund
   hold never covers credit, and credit keeps paying calls while a refund is open.
 * A **late payout** of a cancelled or rejected refund re-debits deposited sompi first, then credit (the coins
@@ -120,8 +127,9 @@ Signed like every KasGate webhook (`X-KasGate-Signature`), with deterministic ev
 * `merchants`: `failed_delivery_credit_enabled_at` (NOT NULL, default now()), `failed_delivery_credit_disabled_at`,
   `failed_delivery_credit_timeouts` (default true).
 * `settlements`: `delivery_outcome`, `delivery_failure` (set iff failed/credited), `failed_delivery_credit_policy`
-  (`errors|errors_and_timeouts`, NULL = opted out), with CHECKs; partial index `ix_settlements_undelivered`.
-  Existing settlements keep NULL and are never credited.
+  (`errors|errors_and_timeouts`, NULL = opted out), `pending_alerted_at`, with CHECKs; partial indexes
+  `ix_settlements_undelivered` and `ix_settlements_stale_pending`. Existing settlements keep NULL and are never
+  credited.
 * `prepaid_balances`: `credited_sompi`, `credit_balance_sompi`; the identity CHECK includes `credited_sompi`.
 * `prepaid_debits.credit_sompi` (`BETWEEN 0 AND amount_sompi`).
 * `prepaid_ledger_entries`: kind `failed_delivery_credit`; `settlement_id` (FK RESTRICT, unique), `slug`,

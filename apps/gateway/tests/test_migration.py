@@ -855,7 +855,8 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         attempt_of(tx=tx, status="confirmed", confirmed="now()", resolved="now()", of="paid"),
         attempt_of(),  # a pending attempt of the requested refund (e.g. after a revert)
         "UPDATE prepaid_refunds SET late_paid_from = 'cancelled', shortfall_sompi = 4 WHERE status = 'paid'",
-        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now() WHERE status = 'requested'",
+        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now(), first_claimed_at = now() "
+        "WHERE status = 'requested'",
     )
     # A late payout that found nothing left to debit is recorded with a 0 sompi refund ledger row.
     await _execute(
@@ -907,6 +908,8 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         "UPDATE prepaid_refunds SET late_paid_from = 'cancelled' WHERE status = 'paying'",  # only when paid
         "UPDATE prepaid_refunds SET late_paid_from = NULL WHERE status = 'paid'",  # shortfall_only_when_late
         "UPDATE prepaid_refunds SET claimed_at = NULL WHERE status = 'paying'",  # paying_is_claimed
+        "UPDATE prepaid_refunds SET first_claimed_at = NULL WHERE status = 'paying'",  # claimed_has_first_claim
+        "UPDATE prepaid_refunds SET hold_until = now() WHERE status = 'paying'",  # hold_until_only_cancelled
         attempt_of(of="paying"),  # ix_prepaid_refund_payouts_tx_id: one refund per tx_id
         attempt_of(tx=f"'{'f' * 64}'", status="lost", of="paying"),  # status_known
         attempt_of(tx=f"'{'f' * 64}'", method="wallet", of="paying"),  # method_known
@@ -1091,6 +1094,7 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
     await asyncio.to_thread(command.upgrade, config, "head")
     # Settlements from before the upgrade have no outcome and no stamped policy, so they are never credited.
     assert await _scalar(url, "SELECT count(*) FROM settlements WHERE delivery_outcome IS NULL") == 1
+    assert await _scalar(url, "SELECT count(*) FROM settlements WHERE pending_alerted_at IS NULL") == 1
     assert await _scalar(url, "SELECT count(*) FROM settlements WHERE failed_delivery_credit_policy IS NULL") == 1
     assert await _scalar(url, "SELECT bool_and(failed_delivery_credit_timeouts) FROM merchants") is True
     assert await _scalar(url, "SELECT credit_balance_sompi FROM prepaid_balances") == 0
@@ -1205,7 +1209,8 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
             url,
             "SELECT count(*) FROM information_schema.columns WHERE column_name IN ('delivery_outcome', "
             "'delivery_failure', 'failed_delivery_credit_policy', 'credit_balance_sompi', "
-            "'failed_delivery_credit_timeouts') OR (table_name = 'prepaid_debits' AND column_name = 'credit_sompi') "
+            "'failed_delivery_credit_timeouts', 'pending_alerted_at') "
+            "OR (table_name = 'prepaid_debits' AND column_name = 'credit_sompi') "
             "OR (table_name = 'prepaid_ledger_entries' AND column_name = 'shortfall_sompi')",
         )
         == 0
@@ -1217,3 +1222,31 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
             assert await conn.run_sync(_diff) == []
     finally:
         await migrated.dispose()
+
+
+async def test_0009_head_passes_the_0008_schema_guard(pg_server: PgServer) -> None:
+    """The 0008 schema guard (final refund columns + prepaid_refund_payouts) must accept a database at 0009 head.
+
+    The guard does not inspect 0009-level columns; it must not false-positive once 0009 is applied on top of the
+    final 0008.
+    """
+    from app.schema_guard import stale_0008_problem
+
+    url = pg_server.make_url("kasgate_guard_head")
+    pg_server.create_database("kasgate_guard_head")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0008_prepaid_refunds")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+    finally:
+        await engine.dispose()
+    await asyncio.to_thread(command.upgrade, config, "head")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await engine.dispose()

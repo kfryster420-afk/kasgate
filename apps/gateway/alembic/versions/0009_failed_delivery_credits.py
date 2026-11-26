@@ -7,9 +7,11 @@ Create Date: 2026-11-26 00:00:00
 * `merchants.failed_delivery_credit_enabled_at` (NOT NULL, default now()), `failed_delivery_credit_disabled_at`
   (NULL): times of the last switch of the opt-out policy; `failed_delivery_credit_timeouts` (default true).
 * `settlements`: `delivery_outcome` (pending|delivered|failed|credited), `delivery_failure`
-  (upstream_5xx|connect_error|timeout|oversized, set iff failed/credited) and `failed_delivery_credit_policy`
-  (errors|errors_and_timeouts, the merchant policy stamped at settle time). Existing rows stay NULL, so no payment
-  settled before the upgrade is ever credited. Partial index `ix_settlements_undelivered` for the sweeper.
+  (upstream_5xx|connect_error|timeout|oversized, set iff failed/credited), `failed_delivery_credit_policy`
+  (errors|errors_and_timeouts, the merchant policy stamped at settle time) and `pending_alerted_at` (set once when
+  a row is still `pending` after the redelivery window plus grace). Existing rows stay NULL, so no payment
+  settled before the upgrade is ever credited. Partial indexes `ix_settlements_undelivered` (failed, covered) and
+  `ix_settlements_stale_pending` (pending, not yet alerted) for the sweeper.
 * `prepaid_balances.credited_sompi` (default 0). The 0008 identity
   `balance = deposited - debited - refunded - expired` becomes
   `balance = deposited + credited - debited - refunded - expired`; existing rows stay valid (credited = 0).
@@ -64,6 +66,7 @@ CREDIT_ROWS_CARRY_SETTLEMENT_SQL = (
     "AND (kind <> 'failed_delivery_credit' OR (tx_id IS NOT NULL AND direction = 'credit'))"
 )
 UNDELIVERED_SQL = "status = 'settled' AND delivery_outcome = 'failed' AND failed_delivery_credit_policy IS NOT NULL"
+STALE_PENDING_SQL = "status = 'settled' AND delivery_outcome = 'pending' AND pending_alerted_at IS NULL"
 CREDIT_BALANCE_SQL = "credit_balance_sompi BETWEEN 0 AND LEAST(credited_sompi, balance_sompi - refund_hold_sompi)"
 # 0008's check exactly (a 0-sompi `refund` row is a late payout shortfall), plus a fully clamped credit row.
 OLD_AMOUNT_SQL = "amount_sompi > 0 OR (kind = 'refund' AND amount_sompi = 0)"
@@ -113,6 +116,7 @@ def upgrade() -> None:
     op.add_column("settlements", sa.Column("delivery_outcome", sa.String(length=10), nullable=True))
     op.add_column("settlements", sa.Column("delivery_failure", sa.String(length=16), nullable=True))
     op.add_column("settlements", sa.Column("failed_delivery_credit_policy", sa.String(length=20), nullable=True))
+    op.add_column("settlements", sa.Column("pending_alerted_at", sa.DateTime(timezone=True), nullable=True))
     for name, sql in SETTLEMENT_CHECKS:
         op.create_check_constraint(op.f(name), "settlements", sql)
 
@@ -180,6 +184,13 @@ def upgrade() -> None:
         unique=False,
         postgresql_where=sa.text(UNDELIVERED_SQL),
     )
+    op.create_index(
+        "ix_settlements_stale_pending",
+        "settlements",
+        ["settled_at"],
+        unique=False,
+        postgresql_where=sa.text(STALE_PENDING_SQL),
+    )
 
     _replace_check("webhook_events", "ck_webhook_events_event_type_known", f"event_type IN ({NEW_EVENT_TYPES_SQL})")
 
@@ -196,6 +207,7 @@ def downgrade() -> None:
         "downgrading below 0009_failed_delivery_credits'; END IF; END $$"
     )
     _replace_check("webhook_events", "ck_webhook_events_event_type_known", f"event_type IN ({OLD_EVENT_TYPES_SQL})")
+    op.drop_index("ix_settlements_stale_pending", table_name="settlements")
     op.drop_index("ix_settlements_undelivered", table_name="settlements")
     op.drop_index("ix_prepaid_ledger_entries_slug", table_name=LEDGER)
     op.drop_index("ix_prepaid_ledger_entries_settlement_id", table_name=LEDGER)
@@ -221,6 +233,7 @@ def downgrade() -> None:
     op.drop_column("prepaid_balances", "credited_sompi")
     for name, _sql in reversed(SETTLEMENT_CHECKS):
         op.drop_constraint(op.f(name), "settlements", type_="check")
+    op.drop_column("settlements", "pending_alerted_at")
     op.drop_column("settlements", "failed_delivery_credit_policy")
     op.drop_column("settlements", "delivery_failure")
     op.drop_column("settlements", "delivery_outcome")

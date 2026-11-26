@@ -157,4 +157,5 @@ async def test_include_reasons_signs_a_status_challenge() -> None:
         assert public["refunds"][0]["reason"] is None
         full = structured(await client.call_tool("prepaid_refunds", {"slug": "cheap-api", "include_reasons": True}))
     assert full["refunds"][0]["reason"] == "promo credit" and full["refunds"][0]["shortfall_sompi"] == 0
+    assert full["refunds"][0]["hold_until"] is None and full["refunds"][0]["claim_expires_at"] is None
     assert fake.action == "status" and "Amount: 0" in fake.message

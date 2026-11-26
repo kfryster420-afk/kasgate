@@ -23,6 +23,7 @@ from app.oracle import KasUsdOracle
 from app.prepaid import router as prepaid_router
 from app.proxy import router as proxy_router
 from app.refunds import router as refunds_router
+from app.schema_guard import check_database_schema
 from app.schemas import (
     HEADER_CREDIT_SUMMARY,
     HEADER_FAILED_DELIVERY_CREDIT,
@@ -51,6 +52,7 @@ __all__ = ["app", "create_app", "kaspa_engine"]
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    await check_database_schema(db_engine)
     redis: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
     http_client = build_upstream_client()
     app.state.redis = redis
