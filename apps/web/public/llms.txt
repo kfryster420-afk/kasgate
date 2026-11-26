@@ -55,7 +55,9 @@ limit. The failing response then carries X-KasGate-Credit: Base64(JSON{creditId,
 creditSompi, balanceSompi, reason, shortfallSompi?}). This credit is call-only: X-KasGate-Prepaid debits spend it
 first, and it is never refunded (refundable_sompi on the balance excludes it). Read your credit with POST
 /v1/prepaid/credits/challenge then a signed POST /v1/prepaid/credits/status (action credits; same signing as a
-refunds status challenge).
+refunds status challenge). Each page needs a fresh challenge. The status body takes optional before (cursor) and
+limit (default 10, max 100) and returns next_cursor. Each credit has credit_id, the same ledger id as creditId
+on X-KasGate-Credit. spendable_sompi and refundable_sompi on the challenge are informational only.
 
 ## Free trial calls (kasgate-trial-v1)
 

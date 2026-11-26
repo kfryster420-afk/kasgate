@@ -67,9 +67,10 @@ HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit"
 HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining"
 # Failed-delivery auto-credit: on the failing response when the call was credited back to prepaid there and then.
 HEADER_FAILED_DELIVERY_CREDIT = "X-KasGate-Credit"
-# CONTRACT v2.14: newest failed-delivery credits returned by signed POST /v1/prepaid/credits/status.
-MAX_SUMMARY_CREDITS = 10
+# CONTRACT v2.14: failed-delivery credits returned by signed POST /v1/prepaid/credits/status.
 CREDIT_STATUS_ACTION = "credits"
+DEFAULT_CREDIT_STATUS_LIMIT = 10
+MAX_CREDIT_STATUS_LIMIT = 100
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -864,6 +865,7 @@ class X402ErrorBody(StrictModel):
         # CONTRACT v2.13 prepaid refunds
         "invalid_payer",
         "invalid_signature",
+        "invalid_cursor",
         "invalid_status",
         "challenge_expired",
         "challenge_replayed",
@@ -1912,6 +1914,7 @@ class FailedDeliveryCreditReceipt(X402Header):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     creditId: uuid.UUID
+    """The `prepaid_ledger_entries.id`. Same value as `credit_id` on each item of POST /v1/prepaid/credits/status."""
     kind: Literal["failed_delivery_credit"]
     txId: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
     merchantId: uuid.UUID
@@ -1937,7 +1940,10 @@ class PrepaidCreditStatusChallengeRequest(StrictModel):
 
 
 class PrepaidCreditStatusChallenge(BaseModel):
-    """Sign `message` with the depositing key and POST {nonce, signature} to /v1/prepaid/credits/status."""
+    """Sign `message` with the depositing key and POST {nonce, signature, before?, limit?} to /credits/status.
+
+    The challenge is single use: each page of credits/status needs a fresh challenge.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -1951,8 +1957,31 @@ class PrepaidCreditStatusChallenge(BaseModel):
     """Always "0": a credits challenge never holds or refunds sompi. The signed message carries Amount: 0."""
     refund_id: None
     spendable_sompi: BalanceSompiStr
+    """Informational only for action `credits`: not part of the signed message and not a hold."""
     refundable_sompi: BalanceSompiStr
+    """Informational only for action `credits`. The signed status body is authoritative."""
     expires_at: datetime
+
+
+class PrepaidCreditStatusRequest(PrepaidRefundSigned):
+    """POST /v1/prepaid/credits/status: a signed `credits` challenge, plus an optional page.
+
+    `limit` defaults to 10 and is at most 100. `before` is the opaque `next_cursor` from a previous page.
+    Each request consumes the challenge; ask for a new one to read the next page.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+
+    before: str | None = None
+    """Opaque cursor (`next_cursor` from the previous page). Omit it to read the newest page."""
+    limit: Annotated[int, Field(ge=1, le=MAX_CREDIT_STATUS_LIMIT)] = DEFAULT_CREDIT_STATUS_LIMIT
+
+    @field_validator("before")
+    @classmethod
+    def _before(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        return v
 
 
 class BuyerCreditStatusItem(StrictModel):
@@ -1960,6 +1989,8 @@ class BuyerCreditStatusItem(StrictModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
+    credit_id: uuid.UUID
+    """The `prepaid_ledger_entries.id`. Same value as `creditId` on the X-KasGate-Credit receipt."""
     tx_id: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
     slug: Annotated[str, Field(pattern=SLUG_RE)]
     credit_sompi: BalanceSompiStr
@@ -1973,6 +2004,7 @@ class BuyerCreditStatus(StrictModel):
 
     Failed-delivery credit is call-only: `refundable_sompi` (deposited and unspent, minus an open refund or
     cancel-cooldown hold) is what a refund may take; `credit_balance_sompi` can only pay for calls.
+    `credits` is one page (newest first). `next_cursor` is null when there are no further pages.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
@@ -1984,8 +2016,10 @@ class BuyerCreditStatus(StrictModel):
     """Unspent call-only credit (spent before deposited sompi; never refundable)."""
     refundable_sompi: BalanceSompiStr
     credit_count: Annotated[int, Field(ge=0)]
-    credits: Annotated[list[BuyerCreditStatusItem], Field(max_length=MAX_SUMMARY_CREDITS)]
-    """The newest credits, at most 10; the merchant lists all with GET /v1/prepaid/credits."""
+    """Total credits at this merchant for this key, not the size of this page."""
+    credits: Annotated[list[BuyerCreditStatusItem], Field(max_length=MAX_CREDIT_STATUS_LIMIT)]
+    next_cursor: str | None
+    """Opaque cursor for the next older page; null when this is the last. Bind it as `before` on a new challenge."""
 
 
 class PrepaidCreditRead(BaseModel):

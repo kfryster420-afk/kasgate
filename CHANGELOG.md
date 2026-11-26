@@ -36,7 +36,10 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Balances and the refund challenge report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
   identity is now `balance = deposited + credited - debited - refunded - expired`.
 - Signed `POST /v1/prepaid/credits/challenge` + `POST /v1/prepaid/credits/status` returns the buyer's credit
-  totals and newest credits (action `credits`; same challenge path as refunds/status). `GET` and signed
+  totals and a page of credits (action `credits`; same challenge path as refunds/status). Each item includes
+  `credit_id` (the ledger entry UUID, the same value as `creditId` on `X-KasGate-Credit`). The status body
+  accepts optional `before` (opaque cursor) and `limit` (default 10, max 100) and returns `next_cursor` (null
+  when there are no more pages). Each page needs a fresh challenge. `GET` and signed
   `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 - Signed webhook events `prepaid.credit.failed_delivery` and `prepaid.credit.failed_delivery_shortfall`.
 - A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never

@@ -19,6 +19,7 @@ from app.models import PrepaidBalance, PrepaidDebit, PrepaidLedgerEntry, Prepaid
 from app.payments import PaymentVerificationError
 from app.schemas import CREDIT_STATUS_ACTION, BuyerCreditStatus, PrepaidCreditStatusChallenge, compute_fee_split
 from tests.conftest import (
+    OTHER_ADDRESS,
     OTHER_KEY,
     PAYER_ADDRESS,
     PRICE_SOMPI,
@@ -236,7 +237,7 @@ async def test_signed_credit_status_returns_the_buyers_credit(
         str(CAPPED_CREDIT),
         str(CREDIT_SOMPI),
     )
-    assert status.credit_count == 1
+    assert status.credit_count == 1 and status.next_cursor is None
     [item] = status.credits
     assert (item.tx_id, item.slug, item.reason) == (TX, "weather", "attempts_exhausted")
     assert (item.credit_sompi, item.shortfall_sompi) == (
@@ -251,6 +252,7 @@ async def test_signed_credit_status_returns_the_buyers_credit(
                 )
             ).scalars()
         )
+    assert item.credit_id == entry.id  # same ledger id as X-KasGate-Credit creditId
     assert entry.shortfall_sompi == SPLIT.merchant_sompi - CAPPED_CREDIT
     # Refund status endpoints stay bare arrays and carry no credit-summary header.
     refunds = await challenge_of(client, action="status")
@@ -271,7 +273,7 @@ async def test_signed_credit_status_is_empty_when_the_buyer_has_no_credits(
     status = BuyerCreditStatus.model_validate(reply.json())
     assert status.merchant_id == shop.merchant_id
     assert (status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi) == ("0", "0", "0")
-    assert status.credit_count == 0 and status.credits == []
+    assert status.credit_count == 0 and status.credits == [] and status.next_cursor is None
 
 
 async def test_signed_credit_status_rejects_the_wrong_key_without_burning_the_challenge(
@@ -330,6 +332,154 @@ async def test_buyer_credit_status_model_is_strict(client: httpx.AsyncClient, sh
         BuyerCreditStatus.model_validate({**body, "credit_count": -1})
     with pytest.raises(ValidationError):
         BuyerCreditStatus.model_validate({**body, "credited_sompi": "01"})  # leading zero is not a BalanceSompiStr
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({k: v for k, v in body.items() if k != "next_cursor"})
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate(
+            {**body, "credits": [{k: v for k, v in body["credits"][0].items() if k != "credit_id"}]}
+        )
+
+
+async def _credit_n(
+    client: httpx.AsyncClient, upstream: Upstream, n: int, *, slug: str = "weather", start: int = 0
+) -> list[str]:
+    """n distinct failed paid calls at `slug`, each becoming one failed-delivery credit."""
+    _fail_upstream(upstream)
+    txs: list[str] = []
+    for i in range(start, start + n):
+        tx = f"{i:02x}" * 32
+        headers = await paid_headers(client, tx, slug)
+        responses = [await client.get(f"/p/{slug}", headers=headers) for _ in range(3)]
+        assert [r.status_code for r in responses] == [502, 502, 502], responses[-1].text
+        txs.append(tx)
+    upstream.handler = None
+    return txs
+
+
+async def _read_credit_status(
+    client: httpx.AsyncClient,
+    *,
+    slug: str = "cheap",
+    payer: str = PAYER_ADDRESS,
+    key=None,
+    before: str | None = None,
+    limit: int | None = None,
+) -> httpx.Response:
+    challenge = await _credit_status_challenge(client, slug=slug, payer=payer)
+    body = signed(challenge) if key is None else signed(challenge, key)
+    if before is not None:
+        body["before"] = before
+    if limit is not None:
+        body["limit"] = limit
+    return await client.post("/v1/prepaid/credits/status", json=body)
+
+
+async def test_signed_credit_status_defaults_to_the_newest_ten(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_n(client, upstream, 11)
+    reply = await _read_credit_status(client)
+    assert reply.status_code == 200, reply.text
+    status = BuyerCreditStatus.model_validate(reply.json())
+    assert status.credit_count == 11 and len(status.credits) == 10
+    assert status.next_cursor is not None
+    # Default is newest first; the 11th is only on the next page.
+    full = await _read_credit_status(client, limit=100)
+    assert [c.credit_id for c in status.credits] == [
+        c.credit_id for c in BuyerCreditStatus.model_validate(full.json()).credits[:10]
+    ]
+
+
+async def test_signed_credit_status_honours_limit_one(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_n(client, upstream, 2)
+    reply = await _read_credit_status(client, limit=1)
+    assert reply.status_code == 200, reply.text
+    status = BuyerCreditStatus.model_validate(reply.json())
+    assert status.credit_count == 2 and len(status.credits) == 1 and status.next_cursor is not None
+
+
+async def test_signed_credit_status_honours_limit_one_hundred(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_n(client, upstream, 11)
+    reply = await _read_credit_status(client, limit=100)
+    assert reply.status_code == 200, reply.text
+    status = BuyerCreditStatus.model_validate(reply.json())
+    assert status.credit_count == 11 and len(status.credits) == 11 and status.next_cursor is None
+
+
+async def test_signed_credit_status_rejects_limit_above_one_hundred(client: httpx.AsyncClient, shop: Seed) -> None:
+    reply = await _read_credit_status(client, limit=101)
+    assert reply.status_code == 422
+
+
+async def test_signed_credit_status_walks_every_page_without_duplicates_or_gaps(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_n(client, upstream, 11)
+    seen: list[object] = []
+    before: str | None = None
+    pages = 0
+    while True:
+        reply = await _read_credit_status(client, limit=3, before=before)
+        assert reply.status_code == 200, reply.text
+        status = BuyerCreditStatus.model_validate(reply.json())
+        assert status.credit_count == 11
+        seen.extend(c.credit_id for c in status.credits)
+        pages += 1
+        if status.next_cursor is None:
+            break
+        before = status.next_cursor
+        assert pages < 10
+    assert pages == 4 and len(seen) == 11 and len(set(seen)) == 11
+    full = BuyerCreditStatus.model_validate((await _read_credit_status(client, limit=100)).json())
+    assert [c.credit_id for c in full.credits] == seen
+
+
+async def test_signed_credit_status_rejects_a_malformed_cursor_without_burning_the_challenge(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_weather(client, upstream)
+    challenge = await _credit_status_challenge(client)
+    bad = await client.post("/v1/prepaid/credits/status", json={**signed(challenge), "before": "not-a-cursor"})
+    assert bad.status_code == 400 and bad.json()["error"] == "invalid_cursor"
+    assert "credits" not in bad.json()
+    ok = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
+    assert ok.status_code == 200, ok.text
+    assert BuyerCreditStatus.model_validate(ok.json()).credit_count == 1
+
+
+async def test_signed_credit_status_does_not_leak_another_buyer_or_merchant_cursor(
+    client: httpx.AsyncClient,
+    shop: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    await _credit_n(client, upstream, 2)
+    ours = BuyerCreditStatus.model_validate((await _read_credit_status(client, limit=1)).json())
+    cursor = ours.next_cursor
+    assert cursor is not None
+    # Same merchant, another depositing key: the cursor must be refused, and none of our ids leak.
+    other_buyer = await _credit_status_challenge(client, payer=OTHER_ADDRESS)
+    leaked = await client.post("/v1/prepaid/credits/status", json={**signed(other_buyer, OTHER_KEY), "before": cursor})
+    assert leaked.status_code == 400 and leaked.json()["error"] == "invalid_cursor"
+    assert "credits" not in leaked.json()
+    # Another merchant, same key: same refusal, no leak of that merchant's credits either.
+    other_shop = await seed_endpoint(sessionmaker, slug="other-weather", address=OTHER_ADDRESS)
+    await _credit_n(client, upstream, 2, slug="other-weather", start=16)
+    foreign = BuyerCreditStatus.model_validate(
+        (await _read_credit_status(client, slug="other-weather", limit=1)).json()
+    )
+    assert foreign.merchant_id == other_shop.merchant_id and foreign.next_cursor is not None
+    cross = await _read_credit_status(client, slug="cheap", before=foreign.next_cursor)
+    assert cross.status_code == 400 and cross.json()["error"] == "invalid_cursor"
+    assert "credits" not in cross.json()
+    # A fresh challenge still returns only this merchant's credits.
+    mine = BuyerCreditStatus.model_validate((await _read_credit_status(client, limit=100)).json())
+    assert mine.merchant_id == shop.merchant_id and mine.credit_count == 2
+    assert {c.credit_id for c in mine.credits}.isdisjoint({c.credit_id for c in foreign.credits})
 
 
 LAPSED = timedelta(hours=1)
