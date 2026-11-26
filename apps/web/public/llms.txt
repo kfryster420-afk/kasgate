@@ -38,19 +38,20 @@ the treasury receives the 0.2 KAS floor. Funds never pass through KasGate custod
 Deposit once (an ordinary payment of at least 0.6 KAS, same split), then pay calls with signed debits:
 POST /v1/prepaid/deposits/quote, POST /v1/prepaid/deposits, then per call POST /v1/prepaid/challenge and
 X-KasGate-Prepaid: Base64(JSON{nonce, signature}). Balance: GET /v1/prepaid/balance?slug=&payer_address=.
-Unsigned, it returns only balance_sompi, spendable_sompi, expires_at and updated_at; deposited_sompi,
-debited_sompi, refunded_sompi, expired_sompi and refund_hold_sompi are null. To read them, sign (depositing
-key, kaspa sign_message / KasWare signMessage schnorr) the text
-"KasGate\nDomain: <gateway host>\nPurpose: kasgate:v1:prepaid-balance-read\nAddress: <payer_address>\nSlug: <slug>\nTimestamp: <unix seconds>"
-and send X-KasGate-Balance-Timestamp and X-KasGate-Balance-Signature (128 hex); the timestamp must be within
-300 s, otherwise 401 invalid_balance_signature. The signature authorises only this read.
+Unsigned it returns only spendable_sompi and expires_at (merchant_id, payer_address, balance_sompi, updated_at
+and the ledger totals are null). Ledger totals, balance_sompi and updated_at require
+X-KasGate-Balance-Timestamp and X-KasGate-Balance-Signature over Purpose kasgate:v1:prepaid-balance-read
+(±300 s). 402 prepaid offers point at this URL: use spendable_sompi.
 
 Refunds of unused credit: POST /v1/prepaid/refunds/challenge {slug, payer_address, action: "request",
 amount_sompi?} (omit the amount for all refundable credit, at least 0.2 KAS), sign the message (Purpose
 kasgate:v1:prepaid-refund) with the depositing key, POST /v1/prepaid/refunds {nonce, signature}. The merchant
 pays it back on-chain to the depositing address with no platform fee (payload kasgate:v1:refund:<id hex>);
-follow it with GET /v1/prepaid/refunds/status?slug=&payer_address= (public, no reasons) or a signed "status"
-challenge and POST /v1/prepaid/refunds/status {nonce, signature} (with the merchant's reasons). Credit may expire if the merchant set an expiry (see
+follow it with GET /v1/prepaid/refunds/status?slug=&payer_address= (buyer-signed with the same
+X-KasGate-Balance-Timestamp / X-KasGate-Balance-Signature headers over Purpose
+kasgate:v1:refunds-status-read; unsigned or invalid is 401 invalid_balance_signature; reasons still
+withheld) or a signed "status" challenge and POST /v1/prepaid/refunds/status {nonce, signature}
+(with the merchant's reasons). Credit may expire if the merchant set an expiry (see
 expires_at and spendable_sompi on the balance).
 
 Failed deliveries: if a paid call's last delivery failed for good (upstream 5xx, connection error, or a timeout

@@ -1,12 +1,12 @@
 "use client";
 
 import { ChevronDown, Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ApiError, apiFetch } from "@/lib/api-client";
 import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { formatDateTime, shortHash } from "@/lib/format";
 import { getKasware, isSignatureToken, isWalletRejection, kaswareNetworkRefusal, walletErrorText } from "@/lib/kasware";
-import { balanceReadMessage, normaliseBalanceSignature } from "@/lib/balance-read";
+import { buyerReadMessage, normaliseBalanceSignature, PREPAID_BALANCE_READ_PURPOSE, PREPAID_REFUNDS_READ_PURPOSE, type BuyerReadPurpose } from "@/lib/balance-read";
 import { checkRefundChallenge } from "@/lib/refund-challenge";
 import { CREDIT_REASON_LABEL } from "@/lib/credit-labels";
 import { checkCreditChallenge } from "@/lib/credit-challenge";
@@ -18,6 +18,7 @@ import { usePricing } from "@/lib/use-pricing";
 import type {
   BuyerCreditStatus,
   BuyerCreditStatusItem,
+  FullPrepaidBalanceRead,
   PrepaidBalanceRead,
   PrepaidCreditStatusChallenge,
   PrepaidCreditStatusRequest,
@@ -36,20 +37,24 @@ function isP2pkAddress(address: string): boolean {
   return address.startsWith(`${ADDRESS_PREFIX}q`);
 }
 
-/** `signed`: the rows came from a signed status read, so they carry the merchant's reasons and payout errors. */
-/** `balanceSigned`: the balance came from a buyer-signed read, so its ledger totals (held, deposited, …) are present. */
-/** `credits`: pages read with signed `credits` challenges (CONTRACT v2.14); totals from the newest page read. */
-type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[]; signed: boolean; credits: CreditView | null };
-type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | "credits" | "credits-more" | `cancel:${string}`;
+/**
+ * `balanceSigned`: the balance came from a buyer-signed read, so balance and ledger totals are present (the unsigned
+ * read has only spendable and expiry). `refunds`: null until a buyer-signed refunds-status read (CONTRACT v2.12.1,
+ * #6: there is no unsigned refund list). `signed`: the rows came from a signed `status` challenge, so they carry
+ * the merchant's reasons and payout errors. `credits`: pages read with signed `credits` challenges (CONTRACT v2.14).
+ */
+type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[] | null; signed: boolean; credits: CreditView | null };
+type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | "refunds" | "credits" | "credits-more" | `cancel:${string}`;
 
 /** Signed POST /v1/prepaid/credits/status pages: totals of the last page read, the rows loaded so far, the next cursor. */
 type CreditView = { totals: BuyerCreditStatus; items: BuyerCreditStatusItem[]; nextCursor: string | null };
 
-type SignedBalance = PrepaidBalanceRead & { deposited_sompi: string; debited_sompi: string; refunded_sompi: string; expired_sompi: string; refund_hold_sompi: string };
+/** A read signature is honoured for ±300 s; reuse one for reloads (after a request or cancel) for 4 minutes, then sign again. */
+const READ_SIGNATURE_REUSE_MS = 240_000;
+type ReadSignature = { timestamp: string; signature: string; at: number };
 
 const SOMPI_RE = /^(0|[1-9][0-9]{0,17})$/;
 
-/** True when every ledger total is present and a strict decimal sompi string (the signed read). */
 /** A strict decimal sompi string as a bigint, else null. */
 function sompiOrNull(value: string | null | undefined): bigint | null {
   return typeof value === "string" && SOMPI_RE.test(value) ? BigInt(value) : null;
@@ -67,8 +72,19 @@ function refundLimit(lookup: Lookup): { refundable: bigint; callOnly: bigint } {
   };
 }
 
-function hasLedgerTotals(balance: PrepaidBalanceRead): balance is SignedBalance {
-  return [balance.deposited_sompi, balance.debited_sompi, balance.refunded_sompi, balance.expired_sompi, balance.refund_hold_sompi].every((v) => typeof v === "string" && SOMPI_RE.test(v));
+/** True when the balance and every ledger total are strict decimal sompi strings (a signed read). */
+function hasLedgerTotals(balance: PrepaidBalanceRead): balance is FullPrepaidBalanceRead {
+  return [balance.balance_sompi, balance.deposited_sompi, balance.debited_sompi, balance.refunded_sompi, balance.expired_sompi, balance.refund_hold_sompi].every(
+    (v) => typeof v === "string" && SOMPI_RE.test(v),
+  );
+}
+
+/** Text for a failed buyer-signed read; 401 invalid_balance_signature gets its own explanation. */
+function readErrorText(e: unknown, what: string): string {
+  if (e instanceof ApiError && e.code === "invalid_balance_signature") {
+    return `The gateway didn't accept the signature for ${what}: the KasWare account isn't the depositing key, or this device's clock is more than 5 minutes off. Nothing was shown.`;
+  }
+  return refundErrorMessage(e);
 }
 
 export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
@@ -97,16 +113,92 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     };
   }, []);
 
-  const load = useCallback(async (slugValue: string, addressValue: string): Promise<Lookup> => {
+  /** Fresh read signatures by purpose, slug and address; memory only (never stored). */
+  const readSignatures = useRef(new Map<string, ReadSignature>());
+
+  /**
+   * A buyer-signed read (balance or refunds status): reuses a signature younger than 4 minutes, otherwise (when
+   * `prompt`) asks KasWare to sign the six-line read text after the account and testnet-10 checks. Null when no
+   * fresh signature is cached and `prompt` is false.
+   */
+  async function readSignature(purpose: BuyerReadPurpose, slugValue: string, addressValue: string, prompt: boolean): Promise<ReadSignature | null> {
+    const key = `${purpose}|${slugValue}|${addressValue}`;
+    const cached = readSignatures.current.get(key);
+    if (cached && Date.now() - cached.at < READ_SIGNATURE_REUSE_MS) return cached;
+    readSignatures.current.delete(key);
+    if (!prompt) return null;
+    const wallet = getKasware();
+    if (!wallet) throw new Error("KasWare was not detected in this browser. Balances and refund requests are shown only to the depositing key.");
+    if (!EXPECTED_AUTH_DOMAIN) throw new Error("This app has no gateway URL configured, so it can't build the message to sign.");
+    const accounts = await wallet.requestAccounts();
+    if (accounts[0]?.trim().toLowerCase() !== addressValue) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
+    const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+    if (wrongNetwork) throw new Error(wrongNetwork);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = buyerReadMessage(purpose, { domain: EXPECTED_AUTH_DOMAIN, address: addressValue, slug: slugValue, timestamp });
+    let raw: string;
+    try {
+      raw = await wallet.signMessage(message, { type: "schnorr" });
+    } catch (e) {
+      if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Nothing was read.");
+      throw new Error(`KasWare: ${walletErrorText(e)}`);
+    }
+    const signature = normaliseBalanceSignature(raw);
+    if (!signature) throw new Error("KasWare returned a signature in an unexpected format (expected 128 hex characters).");
+    const fresh: ReadSignature = { timestamp: String(timestamp), signature, at: Date.now() };
+    readSignatures.current.set(key, fresh);
+    return fresh;
+  }
+
+  /** POST the signed read to this app's route; a 401 drops the cached signature so the next try signs again. */
+  async function signedRead<T>(purpose: BuyerReadPurpose, path: string, slugValue: string, addressValue: string, sig: ReadSignature, extra: Record<string, unknown> = {}): Promise<T> {
+    try {
+      return await apiFetch<T>(path, { method: "POST", body: { slug: slugValue, payer_address: addressValue, timestamp: sig.timestamp, signature: sig.signature, ...extra } });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) readSignatures.current.delete(`${purpose}|${slugValue}|${addressValue}`);
+      throw e;
+    }
+  }
+
+  async function signedBalance(slugValue: string, addressValue: string, sig: ReadSignature): Promise<FullPrepaidBalanceRead> {
+    const balance = await signedRead<PrepaidBalanceRead>(PREPAID_BALANCE_READ_PURPOSE, "/api/prepaid/balance/signed", slugValue, addressValue, sig);
+    if (!hasLedgerTotals(balance)) throw new Error("The gateway answered without the balance and ledger totals. Try again.");
+    return balance;
+  }
+
+  async function signedRefunds(slugValue: string, addressValue: string, sig: ReadSignature): Promise<PrepaidRefundRead[]> {
+    return signedRead<PrepaidRefundRead[]>(PREPAID_REFUNDS_READ_PURPOSE, "/api/prepaid/refunds/status/signed", slugValue, addressValue, sig, { limit: 50 });
+  }
+
+  /**
+   * Unsigned balance (spendable and expiry only), then the signed reads: the refund list (KasWare asked to sign when
+   * `promptRefunds` and no fresh signature is cached) and the full balance when a fresh balance signature is cached.
+   * A failed refund read leaves the list unloaded and reports why; the balance still shows.
+   */
+  async function load(slugValue: string, addressValue: string, promptRefunds: boolean): Promise<Lookup> {
     const query = `slug=${encodeURIComponent(slugValue)}&payer_address=${encodeURIComponent(addressValue)}`;
-    const [balance, refunds] = await Promise.all([
-      apiFetch<PrepaidBalanceRead>(`/api/prepaid/balance?${query}`),
-      apiFetch<PrepaidRefundRead[]>(`/api/prepaid/refunds/status?${query}&limit=50`),
-    ]);
-    const next: Lookup = { slug: slugValue, address: addressValue, balance, balanceSigned: false, refunds, signed: false, credits: null };
+    let balance = await apiFetch<PrepaidBalanceRead>(`/api/prepaid/balance?${query}`);
+    let balanceSigned = false;
+    const balanceSig = await readSignature(PREPAID_BALANCE_READ_PURPOSE, slugValue, addressValue, false);
+    if (balanceSig) {
+      try {
+        balance = await signedBalance(slugValue, addressValue, balanceSig);
+        balanceSigned = true;
+      } catch {
+        readSignatures.current.delete(`${PREPAID_BALANCE_READ_PURPOSE}|${slugValue}|${addressValue}`);
+      }
+    }
+    let refunds: PrepaidRefundRead[] | null = null;
+    try {
+      const sig = await readSignature(PREPAID_REFUNDS_READ_PURPOSE, slugValue, addressValue, promptRefunds);
+      if (sig) refunds = await signedRefunds(slugValue, addressValue, sig);
+    } catch (e) {
+      setError(readErrorText(e, "your refund requests"));
+    }
+    const next: Lookup = { slug: slugValue, address: addressValue, balance, balanceSigned, refunds, signed: false, credits: null };
     setLookup(next);
     return next;
-  }, []);
+  }
 
   function inputs(): { slug: string; address: string } | null {
     const s = checkSlug(slug);
@@ -159,7 +251,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     setBusy("lookup");
     setError(null);
     try {
-      await load(values.slug, values.address);
+      await load(values.slug, values.address, connected === values.address);
     } catch (e) {
       setLookup(null);
       setError(refundErrorMessage(e));
@@ -227,7 +319,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
       if (amountSompi !== undefined) request.amount_sompi = amountSompi;
       const refund = await signAndSend<PrepaidRefundRead>(request, "/api/prepaid/refunds", { amountSompi });
       setAmount("");
-      await load(lookup.slug, lookup.address);
+      await load(lookup.slug, lookup.address, true);
       setNotice(`Refund of ${formatKas(refund.amount_sompi)} KAS requested. The merchant pays it to ${refund.payout_address}.`);
     } catch (e) {
       setError(refundErrorMessage(e));
@@ -248,7 +340,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
         `/api/prepaid/refunds/${refund.id}/cancel`,
         { refundId: refund.id },
       );
-      await load(lookup.slug, lookup.address);
+      await load(lookup.slug, lookup.address, true);
       setNotice(
         cancelled.hold_until
           ? `Refund request withdrawn. Because the merchant had started paying it, the amount stays held until ${formatDateTime(cancelled.hold_until)} in case their payout is already on its way; then it is spendable again.`
@@ -258,7 +350,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
       const txIds = e instanceof ApiError && e.code === "refund_not_cancellable" ? txIdsInMessage(e.message) : [];
       if (txIds.length > 0) {
         setPayoutFound({ refundId: refund.id, txIds });
-        await load(lookup.slug, lookup.address);
+        await load(lookup.slug, lookup.address, true);
       } else if (e instanceof ApiError && e.status === 503) {
         setError("The merchant had started paying this refund, and the Kaspa node can't be checked for their payout right now, so it can't be withdrawn yet. Nothing changed. Try again shortly.");
       } else {
@@ -269,49 +361,43 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     }
   }
 
-  /** Signed `status` read: the same rows with the merchant's reject reasons and payout errors (the public view hides them). */
-  /** CONTRACT v2.12.1 signed balance read: KasWare signs the timestamped balance-read text; no challenge round trip. */
+  /** CONTRACT v2.12.1 signed balance read: KasWare signs the timestamped prepaid-balance-read text; no challenge round trip. */
   async function signBalance() {
     if (!lookup) return;
     setNotice(null);
     setBusy("balance");
     setError(null);
     try {
-      const wallet = getKasware();
-      if (!wallet) throw new Error("KasWare was not detected in this browser. The full balance is shown only to the depositing key.");
-      if (!EXPECTED_AUTH_DOMAIN) throw new Error("This app has no gateway URL configured, so it can't build the balance message.");
-      const accounts = await wallet.requestAccounts();
-      if (accounts[0]?.trim().toLowerCase() !== lookup.address) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
-      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
-      if (wrongNetwork) throw new Error(wrongNetwork);
-      const timestamp = Math.floor(Date.now() / 1000);
-      const message = balanceReadMessage({ domain: EXPECTED_AUTH_DOMAIN, address: lookup.address, slug: lookup.slug, timestamp });
-      let raw: string;
-      try {
-        raw = await wallet.signMessage(message, { type: "schnorr" });
-      } catch (e) {
-        if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Only spendable credit and expiry are shown.");
-        throw new Error(`KasWare: ${walletErrorText(e)}`);
-      }
-      const signature = normaliseBalanceSignature(raw);
-      if (!signature) throw new Error("KasWare returned a signature in an unexpected format (expected 128 hex characters).");
-      const balance = await apiFetch<PrepaidBalanceRead>("/api/prepaid/balance/signed", {
-        method: "POST",
-        body: { slug: lookup.slug, payer_address: lookup.address, timestamp: String(timestamp), signature },
-      });
-      if (!hasLedgerTotals(balance)) throw new Error("The gateway answered without the ledger totals. Try again.");
+      const sig = await readSignature(PREPAID_BALANCE_READ_PURPOSE, lookup.slug, lookup.address, true);
+      if (!sig) throw new Error("No signature was made.");
+      const balance = await signedBalance(lookup.slug, lookup.address, sig);
       setLookup({ ...lookup, balance, balanceSigned: true });
     } catch (e) {
-      if (e instanceof ApiError && e.code === "invalid_balance_signature") {
-        setError("The gateway didn't accept the balance signature: the KasWare account isn't the depositing key, or this device's clock is more than 5 minutes off. Nothing was shown.");
-      } else {
-        setError(refundErrorMessage(e));
-      }
+      setError(readErrorText(e, "the balance"));
     } finally {
       setBusy(null);
     }
   }
 
+  /** CONTRACT v2.12.1 (#6 @a96a16a) signed refund list: KasWare signs the refunds-status-read text. */
+  async function signRefunds() {
+    if (!lookup) return;
+    setNotice(null);
+    setBusy("refunds");
+    setError(null);
+    try {
+      const sig = await readSignature(PREPAID_REFUNDS_READ_PURPOSE, lookup.slug, lookup.address, true);
+      if (!sig) throw new Error("No signature was made.");
+      const refunds = await signedRefunds(lookup.slug, lookup.address, sig);
+      setLookup({ ...lookup, refunds, signed: false });
+    } catch (e) {
+      setError(readErrorText(e, "your refund requests"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Signed `status` challenge: the same rows with the merchant's reject reasons and payout errors (the signed read hides them). */
   async function showReasons() {
     if (!lookup) return;
     setNotice(null);
@@ -382,7 +468,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
 
   const now = Date.now();
   const canSign = connected !== null && lookup !== null && connected === lookup.address;
-  const openRefund = lookup?.refunds.find((r) => r.status === "requested" || r.status === "paying" || r.status === "payout_submitted") ?? null;
+  const openRefund = lookup?.refunds?.find((r) => r.status === "requested" || r.status === "paying" || r.status === "payout_submitted") ?? null;
   const balance = lookup?.balance ?? null;
   const expired = balance?.expires_at ? Date.parse(balance.expires_at) <= Date.now() : false;
   const limit = lookup ? refundLimit(lookup) : null;
@@ -396,7 +482,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
           <Field label="Endpoint slug" htmlFor="refund-slug" hint="Any endpoint of the merchant you deposited with (the part after /p/).">
             <input id="refund-slug" className="input font-mono" value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="weather-api" autoComplete="off" spellCheck={false} />
           </Field>
-          <Field label="Your depositing address" htmlFor="refund-address" hint={connected ? "Connected with KasWare." : "Connect KasWare to sign, or paste an address to only view status."}>
+          <Field label="Your depositing address" htmlFor="refund-address" hint={connected ? "Connected with KasWare." : "Connect KasWare to sign. A pasted address shows only spendable credit and expiry."}>
             <input
               id="refund-address"
               className="input font-mono"
@@ -572,14 +658,27 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
               <h2 id="buyer-refunds-heading" className="text-sm font-medium text-zinc-100">
                 Your refund requests
               </h2>
-              {lookup.refunds.length > 0 ? (
+              {lookup.refunds !== null && lookup.refunds.length > 0 ? (
                 <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void showReasons()} disabled={busy !== null || !canSign} title={canSign ? undefined : "Connect the depositing KasWare account to sign"}>
                   {busy === "status" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
                   {lookup.signed ? "Refresh with reasons" : "Sign to see the merchant's reasons"}
                 </button>
               ) : null}
             </div>
+            {lookup.refunds === null ? (
+              <div className="card flex flex-wrap items-center gap-3 p-4" data-refunds-unsigned>
+                <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void signRefunds()} disabled={busy !== null || !canSign} data-sign-refunds>
+                  {busy === "refunds" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                  Sign to see your refund requests
+                </button>
+                <p className="text-[11px] text-zinc-500">
+                  Refund requests are shown only to the depositing key: KasWare signs a read-only message (it authorises nothing else).
+                  {canSign ? null : " Connect the depositing KasWare account first."}
+                </p>
+              </div>
+            ) : null}
             {lookup.signed ? <p className="text-xs text-zinc-500" data-signed-status>Showing your signed view: merchant reasons and payout problems are included.</p> : null}
+            {lookup.refunds !== null ? (
             <div className="card overflow-x-auto">
               <table className="w-full min-w-[720px]">
                 <thead>
@@ -678,6 +777,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
               </table>
               {lookup.refunds.length === 0 ? <div className="td py-6 text-center text-zinc-500">No refund requests yet.</div> : null}
             </div>
+            ) : null}
             <p className="text-xs text-zinc-500">
               The merchant pays a refund on-chain to exactly this address for exactly the requested amount. Your balance drops only once that payment is seen on
               the network.

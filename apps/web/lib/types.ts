@@ -159,11 +159,14 @@ export interface PrepaidReceipt {
 
 /** GET /v1/prepaid/balances (merchant view) and the public GET /v1/prepaid/balance. */
 export interface PrepaidBalanceRead {
-  merchant_id: Uuid;
-  payer_address: string;
-  /** Always present (the 402 `balanceUrl` relies on it). Includes credit held by an open refund request. */
-  balance_sompi: Sompi;
-  /** CONTRACT v2.12.1: null on the unsigned public read; merchant reads and buyer-signed reads always fill it. */
+  /**
+   * CONTRACT v2.12.1 (#6 @a96a16a): the unsigned public read populates ONLY `spendable_sompi` and `expires_at`;
+   * every other field is null. A buyer-signed read (X-KasGate-Balance-* headers) and merchant reads fill every field.
+   */
+  merchant_id: Uuid | null;
+  payer_address: string | null;
+  /** Includes credit held by an open refund request. Null on the unsigned public read. */
+  balance_sompi: Sompi | null;
   deposited_sompi: Sompi | null;
   debited_sompi: Sompi | null;
   updated_at: IsoDateTime | null;
@@ -173,9 +176,9 @@ export interface PrepaidBalanceRead {
   expired_sompi: Sompi | null;
   /** CONTRACT v2.13: set aside by an open refund request (or a cancel cooldown); still in the balance but not spendable. Null on the unsigned public read. */
   refund_hold_sompi: Sompi | null;
-  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. Always public. */
+  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. Always public (the 402 `balanceUrl` relies on it). */
   spendable_sompi: Sompi;
-  /** CONTRACT v2.13: when the credit expires (null = never). */
+  /** CONTRACT v2.13: when the credit expires (null = never). Always public. */
   expires_at: IsoDateTime | null;
   /**
    * CONTRACT v2.14: merchant shares of failed paid calls ever credited onto this balance. Typed nullable on the public
@@ -189,8 +192,11 @@ export interface PrepaidBalanceRead {
   refundable_sompi?: Sompi | null;
 }
 
-/** Merchant `GET /v1/prepaid/balances` rows always carry every ledger total. */
-export type MerchantPrepaidBalanceRead = PrepaidBalanceRead & {
+/** Signed buyer reads and merchant `GET /v1/prepaid/balances` rows carry every field (updated_at stays nullable for a never-funded key). */
+export type FullPrepaidBalanceRead = PrepaidBalanceRead & {
+  merchant_id: Uuid;
+  payer_address: string;
+  balance_sompi: Sompi;
   deposited_sompi: Sompi;
   debited_sompi: Sompi;
   refunded_sompi: Sompi;
@@ -200,6 +206,9 @@ export type MerchantPrepaidBalanceRead = PrepaidBalanceRead & {
   credit_balance_sompi: Sompi;
   refundable_sompi: Sompi;
 };
+
+/** Merchant `GET /v1/prepaid/balances` rows. */
+export type MerchantPrepaidBalanceRead = FullPrepaidBalanceRead;
 
 export interface PrepaidDepositRead {
   id: Uuid;
@@ -296,9 +305,9 @@ export interface PrepaidRefundRead {
   status: PrepaidRefundStatus;
   /** The latest attempt while `payout_submitted`; the confirmed payout once `paid`. */
   tx_id: string | null;
-  /** The merchant's reject reason. Null in the public GET /refunds/status view (read it with a signed status). */
+  /** The merchant's reject reason. Null in the GET /refunds/status view (buyer-signed read; reasons need the signed `status` challenge). */
   reason: string | null;
-  /** The latest payout problem. Null in the public GET /refunds/status view. */
+  /** The latest payout problem. Null in the GET /refunds/status view. */
   last_error: string | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
