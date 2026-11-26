@@ -24,8 +24,9 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Merchant policy: `GET`/`PUT /v1/prepaid/failed-delivery-policy` `{enabled, credit_timeouts}` (on by default,
   timeouts included).
 - Failure credit is call-only and non-refundable: tracked in `credit_balance_sompi`, spent before deposited sompi
-  (`prepaid_debits.credit_sompi`), excluded from refunds and refund holds (`refundable = balance - hold -
-  credit_balance`); a late v2.13 payout re-debits deposited sompi first.
+  (`prepaid_debits.credit_sompi`), excluded from refunds, refund holds and cancel cooldown holds
+  (`refundable = max(0, balance - hold - credit_balance)`); a late v2.13 payout re-debits deposited sompi first.
+  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown).
 - Credits are clamped to `PREPAID_MAX_BALANCE_SOMPI`; the cut part is `shortfall_sompi` on the ledger row and a
   signed `prepaid.credit.failed_delivery_shortfall` webhook.
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`

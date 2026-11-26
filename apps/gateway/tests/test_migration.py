@@ -1222,3 +1222,31 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
             assert await conn.run_sync(_diff) == []
     finally:
         await migrated.dispose()
+
+
+async def test_0009_head_passes_the_0008_schema_guard(pg_server: PgServer) -> None:
+    """The 0008 schema guard (final refund columns + prepaid_refund_payouts) must accept a database at 0009 head.
+
+    The guard does not inspect 0009-level columns; it must not false-positive once 0009 is applied on top of the
+    final 0008.
+    """
+    from app.schema_guard import stale_0008_problem
+
+    url = pg_server.make_url("kasgate_guard_head")
+    pg_server.create_database("kasgate_guard_head")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0008_prepaid_refunds")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+    finally:
+        await engine.dispose()
+    await asyncio.to_thread(command.upgrade, config, "head")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(stale_0008_problem) is None
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await engine.dispose()

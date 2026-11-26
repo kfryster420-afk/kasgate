@@ -68,7 +68,8 @@ def clip(message: str) -> str:
 
 
 def spendable_sompi(balance: PrepaidBalance | None, now: datetime | None = None) -> int:
-    """Credit calls can be paid from right now: balance minus the open refund hold, none once expired."""
+    """Credit calls can be paid from right now: balance minus the refund hold (an open refund or a cancel
+    cooldown that has not been released yet), none once expired."""
     if balance is None:
         return 0
     if balance.expires_at is not None and balance.expires_at <= (now or datetime.now(UTC)):
@@ -94,8 +95,7 @@ def refundable_covers(amount: int | ColumnElement[int]) -> ColumnElement[bool]:
     `refund_hold_sompi` includes both an open refund and a cancel cooldown hold.
     """
     return and_(
-        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi
-        >= amount,
+        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi >= amount,
         or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
     )
 
