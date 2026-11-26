@@ -511,11 +511,11 @@ async def refund_status(
 # ---------------------------------------------------------------- merchant routes [Bearer]
 
 
-async def _owned_refund(session: AsyncSession, merchant: Merchant, refund_id: uuid.UUID) -> PrepaidRefund | None:
+async def _owned_refund(session: AsyncSession, merchant_id: uuid.UUID, refund_id: uuid.UUID) -> PrepaidRefund | None:
     return (
         await session.execute(
             select(PrepaidRefund)
-            .where(PrepaidRefund.id == refund_id, PrepaidRefund.merchant_id == merchant.id)
+            .where(PrepaidRefund.id == refund_id, PrepaidRefund.merchant_id == merchant_id)
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
@@ -591,7 +591,8 @@ async def submit_refund_payout(
     engine: EngineDep,
 ) -> Response:
     """Record the merchant's payout of an open refund. The ledger is debited only once it is seen on-chain."""
-    refund = await _owned_refund(session, merchant, refund_id)
+    merchant_id = merchant.id
+    refund = await _owned_refund(session, merchant_id, refund_id)
     if refund is None:
         return _error(404, "refund_not_found", "refund not found")
     if refund.status not in PREPAID_REFUND_OPEN_STATUSES:
@@ -641,7 +642,7 @@ async def submit_refund_payout(
         logger.error("refund %s was paid on-chain by %s but could not be recorded", refund_id, tx_id, exc_info=True)
         return _store_unavailable()
     if paid is None:
-        current = await _owned_refund(session, merchant, refund_id)
+        current = await _owned_refund(session, merchant_id, refund_id)
         if current is None:
             return _error(404, "refund_not_found", "refund not found")
         return _error(409, "refund_closed", f"this refund is already {current.status}")
@@ -665,6 +666,7 @@ async def reject_refund(
     refund_id: uuid.UUID, payload: PrepaidRefundReject, merchant: CurrentMerchant, session: DbSession
 ) -> Response:
     """Decline a `requested` refund with a reason the buyer can read; the hold is released back to spendable."""
+    merchant_id = merchant.id
     now = datetime.now(UTC)
     refund = (
         await session.execute(
@@ -681,7 +683,7 @@ async def reject_refund(
     ).scalar_one_or_none()
     if refund is None:
         await session.rollback()
-        existing = await _owned_refund(session, merchant, refund_id)
+        existing = await _owned_refund(session, merchant_id, refund_id)
         if existing is None:
             return _error(404, "refund_not_found", "refund not found")
         return _error(

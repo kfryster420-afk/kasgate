@@ -750,3 +750,151 @@ async def test_0007_trials_webhooks_constraints_and_guarded_downgrade(pg_server:
             assert await conn.run_sync(_diff) == []
     finally:
         await migrated.dispose()
+
+
+async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: PgServer) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    url = pg_server.make_url("kasgate_refunds")
+    pg_server.create_database("kasgate_refunds")
+    config = alembic_config(url)
+    await asyncio.to_thread(command.upgrade, config, "0007_trials_webhooks")
+    await _execute(
+        url,
+        "INSERT INTO merchants (id, kaspa_address, display_name, api_key_hash) "
+        "VALUES (gen_random_uuid(), 'a', 'm', repeat('a', 64))",
+        "INSERT INTO endpoints (id, merchant_id, slug, name, upstream_url, price_sompi, allowed_methods) "
+        "SELECT gen_random_uuid(), id, 'weather', 'w', 'https://x.test', 100000000, '{GET}' FROM merchants LIMIT 1",
+        "INSERT INTO prepaid_balances (id, merchant_id, payer_address, payer_public_key, balance_sompi, "
+        "deposited_sompi, debited_sompi) SELECT gen_random_uuid(), id, 'p', repeat('a', 64), 70, 100, 30 "
+        "FROM merchants LIMIT 1",
+    )
+    await asyncio.to_thread(command.upgrade, config, "head")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    # Existing balances carry over: nothing refunded, expired or held, and no expiry (never retroactive).
+    assert (
+        await _scalar(
+            url,
+            "SELECT refunded_sompi + expired_sompi + refund_hold_sompi FROM prepaid_balances WHERE expires_at IS NULL",
+        )
+        == 0
+    )
+    assert await _scalar(url, "SELECT count(*) FROM merchants WHERE prepaid_expiry_days IS NULL") == 1
+
+    refund = (
+        "INSERT INTO prepaid_refunds (id, balance_id, merchant_id, payer_address, payer_public_key, amount_sompi, "
+        "status, request_nonce, tx_id, payout_submitted_at, paid_at, resolved_at) SELECT gen_random_uuid(), b.id, "
+        "b.merchant_id, 'p', '{key}', {amount}, '{status}', '{nonce}', {tx}, {submitted}, {paid}, {resolved} "
+        "FROM prepaid_balances b LIMIT 1"
+    )
+    entry = (
+        "INSERT INTO prepaid_ledger_entries (id, balance_id, merchant_id, payer_address, kind, direction, "
+        "amount_sompi, balance_after_sompi, tx_id, refund_id) SELECT gen_random_uuid(), b.id, b.merchant_id, 'p', "
+        "'{kind}', '{direction}', {amount}, {after}, {tx}, {refund} FROM prepaid_balances b LIMIT 1"
+    )
+    paid_refund = "(SELECT id FROM prepaid_refunds WHERE status = 'paid')"
+    tx = f"'{'c' * 64}'"
+    await _execute(
+        url,
+        "UPDATE merchants SET prepaid_expiry_days = 30",
+        "UPDATE endpoints SET prepaid_expiry_days = 7",
+        "UPDATE prepaid_balances SET refund_hold_sompi = 20, expires_at = now() + interval '1 day'",
+        refund.format(
+            key="a" * 64,
+            amount=20,
+            status="requested",
+            nonce="1" * 32,
+            tx="NULL",
+            submitted="NULL",
+            paid="NULL",
+            resolved="NULL",
+        ),
+        refund.format(
+            key="a" * 64,
+            amount=10,
+            status="paid",
+            nonce="2" * 32,
+            tx=tx,
+            submitted="NULL",
+            paid="now()",
+            resolved="now()",
+        ),
+        "UPDATE prepaid_balances SET refunded_sompi = 10, balance_sompi = 60",
+        entry.format(kind="refund", direction="debit", amount=10, after=60, tx=tx, refund=paid_refund),
+        entry.format(kind="expiry", direction="debit", amount=5, after=55, tx="NULL", refund="NULL"),
+    )
+
+    def requested(**overrides: object) -> str:
+        values: dict[str, object] = {
+            "key": "a" * 64,
+            "amount": 5,
+            "status": "rejected",
+            "nonce": "3" * 32,
+            "tx": "NULL",
+            "submitted": "NULL",
+            "paid": "NULL",
+            "resolved": "now()",
+        }
+        values.update(overrides)
+        return refund.format(**values)
+
+    for bad in (
+        "UPDATE merchants SET prepaid_expiry_days = 0",  # ck_merchants_prepaid_expiry_days_range
+        "UPDATE endpoints SET prepaid_expiry_days = 3651",  # ck_endpoints_prepaid_expiry_days_range
+        "UPDATE prepaid_balances SET refund_hold_sompi = 61",  # ck_prepaid_balances_refund_hold_within_balance
+        "UPDATE prepaid_balances SET refunded_sompi = 11",  # ck_prepaid_balances_balance_matches_totals
+        "UPDATE prepaid_balances SET expired_sompi = -1",  # ck_prepaid_balances_totals_not_negative
+        requested(status="requested", resolved="NULL"),  # ix_prepaid_refunds_open_balance_id: one open refund
+        requested(nonce="1" * 32),  # ix_prepaid_refunds_request_nonce
+        requested(status="paid", tx=tx, paid="now()"),  # ix_prepaid_refunds_tx_id
+        requested(amount=0),  # ck_prepaid_refunds_amount_positive
+        requested(status="lost"),  # ck_prepaid_refunds_status_known
+        requested(nonce="3" * 31),  # ck_prepaid_refunds_request_nonce_hex32
+        requested(key="A" * 64),  # ck_prepaid_refunds_payer_public_key_hex64
+        requested(status="paid", paid="now()"),  # ck_prepaid_refunds_tx_id_iff_payout
+        requested(status="paid", tx=f"'{'d' * 64}'"),  # ck_prepaid_refunds_paid_at_iff_paid
+        requested(status="payout_submitted", tx=f"'{'d' * 64}'", resolved="NULL"),  # submitted_at iff submitted
+        requested(resolved="NULL"),  # ck_prepaid_refunds_resolved_at_iff_closed
+        requested(tx="'xyz'"),  # ck_prepaid_refunds_tx_id_hex64
+        entry.format(kind="refund", direction="debit", amount=10, after=60, tx=tx, refund=paid_refund),  # unique
+        entry.format(kind="refund", direction="debit", amount=1, after=1, tx="NULL", refund="NULL"),  # carry payout
+        entry.format(kind="expiry", direction="debit", amount=0, after=1, tx="NULL", refund="NULL"),  # positive
+        entry.format(kind="expiry", direction="debit", amount=1, after=-1, tx="NULL", refund="NULL"),  # after >= 0
+        entry.format(kind="gift", direction="debit", amount=1, after=1, tx="NULL", refund="NULL"),  # kind_known
+        entry.format(kind="expiry", direction="up", amount=1, after=1, tx="NULL", refund="NULL"),  # direction
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
+        "'evt_' || repeat('f', 32), id, 'prepaid.refund.lost', '{}'::jsonb FROM merchants LIMIT 1",
+    ):
+        with pytest.raises(IntegrityError):
+            await _execute(url, bad)
+    await _execute(
+        url,
+        "INSERT INTO webhook_events (id, event_id, merchant_id, event_type, payload) SELECT gen_random_uuid(), "
+        "'evt_' || repeat('e', 32), id, 'prepaid.refund.paid', '{}'::jsonb FROM merchants LIMIT 1",
+    )
+
+    with pytest.raises(DBAPIError, match="prepaid refunds, expiries or expiry policies exist"):
+        await asyncio.to_thread(command.downgrade, config, "0007_trials_webhooks")
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    await _execute(
+        url,
+        "DELETE FROM prepaid_ledger_entries",
+        "DELETE FROM prepaid_refunds",
+        "DELETE FROM webhook_events",
+        "UPDATE prepaid_balances SET refund_hold_sompi = 0, refunded_sompi = 0, balance_sompi = 70, expires_at = NULL",
+    )
+    with pytest.raises(DBAPIError, match="expiry policies"):
+        await asyncio.to_thread(command.downgrade, config, "0007_trials_webhooks")
+    await _execute(
+        url, "UPDATE merchants SET prepaid_expiry_days = NULL", "UPDATE endpoints SET prepaid_expiry_days = NULL"
+    )
+    await asyncio.to_thread(command.downgrade, config, "0007_trials_webhooks")
+    assert await _scalar(url, "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'prepaid_re%'") == 0
+    assert await _scalar(url, "SELECT balance_sompi FROM prepaid_balances") == 70
+    await asyncio.to_thread(command.upgrade, config, "head")
+    migrated = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with migrated.connect() as conn:
+            assert await conn.run_sync(_diff) == []
+    finally:
+        await migrated.dispose()
