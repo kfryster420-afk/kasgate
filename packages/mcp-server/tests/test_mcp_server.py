@@ -130,6 +130,9 @@ EXPECTED_TOOLS = {
     "prepaid_deposit",
     "prepaid_balance",
     "call_prepaid_endpoint",
+    "prepaid_refund_request",
+    "prepaid_refund_cancel",
+    "prepaid_refunds",
     "trial_status",
     "call_free_trial",
 }

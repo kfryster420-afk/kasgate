@@ -179,6 +179,12 @@ async def test_event_types_and_strict_payloads(client: httpx.AsyncClient, seeded
         "trial.used",
         "endpoint.created",
         "endpoint.updated",
+        "prepaid.refund.requested",
+        "prepaid.refund.paid",
+        "prepaid.refund.rejected",
+        "prepaid.refund.cancelled",
+        "prepaid.refund.payout_reverted",
+        "prepaid.credit.expired",
     }
     for body in (
         {"url": HOOK_URL, "event_types": []},

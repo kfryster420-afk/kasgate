@@ -70,6 +70,7 @@ from app.schemas import (
     MerchantCreate,
     MerchantCreated,
     MerchantRead,
+    MerchantUpdate,
     OpenApiImportCreated,
     OpenApiImportPreview,
     OpenApiImportRequest,
@@ -264,6 +265,23 @@ async def read_current_merchant(merchant: CurrentMerchant) -> MerchantRead:
     return MerchantRead.model_validate(merchant)
 
 
+@router.patch("/merchants/me", response_model=MerchantRead, tags=["merchants"])
+async def update_current_merchant(
+    payload: MerchantUpdate, merchant: CurrentMerchant, session: DbSession
+) -> MerchantRead:
+    """CONTRACT v2.13: change the display name and/or the default prepaid credit expiry (null = never expires).
+
+    A new expiry policy is never applied retroactively: it is set on a buyer's balance by their next deposit.
+    """
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(merchant, field, value)
+    session.add(merchant)
+    await session.commit()
+    await session.refresh(merchant)
+    return MerchantRead.model_validate(merchant)
+
+
 @router.post("/merchants/me/rotate-key", response_model=MerchantCreated, tags=["merchants"])
 async def rotate_key(
     merchant: CurrentMerchant, session: DbSession, redis: Annotated[Redis, Depends(get_redis)]
@@ -401,6 +419,7 @@ async def create_endpoint(payload: EndpointCreate, merchant: CurrentMerchant, se
             prepaid_only=payload.prepaid_only,
             free_trial_calls=payload.free_trial_calls,
             trial_daily_cap=payload.trial_daily_cap,
+            prepaid_expiry_days=payload.prepaid_expiry_days,
         )
         session.add(endpoint)
         try:

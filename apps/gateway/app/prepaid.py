@@ -31,14 +31,16 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, literal, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
+from app.ledger import expire_balance_for, spendable_sompi
 from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
@@ -154,7 +156,22 @@ def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBa
         deposited_sompi=str(0 if balance is None else balance.deposited_sompi),
         debited_sompi=str(0 if balance is None else balance.debited_sompi),
         updated_at=None if balance is None else balance.updated_at,
+        refunded_sompi=str(0 if balance is None else balance.refunded_sompi),
+        expired_sompi=str(0 if balance is None else balance.expired_sompi),
+        refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi),
+        spendable_sompi=str(spendable_sompi(balance)),
+        expires_at=None if balance is None else balance.expires_at,
     )
+
+
+async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
+    """CONTRACT v2.13: the endpoint's credit expiry override, else the merchant default; None = never expires."""
+    if endpoint.prepaid_expiry_days is not None:
+        return endpoint.prepaid_expiry_days
+    days: int | None = (
+        await session.execute(select(Merchant.prepaid_expiry_days).where(Merchant.id == endpoint.merchant_id))
+    ).scalar_one_or_none()
+    return days
 
 
 # ---------------------------------------------------------------- deposits
@@ -382,6 +399,21 @@ async def deposit(
     try:
         session.add(settlement)
         await session.flush()
+        # CONTRACT v2.13: overdue credit expires before new credit lands, and the new credit gets the policy expiry.
+        await expire_balance_for(session, endpoint.merchant_id, public_key)
+        days = await expiry_policy_days(session, endpoint)
+        new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)
+        next_expiry: ColumnElement[datetime | None]
+        if new_expiry is None:
+            next_expiry = literal(None, PrepaidBalance.expires_at.type)
+        else:
+            promised_never = and_(
+                PrepaidBalance.expires_at.is_(None), PrepaidBalance.balance_sompi > PrepaidBalance.refund_hold_sompi
+            )
+            next_expiry = case(
+                (promised_never, literal(None, PrepaidBalance.expires_at.type)),
+                else_=func.greatest(func.coalesce(PrepaidBalance.expires_at, new_expiry), new_expiry),
+            )
         balance_id, balance = (
             await session.execute(
                 pg_insert(PrepaidBalance)
@@ -393,12 +425,14 @@ async def deposit(
                     balance_sompi=credit,
                     deposited_sompi=credit,
                     debited_sompi=0,
+                    expires_at=new_expiry,
                 )
                 .on_conflict_do_update(
                     index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key],
                     set_={
                         "balance_sompi": PrepaidBalance.balance_sompi + credit,
                         "deposited_sompi": PrepaidBalance.deposited_sompi + credit,
+                        "expires_at": next_expiry,
                         "updated_at": func.now(),
                     },
                 )
@@ -508,14 +542,14 @@ async def debit_challenge(
     except SQLAlchemyError:
         logger.exception("prepaid balance lookup failed")
         return _store_unavailable()
-    current = 0 if balance is None else balance.balance_sompi
+    current = spendable_sompi(balance)
     if current < amount:
         return await prepaid_only_error(
             endpoint,
             merchant_address,
             oracle,
             "insufficient_balance",
-            f"the prepaid balance ({current} sompi) does not cover this call ({amount} sompi); deposit first",
+            f"the spendable prepaid balance ({current} sompi) does not cover this call ({amount} sompi); deposit first",
             amount_sompi=amount,
         )
     nonce = new_payment_nonce()

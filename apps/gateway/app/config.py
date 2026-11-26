@@ -1,8 +1,9 @@
+import ipaddress
 from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KaspaNetwork = Literal["kaspa:testnet-10", "kaspa:mainnet"]
@@ -72,6 +73,51 @@ class Settings(BaseSettings):
     webhook_backoff_max_seconds: float = Field(default=3600.0, gt=0, le=86_400)
     webhook_lease_seconds: int = Field(default=60, ge=15, le=600)
     webhook_max_per_merchant: int = Field(default=10, ge=1, le=100)
+    # CONTRACT v2.13 prepaid ledger worker: credit expiry and re-checks of submitted refund payouts.
+    ledger_worker_enabled: bool = True
+    ledger_poll_interval_seconds: float = Field(default=30.0, gt=0, le=3600)
+    ledger_batch_size: int = Field(default=100, ge=1, le=1000)
+    # A submitted refund payout that the node still cannot see after this long goes back to `requested` (its
+    # tx_id stays on record and is still re-checked until `prepaid_payout_attempt_max_seconds`).
+    prepaid_payout_pending_max_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    # An attempted payout tx_id the node has never confirmed is given up (`abandoned`) after this long.
+    prepaid_payout_attempt_max_seconds: int = Field(default=604_800, ge=3600, le=31_536_000)
+    # Re-check backoff after a transient node error on an attempted payout: base * 2^errors, capped.
+    prepaid_payout_backoff_base_seconds: float = Field(default=30.0, gt=0, le=3600)
+    prepaid_payout_backoff_max_seconds: float = Field(default=1800.0, gt=0, le=86_400)
+    # A merchant's claim (`paying`) blocks the buyer's cancel for this long before a payout must be posted.
+    prepaid_refund_claim_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    # Total time a refund can stay claimed, counted from its FIRST claim (`first_claimed_at`): no renewals past it.
+    prepaid_refund_claim_max_seconds: int = Field(default=3600, ge=60, le=604_800)
+    # After the buyer cancels a refund the merchant had claimed, its amount stays held this long before it becomes
+    # spendable again (a payout broadcast just before the claim lapsed can still land and be recorded).
+    prepaid_refund_cancel_cooldown_seconds: int = Field(default=1800, ge=0, le=604_800)
+    # Pending (unconfirmed) payout attempts allowed per refund; more are refused with 409 `too_many_attempts`.
+    prepaid_payout_max_pending_attempts: int = Field(default=3, ge=1, le=20)
+    # Unseen attempts are re-checked after (attempt age x this fraction), capped by the backoff maximum.
+    prepaid_payout_unseen_backoff_fraction: float = Field(default=0.1, gt=0, le=1)
+    # POST /v1/prepaid/refunds/{id}/payout per merchant per minute.
+    rl_refund_payout_per_merchant_per_minute: int = Field(default=20, ge=1)
+    # Signed buyer refund writes (POST /v1/prepaid/refunds, /cancel, /status) per client IP per minute.
+    rl_prepaid_refund_per_minute: int = Field(default=30, ge=1)
+    # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate
+    # limits. Empty (default): X-Forwarded-For is ignored and the TCP peer address is the client.
+    trusted_proxy_ips: list[str] = []
+
+    @field_validator("trusted_proxy_ips")
+    @classmethod
+    def _proxies(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for item in v:
+            try:
+                out.append(str(ipaddress.ip_network(item.strip(), strict=False)))
+            except ValueError as exc:
+                raise ValueError(f"TRUSTED_PROXY_IPS entry {item!r} is not an IP address or CIDR") from exc
+        return out
+
+    @property
+    def trusted_proxy_networks(self) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+        return tuple(ipaddress.ip_network(item) for item in self.trusted_proxy_ips)
 
     @property
     def address_prefix(self) -> str:

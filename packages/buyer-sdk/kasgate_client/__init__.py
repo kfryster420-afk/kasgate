@@ -52,9 +52,13 @@ from .prepaid import (
     PrepaidDepositQuote,
     PrepaidDepositReceipt,
     PrepaidReceipt,
+    PrepaidRefund,
+    PrepaidRefundChallenge,
     build_prepaid_debit_message,
+    build_prepaid_refund_message,
     prepaid_body_hash,
     validate_debit_challenge,
+    validate_refund_challenge,
 )
 from .protocol import (
     PaymentRequired,
@@ -152,6 +156,8 @@ __all__ = [
     "PrepaidDepositQuote",
     "PrepaidDepositReceipt",
     "PrepaidReceipt",
+    "PrepaidRefund",
+    "PrepaidRefundChallenge",
     "PriceCapExceededError",
     "ProtocolMismatchError",
     "RpcError",
@@ -163,6 +169,7 @@ __all__ = [
     "TrialStatus",
     "UnexpectedRecipientError",
     "build_prepaid_debit_message",
+    "build_prepaid_refund_message",
     "build_trial_call_message",
     "compute_fee_split",
     "compute_webhook_signature",
@@ -176,6 +183,7 @@ __all__ = [
     "sompi_to_kas",
     "trial_receipt_of",
     "validate_debit_challenge",
+    "validate_refund_challenge",
     "validate_trial_challenge",
     "verify_webhook_signature",
 ]

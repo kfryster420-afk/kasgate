@@ -2016,7 +2016,9 @@ async def _debit_balance(
             .where(
                 PrepaidBalance.merchant_id == endpoint.merchant_id,
                 PrepaidBalance.payer_public_key == stored.payer_public_key,
-                PrepaidBalance.balance_sompi >= amount,
+                # CONTRACT v2.13: only spendable credit pays calls (an open refund's hold and expired credit do not).
+                PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi >= amount,
+                or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
             )
             .values(
                 balance_sompi=PrepaidBalance.balance_sompi - amount,
