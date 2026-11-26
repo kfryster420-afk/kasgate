@@ -36,6 +36,8 @@ from app.schemas import (
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
+    HEADER_PREPAID_DEBIT,
+    HEADER_PREPAID_RECEIPT,
     NONCE_RE,
     REGISTER_PURPOSE,
     build_auth_challenge,
@@ -70,6 +72,8 @@ PAYMENT_HEADERS: frozenset[str] = frozenset(
         HEADER_PAYMENT_SIGNATURE.lower(),
         HEADER_PAYMENT_RESPONSE.lower(),
         HEADER_K402_PAYMENT.lower(),
+        HEADER_PREPAID_DEBIT.lower(),
+        HEADER_PREPAID_RECEIPT.lower(),
     }
 )
 FORBIDDEN_UPSTREAM_HEADER_NAMES: frozenset[str] = (

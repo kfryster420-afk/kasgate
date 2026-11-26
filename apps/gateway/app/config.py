@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     rl_auth_challenge_per_minute: int = Field(default=10, ge=1)
     rl_auth_verify_per_minute: int = Field(default=10, ge=1)
     rl_unpaid_proxy_per_minute: int = Field(default=300, ge=1)
+    # CONTRACT v2.11: cap on one buyer's prepaid balance at one merchant (checked when a deposit is quoted).
+    prepaid_max_balance_sompi: int = Field(default=10_000_000_000_000, ge=60_000_000, le=999_999_999_999_999_999)
 
     @property
     def address_prefix(self) -> str:

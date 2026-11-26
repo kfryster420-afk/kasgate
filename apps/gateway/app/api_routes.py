@@ -47,9 +47,10 @@ from app.openapi_import import (
     upstream_url_for,
 )
 from app.oracle import OracleUnavailableError
-from app.proxy import issue_payment_challenge
+from app.proxy import issue_payment_challenge, prepaid_only_error
 from app.schemas import (
     OPENAPI_MAX_DOCUMENT_BYTES,
+    PREPAID_SCHEME,
     PROXY_PATH_PREFIX,
     TAX_CSV_COLUMNS,
     AuthChallenge,
@@ -77,6 +78,7 @@ from app.schemas import (
     SettlementRead,
     TaxReportRow,
     X402ErrorBody,
+    check_on_chain_price,
     min_price_sompi,
     sompi_to_kas,
     usd_micros_to_usd,
@@ -394,6 +396,7 @@ async def create_endpoint(payload: EndpointCreate, merchant: CurrentMerchant, se
             price_usd_micros=payload.price_usd_micros if payload.price_currency is PriceCurrency.USD else None,
             allowed_methods=list(payload.allowed_methods),
             is_public_listed=payload.is_public_listed,
+            prepaid_only=payload.prepaid_only,
         )
         session.add(endpoint)
         try:
@@ -426,7 +429,7 @@ async def read_endpoint(endpoint_id: uuid.UUID, merchant: CurrentMerchant, sessi
 
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
-    {"name", "upstream_url", "upstream_headers", "allowed_methods", "is_active", "is_public_listed"}
+    {"name", "upstream_url", "upstream_headers", "allowed_methods", "is_active", "is_public_listed", "prepaid_only"}
 )
 _PRICE_UPDATE_FIELDS = frozenset({"price_currency", "price_sompi", "price_usd_micros"})
 
@@ -472,6 +475,16 @@ async def update_endpoint(
         changes.pop("upstream_url")
     for field, value in changes.items():
         setattr(endpoint, field, value)
+    # CONTRACT v2.11: a price below the on-chain minimum is only valid while the endpoint is prepaid-only.
+    if not endpoint.prepaid_only and endpoint.price_currency is PriceCurrency.KAS and endpoint.price_sompi is not None:
+        try:
+            check_on_chain_price(endpoint.price_sompi)
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(
+                status_code=422,
+                detail=f"{exc}; set prepaid_only=true to price this endpoint below the on-chain minimum",
+            ) from exc
     await session.commit()
     await session.refresh(endpoint)
     return EndpointRead.model_validate(endpoint)
@@ -993,6 +1006,11 @@ async def quote(
         body = X402ErrorBody(error="endpoint_not_found", message=f"no active endpoint with slug '{slug}'")
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=body.model_dump(mode="json"))
     endpoint, pay_to = row
+    if endpoint.prepaid_only:
+        # No on-chain terms exist for a prepaid-only endpoint: answer with the prepaid offer, like /p/{slug}.
+        return await prepaid_only_error(
+            endpoint, pay_to, oracle, "payment_required", "this endpoint is paid from a prepaid balance only"
+        )
     try:
         required = await issue_payment_challenge(redis, endpoint, pay_to, oracle)
     except OracleUnavailableError as exc:
@@ -1094,9 +1112,10 @@ def _catalog_item(endpoint: Endpoint, *, network: str, paid_url: str) -> Catalog
         price_usd_micros=endpoint.price_usd_micros,
         price_usd=None if endpoint.price_usd_micros is None else usd_micros_to_usd(endpoint.price_usd_micros),
         network=network,
-        schemes=[X402_SCHEME],
+        schemes=[PREPAID_SCHEME] if endpoint.prepaid_only else [X402_SCHEME, PREPAID_SCHEME],
         paid_url=paid_url,
         input_schema=_endpoint_input_schema(endpoint),
+        prepaid_only=endpoint.prepaid_only,
     )
 
 

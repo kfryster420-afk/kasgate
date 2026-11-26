@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import ipaddress
 import re
 import secrets
@@ -47,6 +48,9 @@ HEADER_PAYMENT_REQUIRED = "PAYMENT-REQUIRED"
 HEADER_PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE"
 HEADER_PAYMENT_RESPONSE = "PAYMENT-RESPONSE"
 HEADER_K402_PAYMENT = "X-K402-Payment"
+# CONTRACT v2.11 prepaid credit: the signed debit on a paid call and the debit receipt on its response.
+HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
+HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -67,6 +71,14 @@ K402_NETWORK_BY_CONFIG: dict[str, str] = {"kaspa:testnet-10": "testnet-10", "kas
 PaymentScheme = Literal["kaspa-exact-v1", "k402-kaspa-utxo", "kaspa-exact-v2"]
 K402Network = Literal["testnet-10", "mainnet"]
 SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
+
+PREPAID_SCHEME = "kasgate-prepaid-v1"
+PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
+# Body-Hash of a request without a body.
+PREPAID_EMPTY_BODY_HASH = "-"
+PREPAID_BODY_HASH_RE = r"^(?:[0-9a-f]{64}|-)$"
+PREPAID_PATH_MAX_LENGTH = 2048
+MAX_PREPAID_HEADER_CHARS = 512
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 USD_MICROS_PER_DOLLAR = 1_000_000
@@ -116,6 +128,31 @@ def min_price_sompi(min_output_sompi: int | None = None) -> int:
     """
     floor = get_settings().min_output_sompi if min_output_sompi is None else min_output_sompi
     return 3 * floor
+
+
+def check_on_chain_price(price_sompi: int) -> None:
+    """Raise ValueError unless `price_sompi` is payable on-chain (fee split valid, >= min_price_sompi())."""
+    compute_fee_split(price_sompi)
+
+
+def usd_micros_to_prepaid_sompi(price_usd_micros: int, kas_usd_rate: Decimal) -> int:
+    """Prepaid debit for a USD price: ceil(usd / rate * SOMPI_PER_KAS), at least 1 sompi, WITHOUT the on-chain floor.
+
+    Prepaid debits never touch the chain, so the 0.6 KAS minimum does not apply to them (CONTRACT v2.11).
+    """
+    if price_usd_micros <= 0:
+        raise ValueError("price_usd_micros must be positive")
+    if isinstance(kas_usd_rate, bool) or not isinstance(kas_usd_rate, Decimal):
+        raise ValueError("kas_usd_rate must be a positive finite Decimal")
+    if not kas_usd_rate.is_finite() or kas_usd_rate <= 0:
+        raise ValueError("kas_usd_rate must be a positive finite Decimal")
+    sompi = (
+        Decimal(price_usd_micros) * Decimal(SOMPI_PER_KAS) / (Decimal(USD_MICROS_PER_DOLLAR) * kas_usd_rate)
+    ).to_integral_value(rounding=ROUND_CEILING)
+    result = max(int(sompi), 1)
+    if result > MAX_SOMPI:
+        raise ValueError(f"converted price {result} sompi exceeds MAX_SOMPI")
+    return result
 
 
 def usd_micros_to_usd(price_usd_micros: int) -> str:
@@ -195,6 +232,44 @@ def build_auth_challenge(purpose: str, domain: str, address: str, nonce: str, ex
         f"Domain: {domain}\n"
         f"Purpose: {purpose}\n"
         f"Address: {address}\n"
+        f"Nonce: {nonce}\n"
+        f"Expires: {expires_at.isoformat()}"
+    )
+
+
+def prepaid_body_hash(body: bytes) -> str:
+    """Body-Hash of a prepaid debit: SHA-256 hex of the raw request body, or "-" when there is no body."""
+    return hashlib.sha256(body).hexdigest() if body else PREPAID_EMPTY_BODY_HASH
+
+
+def build_prepaid_debit_message(
+    *,
+    domain: str,
+    address: str,
+    merchant_id: uuid.UUID,
+    method: str,
+    path: str,
+    body_hash: str,
+    amount_sompi: int,
+    nonce: str,
+    expires_at: datetime,
+) -> str:
+    """The exact text a buyer signs (kaspa sign_message, depositing P2PK key) to authorise ONE prepaid debit.
+
+    Multi-line like the login challenge, but its Purpose names the prepaid debit, so it can never be confused with a
+    `payerProof` or a login/registration challenge. The gateway rebuilds it from the stored challenge and the request
+    it is actually serving, never from client-supplied copies.
+    """
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_DEBIT_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Merchant: {merchant_id}\n"
+        f"Method: {method}\n"
+        f"Path: {path}\n"
+        f"Body-Hash: {body_hash}\n"
+        f"Amount: {amount_sompi}\n"
         f"Nonce: {nonce}\n"
         f"Expires: {expires_at.isoformat()}"
     )
@@ -625,9 +700,34 @@ class K402PaymentHeader(BaseModel):
         return f"{self.scheme} {self.tx_id} {self.payment_id}"
 
 
+class PrepaidOffer(StrictModel):
+    """CONTRACT v2.11: how to pay this endpoint from a prepaid balance (deposit once on-chain, then signed debits).
+
+    `amount` is the per-call debit in sompi (USD-priced endpoints: the current quote, without the 0.6 KAS on-chain
+    floor). The deposit itself is an ordinary kaspa-exact-v1 split payment of at least `minDepositSompi`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scheme: Literal["kasgate-prepaid-v1"] = "kasgate-prepaid-v1"
+    network: KaspaNetwork
+    asset: Literal["KAS"] = "KAS"
+    amount: SompiStr
+    payTo: str
+    merchantId: uuid.UUID
+    prepaidOnly: bool
+    minDepositSompi: SompiStr
+    depositQuoteUrl: str
+    depositUrl: str
+    challengeUrl: str
+    balanceUrl: str
+
+
 # CONTRACT v2.10: a fresh-challenge 402 body lists the kaspa-exact-v1 terms, the k402 offer and the kaspa-x402
 # `exact` (kaspa-exact-v2) entry; each client family skips the schemes it does not know.
-PaymentOffer = Annotated[PaymentRequired | K402UtxoOffer | ExactV2Requirements, Field(discriminator="scheme")]
+PaymentOffer = Annotated[
+    PaymentRequired | K402UtxoOffer | ExactV2Requirements | PrepaidOffer, Field(discriminator="scheme")
+]
 
 
 class X402ErrorBody(StrictModel):
@@ -653,6 +753,7 @@ class X402ErrorBody(StrictModel):
         "method_not_allowed",
         "upstream_error",
         "invalid_exact_payment",
+        "insufficient_balance",
     ]
     message: str
     k402: Literal["0.2"] | None = None
@@ -771,6 +872,8 @@ class EndpointCreate(StrictModel):
     price_usd_micros: UsdMicros | None = None
     allowed_methods: list[HttpMethod] = Field(default_factory=_default_methods, min_length=1, max_length=5)
     is_public_listed: bool = True
+    prepaid_only: bool = False
+    """CONTRACT v2.11: paid only from a prepaid balance; a KAS price may then be below the 0.6 KAS on-chain minimum."""
 
     @field_validator("upstream_url")
     @classmethod
@@ -789,7 +892,8 @@ class EndpointCreate(StrictModel):
                 raise ValueError("price_sompi is required when price_currency is KAS")
             if self.price_usd_micros is not None:
                 raise ValueError("price_usd_micros must be omitted when price_currency is KAS")
-            compute_fee_split(self.price_sompi)
+            if not self.prepaid_only:
+                check_on_chain_price(self.price_sompi)
         else:
             if self.price_usd_micros is None:
                 raise ValueError("price_usd_micros is required when price_currency is USD")
@@ -810,6 +914,7 @@ class EndpointUpdate(StrictModel):
     allowed_methods: list[HttpMethod] | None = Field(default=None, min_length=1, max_length=5)
     is_active: bool | None = None
     is_public_listed: bool | None = None
+    prepaid_only: bool | None = None
 
     @field_validator("upstream_url")
     @classmethod
@@ -830,8 +935,9 @@ class EndpointUpdate(StrictModel):
                 raise ValueError("price_usd_micros must be omitted when price_currency is KAS")
         elif self.price_currency is PriceCurrency.USD and self.price_sompi is not None:
             raise ValueError("price_sompi must be omitted when price_currency is USD")
-        if self.price_sompi is not None:
-            compute_fee_split(self.price_sompi)
+        # The route re-checks the merged row: a sub-minimum price is only valid on a prepaid-only endpoint.
+        if self.price_sompi is not None and self.prepaid_only is not True:
+            check_on_chain_price(self.price_sompi)
         return self
 
 
@@ -849,6 +955,7 @@ class EndpointRead(ReadModel):
     allowed_methods: list[str]
     is_active: bool
     is_public_listed: bool
+    prepaid_only: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -1212,6 +1319,7 @@ class CatalogEndpoint(StrictModel):
     schemes: list[str]
     paid_url: str
     input_schema: dict[str, object] | None = None
+    prepaid_only: bool = False
 
 
 class CatalogPage(StrictModel):
@@ -1224,3 +1332,174 @@ class CatalogPage(StrictModel):
     items: list[CatalogEndpoint]
     next_cursor: str | None = None
     limit: int
+
+
+# ---------------------------------------------------------------- prepaid credit (CONTRACT v2.11)
+
+
+class PrepaidDepositQuoteRequest(StrictModel):
+    """Ask for a nonce-bound kaspa-exact-v1 challenge that funds a prepaid balance at the endpoint's merchant.
+
+    `amount_sompi` is the deposit TOTAL (both outputs). It must pass `compute_fee_split` (>= 0.6 KAS); the credit
+    posted to the balance is the merchant share (output 0), never the treasury fee (output 1).
+    """
+
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    payer_address: str
+    amount_sompi: Sompi
+
+    @field_validator("payer_address")
+    @classmethod
+    def _payer(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @field_validator("amount_sompi")
+    @classmethod
+    def _amount(cls, v: int) -> int:
+        check_on_chain_price(v)
+        return v
+
+
+class PrepaidDepositQuote(BaseModel):
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    deposit_sompi: SompiStr
+    fee_sompi: SompiStr
+    credit_sompi: SompiStr
+    balance_sompi: SompiStr
+    """The payer's balance at this merchant before this deposit."""
+    required: PaymentRequired
+    """Pay these terms (outputs 0 merchant, 1 treasury, payload kasgate:v1:<nonce>, payerProof) and POST the
+    PAYMENT-SIGNATURE to deposit_url. Valid until required.expiresAt."""
+    deposit_url: str
+
+
+class PrepaidDepositReceipt(BaseModel):
+    deposit_id: uuid.UUID
+    tx_id: str
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    deposit_sompi: SompiStr
+    fee_sompi: SompiStr
+    credit_sompi: SompiStr
+    balance_sompi: SompiStr
+    created_at: datetime
+
+
+class PrepaidChallengeRequest(StrictModel):
+    """Ask for the debit challenge of ONE prepaid call. `path` is the exact proxy path to be called, including the
+    query string if any (e.g. "/p/weather/today?city=hanoi"); `body_hash` is prepaid_body_hash(body)."""
+
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    payer_address: str
+    method: HttpMethod
+    path: str = Field(min_length=3, max_length=PREPAID_PATH_MAX_LENGTH)
+    body_hash: Annotated[str, Field(pattern=PREPAID_BODY_HASH_RE)] = PREPAID_EMPTY_BODY_HASH
+
+    @field_validator("payer_address")
+    @classmethod
+    def _payer(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+    @model_validator(mode="after")
+    def _path(self) -> Self:
+        prefix = f"{PROXY_PATH_PREFIX}/{self.slug}"
+        rest = self.path[len(prefix) :]
+        if not self.path.startswith(prefix) or (rest and rest[0] not in "/?"):
+            raise ValueError(f"path must be {prefix} or start with {prefix}/ or {prefix}?")
+        if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in self.path) or "#" in self.path:
+            raise ValueError("path must be printable ASCII without spaces or a fragment (percent-encode it)")
+        return self
+
+
+class PrepaidChallenge(BaseModel):
+    nonce: str
+    message: str
+    """Sign exactly this text with the depositing key (kaspa sign_message) and send
+    X-KasGate-Prepaid: Base64(JSON{nonce, signature}) on the call."""
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    method: str
+    path: str
+    body_hash: str
+    amount_sompi: SompiStr
+    kas_usd_rate: str | None
+    balance_sompi: SompiStr
+    expires_at: datetime
+
+
+class PrepaidDebitHeader(X402Header):
+    """Body of the X-KasGate-Prepaid header."""
+
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    signature: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _signature(cls, v: object) -> object:
+        return normalise_signature(v)
+
+    @classmethod
+    def from_header(cls, value: str) -> Self:
+        if not value or len(value) > MAX_PREPAID_HEADER_CHARS:
+            raise ValueError("header missing or too large")
+        return super().from_header(value)
+
+
+class PrepaidReceipt(X402Header):
+    """Body of the X-KasGate-Prepaid-Receipt response header."""
+
+    debitId: uuid.UUID
+    nonce: str
+    amountSompi: SompiStr
+    balanceSompi: SompiStr
+    status: Literal["debited", "refunded"]
+
+
+class PrepaidBalanceRead(BaseModel):
+    merchant_id: uuid.UUID
+    payer_address: str
+    balance_sompi: SompiStr
+    deposited_sompi: SompiStr
+    debited_sompi: SompiStr
+    updated_at: datetime | None
+
+
+class PrepaidDebitRead(ReadModel):
+    id: uuid.UUID
+    endpoint_id: uuid.UUID
+    payer_address: str
+    nonce: str
+    amount_sompi: SompiStr
+    kas_usd_rate: UsdDecimal | None
+    usd_value: UsdDecimal | None
+    status: Literal["debited", "refunded"]
+    request_method: str
+    request_path: str
+    upstream_status_code: int | None
+    created_at: datetime
+    refunded_at: datetime | None
+
+    @field_validator("amount_sompi", mode="before")
+    @classmethod
+    def _sompi(cls, v: object) -> object:
+        return str(v) if isinstance(v, int) else v
+
+
+class PrepaidDepositRead(ReadModel):
+    id: uuid.UUID
+    tx_id: str
+    settlement_id: uuid.UUID
+    payer_address: str
+    deposit_sompi: SompiStr
+    fee_sompi: SompiStr
+    credit_sompi: SompiStr
+    created_at: datetime
+
+    @field_validator("deposit_sompi", "fee_sompi", "credit_sompi", mode="before")
+    @classmethod
+    def _sompi(cls, v: object) -> object:
+        return str(v) if isinstance(v, int) else v

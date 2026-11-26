@@ -17,6 +17,7 @@ from app.db import engine as db_engine
 from app.deps import get_sessionmaker
 from app.kaspa_engine import engine as kaspa_engine
 from app.oracle import KasUsdOracle
+from app.prepaid import router as prepaid_router
 from app.proxy import router as proxy_router
 from app.schemas import (
     HEADER_PAYMENT_REQUIRED,
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(api_router)
     app.include_router(well_known_router)
+    app.include_router(prepaid_router)
     app.include_router(proxy_router)
 
     @app.get("/healthz", response_model=HealthStatus, tags=["system"])

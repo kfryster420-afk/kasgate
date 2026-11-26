@@ -393,6 +393,7 @@ async def seed_endpoint(
     price_sompi: int | None = PRICE_SOMPI,
     price_currency: PriceCurrency = PriceCurrency.KAS,
     price_usd_micros: int | None = None,
+    prepaid_only: bool = False,
 ) -> Seed:
     api_key = generate_api_key()
     merchant = Merchant(
@@ -417,6 +418,7 @@ async def seed_endpoint(
             price_usd_micros=price_usd_micros if price_currency is PriceCurrency.USD else None,
             allowed_methods=methods or ["GET", "POST"],
             is_active=active,
+            prepaid_only=prepaid_only,
         )
         session.add(endpoint)
         await session.commit()

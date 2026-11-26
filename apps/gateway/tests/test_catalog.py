@@ -33,7 +33,8 @@ def _assert_public_item(item: CatalogEndpoint | dict[str, Any], slug: str) -> Ca
     assert parsed.price_usd_micros is None
     assert parsed.price_usd is None
     assert parsed.network == "kaspa:testnet-10"
-    assert parsed.schemes == ["kaspa-exact-v1"]
+    assert parsed.schemes == ["kaspa-exact-v1", "kasgate-prepaid-v1"]  # CONTRACT v2.11: prepaid debits too
+    assert parsed.prepaid_only is False
     assert parsed.paid_url == f"http://gateway.test/p/{slug}"
     assert parsed.input_schema is None
     assert parsed.methods

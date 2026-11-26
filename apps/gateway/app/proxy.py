@@ -65,10 +65,11 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from kaspa import Address, PublicKey, pay_to_address_script, verify_message
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,7 +85,17 @@ from app.deps import (
     get_redis,
 )
 from app.exact_v2 import ExactV2Verification, check_authorization_expiry
-from app.models import Endpoint, Merchant, PriceCurrency, Settlement, SettlementStatus
+from app.models import (
+    PREPAID_DEBIT_DEBITED,
+    PREPAID_DEBIT_REFUNDED,
+    Endpoint,
+    Merchant,
+    PrepaidBalance,
+    PrepaidDebit,
+    PriceCurrency,
+    Settlement,
+    SettlementStatus,
+)
 from app.oracle import OracleUnavailableError, usd_value
 from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.schemas import (
@@ -92,8 +103,11 @@ from app.schemas import (
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
+    HEADER_PREPAID_DEBIT,
+    HEADER_PREPAID_RECEIPT,
     K402_VERSION,
     NONCE_RE,
+    PREPAID_EMPTY_BODY_HASH,
     PROXY_PATH_PREFIX,
     K402PaymentHeader,
     K402UtxoOffer,
@@ -103,16 +117,24 @@ from app.schemas import (
     PaymentResponse,
     PaymentScheme,
     PaymentSignature,
+    PrepaidDebitHeader,
+    PrepaidOffer,
+    PrepaidReceipt,
     X402ErrorBody,
+    build_prepaid_debit_message,
+    min_price_sompi,
     new_k402_payment_id,
     new_k402_tag,
     new_payment_nonce,
+    prepaid_body_hash,
+    usd_micros_to_prepaid_sompi,
     usd_micros_to_sompi,
 )
 from app.security import (
     HOP_BY_HOP_HEADERS,
     PAYMENT_HEADERS,
     RATE_LIMIT_UNPAID_PROXY,
+    auth_domain,
     client_ip,
     decrypt_headers,
     enforce_rate_limit,
@@ -1136,7 +1158,8 @@ async def paywalled_proxy(
     settings = get_settings()
     signature_header = request.headers.get(HEADER_PAYMENT_SIGNATURE)
     k402_header = request.headers.get(HEADER_K402_PAYMENT)
-    if not signature_header and k402_header is None:
+    prepaid_header = request.headers.get(HEADER_PREPAID_DEBIT)
+    if not signature_header and k402_header is None and prepaid_header is None:
         try:
             await enforce_rate_limit(redis, RATE_LIMIT_UNPAID_PROXY, f"ip:{client_ip(request)}")
         except HTTPException as exc:
@@ -1158,6 +1181,34 @@ async def paywalled_proxy(
             "method_not_allowed",
             f"{method} is not allowed on this endpoint",
             headers={"Allow": ", ".join(sorted(endpoint.allowed_methods))},
+        )
+
+    # CONTRACT v2.11: a signed prepaid debit, accepted on every endpoint; never combined with an on-chain payment.
+    if prepaid_header is not None:
+        if signature_header or k402_header is not None:
+            return await prepaid_only_error(
+                endpoint,
+                merchant_address,
+                oracle,
+                "invalid_payment_header",
+                f"send {HEADER_PREPAID_DEBIT} alone, not together with an on-chain payment header",
+            )
+        return await _pay_with_prepaid(
+            request, session, redis, client, oracle, endpoint, merchant_address, method, path, prepaid_header
+        )
+    # A prepaid-only endpoint has no on-chain terms: no nonce, k402 offer or exact offer is ever minted for it, and
+    # an on-chain payment header (e.g. for an offer issued before the merchant switched it) is refused unpaid.
+    if endpoint.prepaid_only:
+        if signature_header or k402_header is not None:
+            return await prepaid_only_error(
+                endpoint,
+                merchant_address,
+                oracle,
+                "invalid_payment_header",
+                "this endpoint is paid from a prepaid balance only",
+            )
+        return await prepaid_only_error(
+            endpoint, merchant_address, oracle, "payment_required", "this endpoint is paid from a prepaid balance only"
         )
 
     if k402_header is not None:
@@ -1676,3 +1727,468 @@ async def _pay_with_exact_v2(
         )
     finally:
         await _drop_delivery_lock(redis, tx_id)
+
+
+# ---------------------------------------------------------------- prepaid credit (CONTRACT v2.11)
+#
+# A buyer deposits once with an ordinary kaspa-exact-v1 split payment (output 0 merchant, output 1 treasury, fee
+# max(1.5 %, 0.2 KAS), total >= 0.6 KAS; app/prepaid.py) and is credited the merchant share. Later calls carry
+# `X-KasGate-Prepaid: Base64(JSON{nonce, signature})`, where `signature` signs the debit challenge minted by
+# POST /v1/prepaid/challenge (build_prepaid_debit_message: domain, payer, merchant, method, path + query, body hash,
+# amount, nonce, expiry). The gateway rebuilds that message from the stored challenge AND the request it is actually
+# serving, takes `kasgate:prepaid:noncelock:{nonce}`, then debits the balance with a conditional UPDATE (never below
+# zero) and inserts the debit (unique nonce) in ONE transaction, consumes the challenge and forwards. No response or
+# a 5xx from the upstream refunds the debit. Nothing in this path touches the chain.
+
+PREPAID_DEPOSIT_PREFIX: Final = "kasgate:prepaid:deposit:"
+PREPAID_CHALLENGE_PREFIX: Final = "kasgate:prepaid:challenge:"
+PREPAID_NONCE_LOCK_PREFIX: Final = "kasgate:prepaid:noncelock:"
+PREPAID_REFUND_DEAD_LETTER_KEY: Final = "kasgate:deadletter:prepaid-refunds"
+_P2PK_SCHNORR_SCRIPT: Final = re.compile(r"20([0-9a-f]{64})ac")
+
+
+def prepaid_deposit_key(nonce: str) -> str:
+    return f"{PREPAID_DEPOSIT_PREFIX}{nonce}"
+
+
+def prepaid_challenge_key(nonce: str) -> str:
+    return f"{PREPAID_CHALLENGE_PREFIX}{nonce}"
+
+
+def prepaid_nonce_lock_key(nonce: str) -> str:
+    return f"{PREPAID_NONCE_LOCK_PREFIX}{nonce}"
+
+
+def payer_public_key(address: str) -> str | None:
+    """The x-only Schnorr key of a P2PK address (script 20 <key> ac), or None for any other address kind."""
+    try:
+        script = pay_to_address_script(Address(address))
+    except Exception:
+        return None
+    if int(script.version) != 0:
+        return None
+    match = _P2PK_SCHNORR_SCRIPT.fullmatch(str(script.script).lower())
+    return match.group(1) if match else None
+
+
+def verify_prepaid_signature(message: str, signature: str, public_key: str) -> bool:
+    try:
+        return bool(verify_message(message, signature, PublicKey(public_key)))
+    except Exception:
+        return False
+
+
+def request_path_and_query(request: Request) -> str:
+    """The raw (percent-encoded) request path plus `?query`: the `Path` a prepaid debit is bound to."""
+    raw_path = request.scope.get("raw_path")
+    path = raw_path.decode("latin-1").split("?", 1)[0] if isinstance(raw_path, bytes) else request.url.path
+    query = request.scope.get("query_string", b"")
+    query_text = query.decode("latin-1") if isinstance(query, bytes) else ""
+    return path + (f"?{query_text}" if query_text else "")
+
+
+async def prepaid_price(endpoint: Endpoint, oracle: RateProvider) -> tuple[int, Decimal | None]:
+    """Per-call prepaid debit in sompi and the KAS/USD rate it was quoted at (USD-priced endpoints only).
+
+    KAS-priced: price_sompi, whatever its size. USD-priced: ceil conversion WITHOUT the 0.6 KAS on-chain floor.
+    Raises OracleUnavailableError (USD, oracle down) or ValueError (unpriceable row).
+    """
+    if endpoint.price_currency is PriceCurrency.KAS:
+        if endpoint.price_sompi is None or endpoint.price_sompi <= 0:
+            raise ValueError("KAS-priced endpoint is missing price_sompi")
+        return endpoint.price_sompi, None
+    if endpoint.price_usd_micros is None:
+        raise ValueError("USD-priced endpoint is missing price_usd_micros")
+    try:
+        rate = await oracle.get_rate()
+    except OracleUnavailableError:
+        raise
+    except Exception as exc:
+        raise OracleUnavailableError("KAS/USD rate is unavailable") from exc
+    return usd_micros_to_prepaid_sompi(endpoint.price_usd_micros, rate), rate
+
+
+def build_prepaid_offer(endpoint: Endpoint, merchant_address: str, amount_sompi: int) -> PrepaidOffer:
+    settings = get_settings()
+    base = settings.public_base_url
+    return PrepaidOffer(
+        network=settings.kaspa_network,
+        amount=str(amount_sompi),
+        payTo=merchant_address,
+        merchantId=endpoint.merchant_id,
+        prepaidOnly=endpoint.prepaid_only,
+        minDepositSompi=str(min_price_sompi()),
+        depositQuoteUrl=f"{base}/v1/prepaid/deposits/quote",
+        depositUrl=f"{base}/v1/prepaid/deposits",
+        challengeUrl=f"{base}/v1/prepaid/challenge",
+        balanceUrl=f"{base}/v1/prepaid/balance?slug={endpoint.slug}",
+    )
+
+
+async def prepaid_only_error(
+    endpoint: Endpoint,
+    merchant_address: str,
+    oracle: RateProvider,
+    error: str,
+    message: str,
+    *,
+    status_code: int = 402,
+    amount_sompi: int | None = None,
+) -> JSONResponse:
+    """An x402 error whose `accepts` is the prepaid offer only. No on-chain challenge, nonce or Redis key is minted.
+
+    Used for every 402 of a prepaid-only endpoint and for prepaid debit failures. A USD price that cannot be
+    quoted right now is 503 price_unavailable, exactly like the on-chain path.
+    """
+    if amount_sompi is None:
+        try:
+            amount_sompi, _rate = await prepaid_price(endpoint, oracle)
+        except OracleUnavailableError as exc:
+            logger.warning("USD price unavailable for %s: %s", endpoint.slug, exc)
+            return _error(503, "price_unavailable", "KAS/USD price is temporarily unavailable")
+        except ValueError as exc:
+            logger.error("endpoint %s cannot be priced: %s", endpoint.slug, exc)
+            return _error(503, "service_unavailable", "endpoint price is not currently payable")
+    offer = build_prepaid_offer(endpoint, merchant_address, amount_sompi)
+    content = X402ErrorBody.model_validate(
+        {"error": error, "message": message, "accepts": [offer.model_dump(mode="json")]}
+    ).model_dump(mode="json")
+    return JSONResponse(status_code=status_code, content=content)
+
+
+@dataclass(frozen=True)
+class StoredPrepaidChallenge:
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    payer_public_key: str
+    method: str
+    path: str
+    body_hash: str
+    amount_sompi: int
+    kas_usd_rate: Decimal | None
+    expires_at: datetime
+
+    def message(self, nonce: str) -> str:
+        return build_prepaid_debit_message(
+            domain=auth_domain(),
+            address=self.payer_address,
+            merchant_id=self.merchant_id,
+            method=self.method,
+            path=self.path,
+            body_hash=self.body_hash,
+            amount_sompi=self.amount_sompi,
+            nonce=nonce,
+            expires_at=self.expires_at,
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "slug": self.slug,
+                "merchantId": str(self.merchant_id),
+                "payerAddress": self.payer_address,
+                "payerPublicKey": self.payer_public_key,
+                "method": self.method,
+                "path": self.path,
+                "bodyHash": self.body_hash,
+                "amountSompi": str(self.amount_sompi),
+                "kasUsdRate": None if self.kas_usd_rate is None else format(self.kas_usd_rate, "f"),
+                "expiresAt": self.expires_at.isoformat(),
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str | bytes) -> "StoredPrepaidChallenge":
+        data = json.loads(raw)
+        rate = data["kasUsdRate"]
+        amount = int(data["amountSompi"])
+        expires_at = datetime.fromisoformat(data["expiresAt"])
+        public_key = data["payerPublicKey"]
+        if amount <= 0 or expires_at.tzinfo is None or not re.fullmatch(r"[0-9a-f]{64}", public_key):
+            raise ValueError("stored prepaid challenge is malformed")
+        return cls(
+            slug=str(data["slug"]),
+            merchant_id=uuid.UUID(data["merchantId"]),
+            payer_address=str(data["payerAddress"]),
+            payer_public_key=public_key,
+            method=str(data["method"]),
+            path=str(data["path"]),
+            body_hash=str(data["bodyHash"]),
+            amount_sompi=amount,
+            kas_usd_rate=None if rate is None else Decimal(rate),
+            expires_at=expires_at,
+        )
+
+
+async def _load_prepaid_challenge(redis: Redis, nonce: str) -> StoredPrepaidChallenge | None:
+    raw = await redis.get(prepaid_challenge_key(nonce))
+    if raw is None:
+        return None
+    try:
+        return StoredPrepaidChallenge.from_json(raw)
+    except (ValueError, KeyError, TypeError, ArithmeticError):
+        logger.error("stored prepaid challenge %s is unreadable", nonce, exc_info=True)
+        return None
+
+
+def _prepaid_receipt_header(debit_id: uuid.UUID, nonce: str, amount: int, balance: int, status: str) -> str:
+    return PrepaidReceipt(
+        debitId=debit_id,
+        nonce=nonce,
+        amountSompi=str(amount),
+        balanceSompi=str(balance),
+        status="refunded" if status == PREPAID_DEBIT_REFUNDED else "debited",
+    ).to_header()
+
+
+async def _debit_balance(
+    session: AsyncSession,
+    endpoint: Endpoint,
+    stored: StoredPrepaidChallenge,
+    nonce: str,
+    request: Request,
+) -> tuple[uuid.UUID, int] | None:
+    """Atomically take `amount` from the balance and insert the debit row. None = no balance or not enough.
+
+    The conditional UPDATE serialises concurrent debits on the balance row and can never take it below zero (the
+    ck_prepaid_balances_balance_not_negative constraint is the backstop). Raises IntegrityError when the nonce was
+    already debited, SQLAlchemyError when the store fails; the caller rolls back.
+    """
+    amount = stored.amount_sompi
+    row = (
+        await session.execute(
+            update(PrepaidBalance)
+            .where(
+                PrepaidBalance.merchant_id == endpoint.merchant_id,
+                PrepaidBalance.payer_public_key == stored.payer_public_key,
+                PrepaidBalance.balance_sompi >= amount,
+            )
+            .values(
+                balance_sompi=PrepaidBalance.balance_sompi - amount,
+                debited_sompi=PrepaidBalance.debited_sompi + amount,
+                updated_at=func.now(),
+            )
+            .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
+        )
+    ).one_or_none()
+    if row is None:
+        await session.rollback()
+        return None
+    balance_id, balance = row
+    debit_id = uuid.uuid4()
+    session.add(
+        PrepaidDebit(
+            id=debit_id,
+            balance_id=balance_id,
+            merchant_id=endpoint.merchant_id,
+            endpoint_id=endpoint.id,
+            nonce=nonce,
+            payer_address=stored.payer_address,
+            amount_sompi=amount,
+            kas_usd_rate=stored.kas_usd_rate,
+            usd_value=None if stored.kas_usd_rate is None else usd_value(amount, stored.kas_usd_rate),
+            status=PREPAID_DEBIT_DEBITED,
+            request_method=request.method.upper(),
+            request_path=stored.path,
+            body_hash=None if stored.body_hash == PREPAID_EMPTY_BODY_HASH else stored.body_hash,
+            created_at=datetime.now(UTC),
+        )
+    )
+    await session.commit()
+    return debit_id, int(balance)
+
+
+async def refund_prepaid_debit(
+    session: AsyncSession, redis: Redis, debit_id: uuid.UUID, status_code: int | None
+) -> int | None:
+    """Return a debit to its balance (status refunded) in one transaction; the new balance, or None if it failed.
+
+    Only a `debited` row is refunded, so a refund can never run twice. A store failure is dead-lettered to Redis
+    for reconciliation.
+    """
+    try:
+        row = (
+            await session.execute(
+                update(PrepaidDebit)
+                .where(PrepaidDebit.id == debit_id, PrepaidDebit.status == PREPAID_DEBIT_DEBITED)
+                .values(status=PREPAID_DEBIT_REFUNDED, refunded_at=func.now(), upstream_status_code=status_code)
+                .returning(PrepaidDebit.balance_id, PrepaidDebit.amount_sompi)
+            )
+        ).one_or_none()
+        if row is None:
+            await session.rollback()
+            return None
+        balance_id, amount = row
+        balance = (
+            await session.execute(
+                update(PrepaidBalance)
+                .where(PrepaidBalance.id == balance_id)
+                .values(
+                    balance_sompi=PrepaidBalance.balance_sompi + amount,
+                    debited_sompi=PrepaidBalance.debited_sompi - amount,
+                    updated_at=func.now(),
+                )
+                .returning(PrepaidBalance.balance_sompi)
+            )
+        ).scalar_one()
+        await session.commit()
+        return int(balance)
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.error("could not refund prepaid debit %s", debit_id, exc_info=True)
+        payload = json.dumps({"debitId": str(debit_id), "upstreamStatusCode": status_code}, sort_keys=True)
+        try:
+            await cast(Awaitable[int], redis.lpush(PREPAID_REFUND_DEAD_LETTER_KEY, payload))
+        except RedisError:
+            logger.error("dead-letter queue unavailable; unrefunded prepaid debit: %s", payload, exc_info=True)
+        return None
+
+
+async def _record_debit_status(session: AsyncSession, debit_id: uuid.UUID, status_code: int) -> None:
+    try:
+        await session.execute(
+            update(PrepaidDebit).where(PrepaidDebit.id == debit_id).values(upstream_status_code=status_code)
+        )
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("could not store upstream status for prepaid debit %s", debit_id)
+
+
+async def _pay_with_prepaid(
+    request: Request,
+    session: AsyncSession,
+    redis: Redis,
+    client: httpx.AsyncClient,
+    oracle: RateProvider,
+    endpoint: Endpoint,
+    merchant_address: str,
+    method: str,
+    path: str,
+    header: str,
+) -> Response:
+    async def failure(error: str, message: str) -> JSONResponse:
+        return await prepaid_only_error(endpoint, merchant_address, oracle, error, message)
+
+    try:
+        debit = PrepaidDebitHeader.from_header(header)
+    except (ValidationError, ValueError):
+        return await failure("invalid_payment_header", f"{HEADER_PREPAID_DEBIT} header is malformed")
+    nonce = debit.nonce
+
+    try:
+        prepared = await _prepare_upstream(request, endpoint, path)
+    except RequestRejectedError as exc:
+        return _error(exc.status_code, exc.error, exc.message)
+
+    try:
+        stored = await _load_prepaid_challenge(redis, nonce)
+    except RedisError:
+        logger.exception("prepaid challenge store unavailable")
+        return _error(503, "service_unavailable", "prepaid debits are temporarily unavailable")
+    try:
+        used = (await session.execute(select(PrepaidDebit.id).where(PrepaidDebit.nonce == nonce))).first()
+    except SQLAlchemyError:
+        logger.exception("prepaid debit lookup failed")
+        return _error(503, "service_unavailable", "prepaid store is temporarily unavailable")
+    if used is not None:
+        return _error(409, "payment_replayed", "this prepaid debit nonce was already used")
+    if stored is None or stored.expires_at <= datetime.now(UTC):
+        return await failure("payment_expired", "the prepaid challenge is unknown or has expired; request a new one")
+
+    # Bind to the request actually being served: never trust client-supplied copies of these fields.
+    actual_path = request_path_and_query(request)
+    actual_body_hash = prepaid_body_hash(prepared.body)
+    if (
+        stored.slug != endpoint.slug
+        or stored.merchant_id != endpoint.merchant_id
+        or stored.method != method
+        or stored.path != actual_path
+        or stored.body_hash != actual_body_hash
+    ):
+        return await failure(
+            "invalid_payment_header", "the prepaid challenge was issued for another endpoint, method, path or body"
+        )
+    if payer_public_key(stored.payer_address) != stored.payer_public_key or not verify_prepaid_signature(
+        stored.message(nonce), debit.signature, stored.payer_public_key
+    ):
+        return await failure(
+            "invalid_payment_header", "signature is not a signature by the depositing key over this debit challenge"
+        )
+
+    try:
+        claimed = bool(await redis.set(prepaid_nonce_lock_key(nonce), "1", nx=True, ex=REPLAY_LOCK_TTL_SECONDS))
+    except RedisError:
+        logger.exception("prepaid replay lock unavailable")
+        return _error(503, "service_unavailable", "prepaid replay protection is temporarily unavailable")
+    if not claimed:
+        return _error(409, "payment_replayed", "this prepaid debit is already being processed")
+
+    try:
+        debited = await _debit_balance(session, endpoint, stored, nonce, request)
+    except IntegrityError:
+        await session.rollback()
+        return _error(409, "payment_replayed", "this prepaid debit nonce was already used")
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("prepaid debit could not be stored")
+        await _release_prepaid_lock(redis, nonce)
+        return _error(503, "service_unavailable", "prepaid store is temporarily unavailable")
+    if debited is None:
+        await _release_prepaid_lock(redis, nonce)
+        return await prepaid_only_error(
+            endpoint,
+            merchant_address,
+            oracle,
+            "insufficient_balance",
+            "the prepaid balance does not cover this call; deposit more first",
+            amount_sompi=stored.amount_sompi,
+        )
+    debit_id, balance = debited
+    try:
+        await redis.getdel(prepaid_challenge_key(nonce))
+    except RedisError:
+        logger.warning("could not consume prepaid challenge %s; the unique nonce still blocks reuse", nonce)
+
+    try:
+        result = await _call_upstream(client, method, prepared)
+    except UpstreamFailedError as exc:
+        logger.warning("upstream failure for prepaid debit %s: %s", debit_id, exc)
+        refunded = await refund_prepaid_debit(session, redis, debit_id, None)
+        receipt = _prepaid_receipt_header(
+            debit_id,
+            nonce,
+            stored.amount_sompi,
+            balance if refunded is None else refunded,
+            PREPAID_DEBIT_DEBITED if refunded is None else PREPAID_DEBIT_REFUNDED,
+        )
+        return _error(
+            502,
+            "upstream_error",
+            "the upstream API did not return a response"
+            + ("; the debit was refunded" if refunded is not None else "; the refund is pending reconciliation"),
+            headers={HEADER_PREPAID_RECEIPT: receipt},
+        )
+    if result.status_code >= 500:
+        refunded = await refund_prepaid_debit(session, redis, debit_id, result.status_code)
+        status = PREPAID_DEBIT_DEBITED if refunded is None else PREPAID_DEBIT_REFUNDED
+        balance = balance if refunded is None else refunded
+    else:
+        await _record_debit_status(session, debit_id, result.status_code)
+        status = PREPAID_DEBIT_DEBITED
+    response = Response(content=result.body, status_code=result.status_code)
+    for name, value in result.headers:
+        response.raw_headers.append((name.lower().encode("latin-1"), value.encode("latin-1")))
+    response.headers[HEADER_PREPAID_RECEIPT] = _prepaid_receipt_header(
+        debit_id, nonce, stored.amount_sompi, balance, status
+    )
+    return response
+
+
+async def _release_prepaid_lock(redis: Redis, nonce: str) -> None:
+    try:
+        await redis.delete(prepaid_nonce_lock_key(nonce))
+    except RedisError:
+        logger.error("could not release prepaid lock for %s; it expires in %ss", nonce, REPLAY_LOCK_TTL_SECONDS)
