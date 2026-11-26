@@ -89,5 +89,13 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - CONTRACTS Limits now names the remaining shortfall cases accurately, including a merchant who posts a `tx_id`
   without ever claiming (no scan, no cooldown).
 
+### Security: refund red-team fix, round 4 (CONTRACT v2.13, before release)
+
+- A claim renewal no longer backfills a missing `first_claimed_daa_score`. The score is written only in the same
+  write that sets `first_claimed_at` the first time; if the node could not be asked then, it stays null and the
+  pre-cancel UTXO filter is skipped (as CONTRACTS already said).
+- CONTRACTS Limits adds the shortfall case of a payout accepted at or before `first_claimed_daa_score` (broadcast
+  before or at the first claim), and keeps the null-score skip. Merchants should claim before broadcasting.
+
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.
