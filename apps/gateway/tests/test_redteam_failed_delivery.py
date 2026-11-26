@@ -280,6 +280,14 @@ async def test_held_identity_under_concurrent_credit_debit_and_refund(
     assert balance.refund_hold_sompi + balance.debited_sompi <= 40_000_000 + SPLIT.merchant_sompi
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Contradicts QA decision 3 (01, 2026-11-26): failed-delivery credit is call-only and never refundable "
+        "on-chain. Kept unedited and pinned (strict) so the contradiction stays visible; the replacement "
+        "invariants are in tests/test_failed_delivery_refunds.py."
+    ),
+)
 async def test_held_credited_balance_can_be_refunded_and_identity_holds(
     client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
