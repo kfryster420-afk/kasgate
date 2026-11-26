@@ -146,6 +146,16 @@ export interface PrepaidBalanceRead {
   deposited_sompi: Sompi;
   debited_sompi: Sompi;
   updated_at: IsoDateTime | null;
+  /** CONTRACT v2.13: paid back on-chain by refund payouts. */
+  refunded_sompi: Sompi;
+  /** CONTRACT v2.13: swept by the credit-expiry worker. */
+  expired_sompi: Sompi;
+  /** CONTRACT v2.13: set aside by an open refund request; still in the balance but not spendable. */
+  refund_hold_sompi: Sompi;
+  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. */
+  spendable_sompi: Sompi;
+  /** CONTRACT v2.13: when the credit expires (null = never). */
+  expires_at: IsoDateTime | null;
 }
 
 export interface PrepaidDepositRead {
@@ -178,6 +188,94 @@ export interface PrepaidDebitRead {
 
 export type PrepaidLedgerKind = "balances" | "deposits" | "debits";
 
+/* ------------------------------------------------------------------ prepaid refunds and credit expiry (CONTRACT v2.13) */
+
+/** models.PREPAID_EXPIRY_DAYS_MAX: credit expiry is 1..3650 days after the latest deposit (null = never / merchant default). */
+export const PREPAID_EXPIRY_DAYS_MAX = 3650;
+/** schemas.PREPAID_REFUND_PURPOSE: the `Purpose:` line of a refund challenge. */
+export const PREPAID_REFUND_PURPOSE = "kasgate:v1:prepaid-refund";
+/** schemas.PREPAID_REFUND_PAYLOAD_PREFIX: payload of a merchant-built payout (`kasgate:v1:refund:<refund id hex>`). */
+export const PREPAID_REFUND_PAYLOAD_PREFIX = "kasgate:v1:refund:";
+export const PREPAID_REFUND_REASON_MAX_LENGTH = 300;
+export const PREPAID_REFUND_STATUSES = ["requested", "payout_submitted", "paid", "rejected", "cancelled"] as const;
+export type PrepaidRefundStatus = (typeof PREPAID_REFUND_STATUSES)[number];
+export type PrepaidRefundAction = "request" | "cancel";
+
+/** POST /v1/prepaid/refunds/challenge. `request`: optional amount (omit = all spendable), no refund_id. `cancel`: refund_id, no amount. */
+export interface PrepaidRefundChallengeRequest {
+  slug: string;
+  payer_address: string;
+  action: PrepaidRefundAction;
+  /** JSON integer on the wire; a decimal string here, converted server-side. */
+  amount_sompi?: Sompi;
+  refund_id?: Uuid;
+}
+
+export interface PrepaidRefundChallenge {
+  nonce: string;
+  /** Sign exactly this text with the depositing key, then POST {nonce, signature}. */
+  message: string;
+  action: PrepaidRefundAction;
+  slug: string;
+  merchant_id: Uuid;
+  payer_address: string;
+  amount_sompi: Sompi;
+  refund_id: Uuid | null;
+  spendable_sompi: Sompi;
+  expires_at: IsoDateTime;
+}
+
+/** POST /v1/prepaid/refunds and /v1/prepaid/refunds/{id}/cancel. */
+export interface PrepaidRefundSigned {
+  nonce: string;
+  /** Sent as the wallet returned it (128 hex or Base64 of 64/65 bytes); the gateway normalises. */
+  signature: string;
+}
+
+export interface PrepaidRefundRead {
+  id: Uuid;
+  merchant_id: Uuid;
+  payer_address: string;
+  amount_sompi: Sompi;
+  status: PrepaidRefundStatus;
+  tx_id: string | null;
+  reason: string | null;
+  last_error: string | null;
+  created_at: IsoDateTime;
+  updated_at: IsoDateTime;
+  payout_submitted_at: IsoDateTime | null;
+  paid_at: IsoDateTime | null;
+  resolved_at: IsoDateTime | null;
+  /** computed_field: pay exactly `amount_sompi` here (the depositing address). No platform fee. */
+  payout_address: string;
+  /** computed_field: hex of `kasgate:v1:refund:<id hex>`, required on a signed `transaction` payout. */
+  payout_payload_hex: string;
+}
+
+/** POST /v1/prepaid/refunds/{id}/payout [Bearer]: exactly one of the two. */
+export type PrepaidRefundPayout = { tx_id: string; transaction?: undefined } | { transaction: string; tx_id?: undefined };
+
+/** POST /v1/prepaid/refunds/{id}/reject [Bearer]. */
+export interface PrepaidRefundReject {
+  reason: string;
+}
+
+export type PrepaidLedgerEntryKind = "refund" | "expiry";
+
+/** GET /v1/prepaid/ledger [Bearer]: refund payouts and expiries, newest first. */
+export interface PrepaidLedgerEntryRead {
+  id: Uuid;
+  payer_address: string;
+  kind: PrepaidLedgerEntryKind;
+  direction: "credit" | "debit";
+  amount_sompi: Sompi;
+  balance_after_sompi: Sompi;
+  tx_id: string | null;
+  refund_id: Uuid | null;
+  note: string | null;
+  created_at: IsoDateTime;
+}
+
 /* ------------------------------------------------------------------ fee split */
 
 export interface FeeSplit {
@@ -206,6 +304,14 @@ export interface MerchantRead {
   email: string | null;
   is_active: boolean;
   created_at: IsoDateTime;
+  /** CONTRACT v2.13: default prepaid credit expiry in days after the latest deposit (null = never expires). */
+  prepaid_expiry_days: number | null;
+}
+
+/** PATCH /v1/merchants/me (CONTRACT v2.13). Only fields present change; `prepaid_expiry_days: null` = never expire. */
+export interface MerchantUpdate {
+  display_name?: string;
+  prepaid_expiry_days?: number | null;
 }
 
 /**
@@ -291,6 +397,8 @@ export interface EndpointCreate {
   free_trial_calls?: number;
   /** CONTRACT v2.12: trial calls this endpoint serves per UTC day across all buyers (1..100000, default 100). */
   trial_daily_cap?: number;
+  /** CONTRACT v2.13: credit bought here expires this many days after the latest deposit (1..3650); null = merchant default. */
+  prepaid_expiry_days?: number | null;
 }
 
 export interface EndpointUpdate {
@@ -309,6 +417,8 @@ export interface EndpointUpdate {
   /** Not nullable on the gateway: omit to keep. */
   free_trial_calls?: number;
   trial_daily_cap?: number;
+  /** CONTRACT v2.13: 1..3650, or null to fall back to the merchant default. */
+  prepaid_expiry_days?: number | null;
 }
 
 export interface EndpointRead {
@@ -328,6 +438,8 @@ export interface EndpointRead {
   prepaid_only: boolean;
   free_trial_calls: number;
   trial_daily_cap: number;
+  /** CONTRACT v2.13: per-endpoint credit expiry override (null = merchant default). */
+  prepaid_expiry_days: number | null;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
   /** computed_field; null when price_currency is USD. */
@@ -613,6 +725,11 @@ export const WEBHOOK_EVENT_TYPES = [
   "trial.used",
   "endpoint.created",
   "endpoint.updated",
+  "prepaid.refund.requested",
+  "prepaid.refund.paid",
+  "prepaid.refund.rejected",
+  "prepaid.refund.cancelled",
+  "prepaid.credit.expired",
 ] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 export type WebhookDeliveryStatus = "pending" | "delivering" | "succeeded" | "dead";

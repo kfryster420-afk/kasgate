@@ -12,6 +12,17 @@ export interface KaswareProvider {
   /** Optional: read-only, no approval prompt. Official values are listed at KaswareNetworkId; may be "" when not connected. */
   getNetwork?: () => Promise<string>;
   signMessage(message: string, options?: KaswareSignOptions | "auto" | "schnorr" | "ecdsa"): Promise<string>;
+  /**
+   * Optional (Transaction API): builds, signs in the wallet and broadcasts a payment. Resolves to the serialized
+   * transaction JSON (current KasWare) or, on older builds, the bare txid. `sompi` is a JS number.
+   */
+  sendKaspa?: (toAddress: string, sompi: number, options?: KaswareSendOptions) => Promise<string>;
+}
+
+export interface KaswareSendOptions {
+  priorityFee?: number;
+  /** Plain text; KasWare hex-encodes it into the transaction payload. */
+  payload?: string;
 }
 
 declare global {
@@ -94,4 +105,65 @@ export async function kaswareNetworkRefusal(wallet: KaswareProvider, gatewayNetw
   const expected = expectedKaswareNetwork(gatewayNetwork);
   if (actual === expected) return null;
   return `KasWare is on ${NETWORK_FRIENDLY_NAME[actual]}. Switch KasWare to ${NETWORK_FRIENDLY_NAME[expected]} and try again.`;
+}
+
+const TX_ID = /^[0-9a-f]{64}$/;
+
+/** The txid of a `sendKaspa` result: the bare 64-hex id, or the `id` / `transactionId` of the serialized transaction. */
+export function txIdFromSendResult(result: unknown): string | null {
+  if (typeof result !== "string") return null;
+  const text = result.trim();
+  if (TX_ID.test(text.toLowerCase())) return text.toLowerCase();
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      for (const key of ["id", "transactionId", "txid", "txId"]) {
+        const value = record[key];
+        if (typeof value === "string" && TX_ID.test(value.trim().toLowerCase())) return value.trim().toLowerCase();
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** True when a KasWare error means the user dismissed or rejected the prompt (EIP-1193 style code 4001 or the message). */
+export function isWalletRejection(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: unknown }).code;
+    if (code === 4001 || code === "4001" || code === "ACTION_REJECTED") return true;
+  }
+  const text = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return /reject|denied|cancel+ed|declined|user closed/i.test(text);
+}
+
+/** A readable message from whatever a wallet call threw (Error, string or `{message}`). */
+export function walletErrorText(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message) return message;
+  }
+  return "KasWare reported an unknown error";
+}
+
+export class WalletTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WalletTimeoutError";
+  }
+}
+
+/** Races a wallet promise against a timeout; the wallet prompt itself cannot be cancelled, so callers must say so. */
+export function withWalletTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new WalletTimeoutError(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
