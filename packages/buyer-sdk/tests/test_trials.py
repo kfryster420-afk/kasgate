@@ -11,7 +11,6 @@ import httpx
 import kaspa
 import pytest
 from app import schemas as gw
-from app import webhooks as gw_webhooks
 from conftest import PAYER, PAYER_KEY, FakeGateway
 
 import kasgate_client as sdk
@@ -322,6 +321,11 @@ def test_message_matches_gateway_byte_for_byte() -> None:
 
 
 def test_verify_webhook_signature_matches_the_gateway_signer() -> None:
+    # The gateway signer module needs FastAPI, which the SDK-only CI job does not install; the gateway suite
+    # covers the signer itself, so this cross-check runs wherever the gateway dependencies are present.
+    pytest.importorskip("fastapi")
+    from app import webhooks as gw_webhooks
+
     secret = "whsec_" + "Z" * 43
     body = b'{"api_version":"2.12","id":"evt_' + b"1" * 32 + b'","type":"payment.settled"}'
     now = 1_800_000_000
