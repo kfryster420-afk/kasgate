@@ -248,7 +248,7 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
           </div>
         ) : null}
       </div>
-      <p className="text-[11px] text-zinc-600">Amounts in KAS and sompi. KasGate records no USD value for these credits.</p>
+      <p className="text-[11px] text-zinc-600">Amounts in KAS and sompi. USD at settlement is the credited KAS at the KAS/USD rate the call settled at (from its settlement; &ldquo;no rate&rdquo; when none was recorded).</p>
       <FailedDeliveryPolicy onUnauthorized={onUnauthorized} />
     </section>
   );
