@@ -18,6 +18,11 @@ const EVENT_LABELS: Record<WebhookEventType, string> = {
   "trial.used": "Free trial call used",
   "endpoint.created": "Endpoint created",
   "endpoint.updated": "Endpoint updated",
+  "prepaid.refund.requested": "Prepaid refund requested",
+  "prepaid.refund.paid": "Prepaid refund paid",
+  "prepaid.refund.rejected": "Prepaid refund rejected",
+  "prepaid.refund.cancelled": "Prepaid refund cancelled",
+  "prepaid.credit.expired": "Prepaid credit expired",
 };
 
 const STATUS_TONE: Record<WebhookDeliveryStatus, string> = {

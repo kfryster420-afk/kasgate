@@ -10,6 +10,7 @@ import { AnalyticsPanel } from "./analytics-panel";
 import { ApiKeyReveal } from "./api-key-reveal";
 import { EndpointsPanel } from "./endpoints-panel";
 import { PrepaidPanel } from "./prepaid-panel";
+import { RefundsPanel } from "./refunds-panel";
 import { TrialsPanel } from "./trials-panel";
 import { WebhooksPanel } from "./webhooks-panel";
 import { SettlementsPanel } from "./settlements-panel";
@@ -115,6 +116,7 @@ export function DashboardClient() {
           <EndpointsPanel endpoints={endpoints} onChanged={() => setReloadKey((k) => k + 1)} onUnauthorized={toLogin} />
           <SettlementsPanel endpoints={endpoints} reloadKey={reloadKey} />
           <PrepaidPanel endpoints={endpoints} reloadKey={reloadKey} />
+          <RefundsPanel merchant={merchant} reloadKey={reloadKey} onMerchantChange={setMerchant} onUnauthorized={toLogin} />
           <TrialsPanel endpoints={endpoints} reloadKey={reloadKey} />
           <WebhooksPanel reloadKey={reloadKey} />
         </>
