@@ -92,8 +92,8 @@ async def test_a_refund_takes_only_deposited_unspent_credit_and_its_hold_never_c
 
     challenge = await challenge_of(client)
     assert challenge.amount_sompi == str(CREDIT_SOMPI)  # the default amount is the refundable part only
-    assert challenge.refundable_sompi == str(CREDIT_SOMPI)
-    assert challenge.spendable_sompi == str(CREDIT_SOMPI + SPLIT.merchant_sompi)
+    dumped = challenge.model_dump()
+    assert "spendable_sompi" not in dumped and "refundable_sompi" not in dumped
     too_much = await refund_challenge(client, amount=CREDIT_SOMPI + 1)
     assert too_much.status_code == 409 and too_much.json()["error"] == "insufficient_balance"
 

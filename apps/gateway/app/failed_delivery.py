@@ -293,7 +293,6 @@ async def credit_failed_delivery(
         settlement_id=settlement.id,
         slug=endpoint.slug,
         credit_reason=reason,
-        created_at=datetime.now(UTC),
     )
     session.add(entry)
     try:

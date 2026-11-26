@@ -84,13 +84,16 @@ await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  
 ```
 
 - The request signs a refund text (purpose `kasgate:v1:prepaid-refund`) that the SDK rebuilds itself; it refuses to sign
-  for another payer, endpoint, action, refund or amount, or for more than the spendable credit the gateway reported.
-  The signature moves no coins: the merchant pays the amount back on-chain to this key's address, with no platform fee.
+  for another payer, endpoint, action, refund or amount. When no amount is given, it signs the amount the challenge
+  names (the gateway's refundable default). The unsigned challenge does not report `spendable_sompi` or
+  `refundable_sompi`; those live on the signed credits/status and on `prepaid_balance`. The signature moves no coins:
+  the merchant pays the amount back on-chain to this key's address, with no platform fee.
 - `GET /v1/prepaid/refunds/status` is a buyer-signed read (the gateway answers unsigned calls with 401): the SDK sends
   `X-KasGate-Balance-Timestamp` + `X-KasGate-Balance-Signature` over the balance-read text (purpose
   `kasgate:v1:prepaid-balance-read`, this domain, address, slug and unix time), the same read signature as
   `prepaid_balance`; it authorises nothing else. That list hides the merchant's reject reason and claim (`paying`
-  reads as `requested`); `signed=True` signs a single-use `status` challenge (amount 0) instead to read them (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
+  reads as `requested`); `signed=True` signs a single-use `status` challenge (amount 0) instead to read them
+  (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
   claimed it keeps its amount set aside until `hold_until`; a cancel is refused while a payout of it is on-chain.
   `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
 - `prepaid_balance` is a signed read by default (same headers as above) and reports `balance_sompi`, the ledger totals

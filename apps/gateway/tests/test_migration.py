@@ -979,6 +979,12 @@ async def test_0009_failed_delivery_credit_constraints_and_guarded_downgrade(pg_
     )
     await asyncio.to_thread(command.upgrade, config, "head")
     assert await _scalar(url, "SELECT version_num FROM alembic_version") == HEAD_REVISION
+    indexdef = await _scalar(
+        url,
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_prepaid_ledger_entries_credit_balance_created'",
+    )
+    assert indexdef is not None and "balance_id" in indexdef
+    assert "created_at" in indexdef and "failed_delivery_credit" in indexdef
     # existing balances carry over with nothing credited; existing merchants are opted in from the upgrade on
     assert await _scalar(url, "SELECT credited_sompi FROM prepaid_balances") == 0
     assert (
