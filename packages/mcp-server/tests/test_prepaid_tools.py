@@ -101,6 +101,10 @@ class Gateway:
                     "balance_sompi": str(self.balance),
                     "deposited_sompi": str(self.balance) if signed else None,
                     "debited_sompi": "0" if signed else None,
+                    "refunded_sompi": "0" if signed else None,
+                    "expired_sompi": "0" if signed else None,
+                    "refund_hold_sompi": "0" if signed else None,
+                    "spendable_sompi": str(self.balance),
                     "updated_at": None,
                 },
             )

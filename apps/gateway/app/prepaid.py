@@ -12,7 +12,8 @@ Routes (all under /v1/prepaid):
   ``resolve_inputs`` + ``settle``, then ONE transaction: settlement row (kaspa-exact-v1, fee > 0, treasury), balance
   upsert (credit = merchant share only) and the prepaid_deposits row (unique tx_id and settlement_id).
 * ``POST /challenge`` (public, unpaid rate limit) -> 201 PrepaidChallenge: the exact text to sign for ONE debit.
-* ``GET /balance?slug=&payer_address=`` (public; totals only when buyer-signed) -> PrepaidBalanceRead.
+* ``GET /balance?slug=&payer_address=`` (public balance and spendable; ledger totals only when buyer-signed)
+  -> PrepaidBalanceRead.
 * ``GET /balances``, ``GET /deposits``, ``GET /debits`` [Bearer] -> the merchant's own prepaid ledger.
 
 KasGate never holds the coins: the merchant and the treasury were paid on-chain by the deposit. Unused credit is a
@@ -201,7 +202,10 @@ def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDeposit
 def _balance_read(
     merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None, *, totals: bool = True
 ) -> PrepaidBalanceRead:
-    """`totals=False` (the unsigned public read) leaves deposited/debited null: only the buyer sees its spend."""
+    """`totals=False` (the unsigned public read) leaves deposited/debited/refunded/expired/hold null.
+
+    `balance_sompi` and `spendable_sompi` stay public so agents can see what they can still spend without signing.
+    """
     return PrepaidBalanceRead(
         merchant_id=merchant_id,
         payer_address=payer_address if balance is None else balance.payer_address,
@@ -209,9 +213,9 @@ def _balance_read(
         deposited_sompi=str(0 if balance is None else balance.deposited_sompi) if totals else None,
         debited_sompi=str(0 if balance is None else balance.debited_sompi) if totals else None,
         updated_at=None if balance is None else balance.updated_at,
-        refunded_sompi=str(0 if balance is None else balance.refunded_sompi),
-        expired_sompi=str(0 if balance is None else balance.expired_sompi),
-        refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi),
+        refunded_sompi=str(0 if balance is None else balance.refunded_sompi) if totals else None,
+        expired_sompi=str(0 if balance is None else balance.expired_sompi) if totals else None,
+        refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi) if totals else None,
         spendable_sompi=str(spendable_sompi(balance)),
         expires_at=None if balance is None else balance.expires_at,
     )

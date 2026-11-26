@@ -91,8 +91,9 @@ class PrepaidChallenge(_Model):
 
 
 class PrepaidBalance(_Model):
-    """`deposited_sompi` / `debited_sompi` are only returned on a buyer-signed read (the SDK always signs); an
-    unsigned public read leaves them None."""
+    """Ledger totals (`deposited` / `debited` / `refunded` / `expired` / `refund_hold`) are only returned on a
+    buyer-signed read (the SDK always signs); an unsigned public read leaves them None. `balance_sompi` and
+    `spendable_sompi` stay public."""
 
     merchant_id: uuid.UUID
     payer_address: str
@@ -100,10 +101,10 @@ class PrepaidBalance(_Model):
     deposited_sompi: BalanceStr | None = None
     debited_sompi: BalanceStr | None = None
     updated_at: datetime | None = None
-    # CONTRACT v2.13 (absent from older gateways, hence the defaults)
-    refunded_sompi: BalanceStr = "0"
-    expired_sompi: BalanceStr = "0"
-    refund_hold_sompi: BalanceStr = "0"
+    # CONTRACT v2.13 (absent from older gateways, hence the defaults; explicit null on an unsigned public read)
+    refunded_sompi: BalanceStr | None = "0"
+    expired_sompi: BalanceStr | None = "0"
+    refund_hold_sompi: BalanceStr | None = "0"
     spendable_sompi: BalanceStr | None = None
     """What calls can be paid from now (balance minus an open refund's hold, 0 once expired). None = old gateway."""
     expires_at: datetime | None = None
@@ -160,7 +161,7 @@ class PrepaidRefund(_Model):
 
 
 def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
-    """The text signed to read this key's own deposited/debited totals (byte-identical to the gateway's)."""
+    """The text signed to read this key's own ledger totals (byte-identical to the gateway's)."""
     return (
         "KasGate\n"
         f"Domain: {domain}\n"

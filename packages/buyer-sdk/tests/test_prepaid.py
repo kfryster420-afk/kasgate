@@ -99,6 +99,10 @@ class PrepaidGateway:
                     "balance_sompi": str(self.balance),
                     "deposited_sompi": str(self.balance) if signed else None,
                     "debited_sompi": "0" if signed else None,
+                    "refunded_sompi": "0" if signed else None,
+                    "expired_sompi": "0" if signed else None,
+                    "refund_hold_sompi": "0" if signed else None,
+                    "spendable_sompi": str(self.balance),
                     "updated_at": None,
                 },
             )
@@ -452,10 +456,18 @@ async def test_balance_read(pgw, make_client) -> None:
 
 def test_unsigned_public_balance_parses_without_totals() -> None:
     balance = sdk.PrepaidBalance.model_validate(
-        {"merchant_id": str(MERCHANT_ID), "payer_address": PAYER, "balance_sompi": "5", "updated_at": None}
-        | {"deposited_sompi": None, "debited_sompi": None}
+        {"merchant_id": str(MERCHANT_ID), "payer_address": PAYER, "balance_sompi": "5", "updated_at": None, "spendable_sompi": "5"}
+        | {
+            "deposited_sompi": None,
+            "debited_sompi": None,
+            "refunded_sompi": None,
+            "expired_sompi": None,
+            "refund_hold_sompi": None,
+        }
     )
-    assert balance.balance_sompi == "5" and balance.deposited_sompi is None and balance.debited_sompi is None
+    assert balance.balance_sompi == "5" and balance.spendable_sompi == "5"
+    assert balance.deposited_sompi is None and balance.debited_sompi is None
+    assert balance.refunded_sompi is None and balance.expired_sompi is None and balance.refund_hold_sompi is None
 
 
 def test_balance_read_message_and_headers_match_the_gateway() -> None:

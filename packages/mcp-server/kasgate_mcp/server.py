@@ -477,8 +477,8 @@ def build_server(
 
     @server.tool()
     async def prepaid_balance(slug: str) -> dict[str, Any]:
-        """Show this buyer key's prepaid balance at the merchant behind `slug`, with its deposited and debited
-        totals (a read only: it signs a balance-read message that authorises no payment)."""
+        """Show this buyer key's prepaid balance at the merchant behind `slug`, including ledger totals
+        (a read only: it signs a balance-read message that authorises no payment)."""
         slug = validate_slug(slug)
         try:
             balance = await paying_client().prepaid_balance(cfg.gateway_url, slug)

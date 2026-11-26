@@ -276,7 +276,8 @@ def prepaid_body_hash(body: bytes) -> str:
 
 
 def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
-    """The text a buyer signs (depositing P2PK key) to read its own deposited/debited totals. Its Purpose differs
+    """The text a buyer signs (depositing P2PK key) to read its own ledger totals
+    (deposited, debited, refunded, expired, hold). Its Purpose differs
     from every other KasGate message, so the signature authorises nothing but this read."""
     return (
         "KasGate\n"
@@ -1643,8 +1644,9 @@ class PrepaidReceipt(X402Header):
 
 
 class PrepaidBalanceRead(BaseModel):
-    """`deposited_sompi` / `debited_sompi` are null on the public balance read unless the buyer signs it
-    (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature); merchant views always carry them."""
+    """Ledger totals (`deposited` / `debited` / `refunded` / `expired` / `refund_hold`) are null on the public
+    balance read unless the buyer signs it (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature).
+    `balance_sompi` and `spendable_sompi` stay public. Merchant views always carry every field."""
 
     merchant_id: uuid.UUID
     payer_address: str
@@ -1652,13 +1654,16 @@ class PrepaidBalanceRead(BaseModel):
     deposited_sompi: BalanceSompiStr | None
     debited_sompi: BalanceSompiStr | None
     updated_at: datetime | None
-    # CONTRACT v2.13
-    refunded_sompi: BalanceSompiStr = "0"
-    expired_sompi: BalanceSompiStr = "0"
-    refund_hold_sompi: BalanceSompiStr = "0"
-    """Set aside by an open refund request: still in the balance, but not spendable."""
+    # CONTRACT v2.13 (null on the unsigned public read)
+    refunded_sompi: BalanceSompiStr | None = None
+    expired_sompi: BalanceSompiStr | None = None
+    refund_hold_sompi: BalanceSompiStr | None = None
+    """Set aside by an open refund request: still in the balance, but not spendable.
+
+    Signed-only on the public read.
+    """
     spendable_sompi: BalanceSompiStr = "0"
-    """What calls can be paid from right now: balance - refund hold, or 0 once `expires_at` has passed."""
+    """What calls can be paid from right now: balance minus the refund hold, or 0 once expired. Always public."""
     expires_at: datetime | None = None
 
 

@@ -38,6 +38,7 @@ from tests.conftest import (
     seed_endpoint,
 )
 from tests.test_prepaid import CREDIT_SOMPI, DEPOSIT_SOMPI, add_endpoint, fund, request_challenge
+from tests.test_prepaid_balance_privacy import signed_headers
 
 MIN_REFUND = 20_000_000
 PAYOUT_TX = "ab" * 32
@@ -198,8 +199,17 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     # The held credit no longer pays calls.
     blocked = await request_challenge(client)
     assert blocked.status_code == 402 and "spendable" in blocked.json()["message"]
-    balance = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    assert (balance["refund_hold_sompi"], balance["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
+    public = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
+    assert public["spendable_sompi"] == "0" and public["balance_sompi"] == str(CREDIT_SOMPI)
+    assert public["refund_hold_sompi"] is public["refunded_sompi"] is public["expired_sompi"] is None
+    totals = (
+        await client.get(
+            "/v1/prepaid/balance",
+            params={"slug": "cheap", "payer_address": PAYER_ADDRESS},
+            headers=signed_headers(),
+        )
+    ).json()
+    assert (totals["refund_hold_sompi"], totals["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
 
     paid = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
     assert paid.status_code == 200, paid.text
