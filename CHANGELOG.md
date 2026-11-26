@@ -26,7 +26,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Failure credit is call-only and non-refundable: tracked in `credit_balance_sompi`, spent before deposited sompi
   (`prepaid_debits.credit_sompi`), excluded from refunds, refund holds and cancel cooldown holds
   (`refundable = max(0, balance - hold - credit_balance)`); a late v2.13 payout re-debits deposited sompi first.
-  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown).
+  Spendable for calls follows v2.13: balance minus the hold (open refund or unreleased cooldown, including a
+  cooldown that outlasts `hold_until` while a payout attempt is still pending).
 - Credits are clamped to `PREPAID_MAX_BALANCE_SOMPI`; the cut part is `shortfall_sompi` on the ledger row and a
   signed `prepaid.credit.failed_delivery_shortfall` webhook.
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`
@@ -34,8 +35,12 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - `GET /v1/prepaid/credits` lists credits (filters `slug`, `payer_address`, `tx_id`); `/v1/prepaid/ledger` shows them.
 - Balances and the refund challenge report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
   identity is now `balance = deposited + credited - debited - refunded - expired`.
-- The signed `POST /v1/prepaid/refunds/status` reply adds an `X-KasGate-Credit-Summary` header (the buyer's credit
-  totals and newest credits); its body is unchanged.
+- Signed `POST /v1/prepaid/credits/challenge` + `POST /v1/prepaid/credits/status` returns the buyer's credit
+  totals and a page of credits (action `credits`; same challenge path as refunds/status). Each item includes
+  `credit_id` (the ledger entry UUID, the same value as `creditId` on `X-KasGate-Credit`). The status body
+  accepts optional `before` (opaque cursor) and `limit` (default 10, max 100) and returns `next_cursor` (null
+  when there are no more pages). Each page needs a fresh challenge. `GET` and signed
+  `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 - Signed webhook events `prepaid.credit.failed_delivery` and `prepaid.credit.failed_delivery_shortfall`.
 - A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never
   shortens a later expiry, never retroactive.
@@ -43,8 +48,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   0008's 0-sompi refund rows; guarded downgrade).
 - Settings: `UPSTREAM_TIMEOUT_SECONDS` (was a constant), `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (now 30 s on top of
   the upstream timeout), `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
-- Out of scope: no per-endpoint policy override, no public credit lookup. SDK/MCP parsing of `X-KasGate-Credit` and
-  `X-KasGate-Credit-Summary` is a follow-up.
+- Out of scope: no per-endpoint policy override, no other public credit lookup. SDK/MCP parsing of
+  `X-KasGate-Credit` and of `POST /v1/prepaid/credits/status` is a follow-up.
 - Docs: [docs/CONTRACTS.md](docs/CONTRACTS.md) v2.14, [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md),
   runbook.
 
@@ -121,6 +126,25 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   of `0008_prepaid_refunds` and say how to fix it (downgrade to 0007, upgrade again); 0008's downgrade now works from
   the first draft too. See RUNBOOK "Migration 0008 revised in place".
 - Webhook data of refund events gains `hold_until`. `prepaid_refund_payouts.method` gains `scan`.
+
+### Security: refund red-team fixes, round 3 (CONTRACT v2.13, before release)
+
+- The cooldown hold is not released while any payout attempt for that refund is still pending (it stays until the
+  attempt is confirmed — debited in full from the hold — or resolved invalid/abandoned).
+- The pending-attempt cap applies only to bare `tx_id` posts. A signed `{transaction}` proof is exempt (it is checked
+  locally) and `scan` attempts do not count toward it.
+- The pre-cancel UTXO scan ignores outputs with `blockDaaScore` at or below the virtual DAA stored at the first claim
+  (`first_claimed_daa_score`).
+- CONTRACTS Limits now names the remaining shortfall cases accurately, including a merchant who posts a `tx_id`
+  without ever claiming (no scan, no cooldown).
+
+### Security: refund red-team fix, round 4 (CONTRACT v2.13, before release)
+
+- A claim renewal no longer backfills a missing `first_claimed_daa_score`. The score is written only in the same
+  write that sets `first_claimed_at` the first time; if the node could not be asked then, it stays null and the
+  pre-cancel UTXO filter is skipped (as CONTRACTS already said).
+- CONTRACTS Limits adds the shortfall case of a payout accepted at or before `first_claimed_daa_score` (broadcast
+  before or at the first claim), and keeps the null-score skip. Merchants should claim before broadcasting.
 
 The on-chain payment rules are unchanged: output 0 merchant, output 1 treasury, fee max(1.5 %, 0.2 KAS), 0.6 KAS
 minimum for on-chain payments.
