@@ -34,8 +34,9 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - `GET /v1/prepaid/credits` lists credits (filters `slug`, `payer_address`, `tx_id`); `/v1/prepaid/ledger` shows them.
 - Balances and the refund challenge report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
   identity is now `balance = deposited + credited - debited - refunded - expired`.
-- The signed `POST /v1/prepaid/refunds/status` reply adds an `X-KasGate-Credit-Summary` header (the buyer's credit
-  totals and newest credits); its body is unchanged.
+- Signed `POST /v1/prepaid/credits/challenge` + `POST /v1/prepaid/credits/status` returns the buyer's credit
+  totals and newest credits (action `credits`; same challenge path as refunds/status). `GET` and signed
+  `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 - Signed webhook events `prepaid.credit.failed_delivery` and `prepaid.credit.failed_delivery_shortfall`.
 - A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never
   shortens a later expiry, never retroactive.
@@ -43,8 +44,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
   0008's 0-sompi refund rows; guarded downgrade).
 - Settings: `UPSTREAM_TIMEOUT_SECONDS` (was a constant), `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (now 30 s on top of
   the upstream timeout), `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
-- Out of scope: no per-endpoint policy override, no public credit lookup. SDK/MCP parsing of `X-KasGate-Credit` and
-  `X-KasGate-Credit-Summary` is a follow-up.
+- Out of scope: no per-endpoint policy override, no other public credit lookup. SDK/MCP parsing of
+  `X-KasGate-Credit` and of `POST /v1/prepaid/credits/status` is a follow-up.
 - Docs: [docs/CONTRACTS.md](docs/CONTRACTS.md) v2.14, [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md),
   runbook.
 

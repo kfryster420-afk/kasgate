@@ -67,9 +67,9 @@ HEADER_TRIAL_LIMIT = "X-KasGate-Trial-Limit"
 HEADER_TRIAL_REMAINING = "X-KasGate-Trial-Remaining"
 # Failed-delivery auto-credit: on the failing response when the call was credited back to prepaid there and then.
 HEADER_FAILED_DELIVERY_CREDIT = "X-KasGate-Credit"
-# CONTRACT v2.14: the buyer's failed-delivery credit summary on the signed POST /v1/prepaid/refunds/status reply.
-HEADER_CREDIT_SUMMARY = "X-KasGate-Credit-Summary"
+# CONTRACT v2.14: newest failed-delivery credits returned by signed POST /v1/prepaid/credits/status.
 MAX_SUMMARY_CREDITS = 10
+CREDIT_STATUS_ACTION = "credits"
 
 PROXY_PATH_PREFIX = "/p"
 MAX_HEADER_BYTES = 40_960
@@ -319,8 +319,9 @@ def build_prepaid_refund_message(
     nonce: str,
     expires_at: datetime,
 ) -> str:
-    """The exact text a buyer signs (kaspa sign_message, the depositing P2PK key) to open or cancel ONE refund, or
-    to read their own refunds with the merchant's reasons (`status`, Amount 0, Refund `-`).
+    """The exact text a buyer signs (kaspa sign_message, the depositing P2PK key) to open or cancel ONE refund, to
+    read their own refunds with the merchant's reasons (`status`, Amount 0, Refund `-`), or to read their
+    failed-delivery credit (`credits`, also Amount 0, Refund `-`).
 
     Its Purpose differs from a prepaid debit, a trial call, a payerProof and a login, so no other signature can stand
     in for it. A refund signature moves no coins: it only asks the merchant to pay `amount_sompi` back on-chain to
@@ -1921,37 +1922,69 @@ class FailedDeliveryCreditReceipt(X402Header):
     """Part of the merchant share not credited because the balance reached PREPAID_MAX_BALANCE_SOMPI."""
 
 
-class BuyerCreditItem(BaseModel):
-    """One failed-delivery credit in the buyer's credit summary (newest first)."""
+class PrepaidCreditStatusChallengeRequest(StrictModel):
+    """POST /v1/prepaid/credits/challenge: the text to sign to read this key's failed-delivery credit."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
-    txId: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
     slug: Annotated[str, Field(pattern=SLUG_RE)]
-    creditSompi: BalanceSompiStr
-    shortfallSompi: BalanceSompiStr
+    payer_address: str
+
+    @field_validator("payer_address")
+    @classmethod
+    def _payer(cls, v: str) -> str:
+        return validate_kaspa_address(v)
+
+
+class PrepaidCreditStatusChallenge(BaseModel):
+    """Sign `message` with the depositing key and POST {nonce, signature} to /v1/prepaid/credits/status."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    nonce: Annotated[str, Field(pattern=NONCE_RE)]
+    message: str
+    action: Literal["credits"]
+    slug: str
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: Literal["0"]
+    """Always "0": a credits challenge never holds or refunds sompi. The signed message carries Amount: 0."""
+    refund_id: None
+    spendable_sompi: BalanceSompiStr
+    refundable_sompi: BalanceSompiStr
+    expires_at: datetime
+
+
+class BuyerCreditStatusItem(StrictModel):
+    """One failed-delivery credit in the signed POST /v1/prepaid/credits/status reply (newest first)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    tx_id: Annotated[str, Field(pattern=TX_ID_RE.pattern)]
+    slug: Annotated[str, Field(pattern=SLUG_RE)]
+    credit_sompi: BalanceSompiStr
+    shortfall_sompi: BalanceSompiStr
     reason: FailedDeliveryCreditReason
-    createdAt: datetime
+    created_at: datetime
 
 
-class BuyerCreditSummary(X402Header):
-    """Body of the X-KasGate-Credit-Summary header on the signed POST /v1/prepaid/refunds/status reply (v2.14).
+class BuyerCreditStatus(StrictModel):
+    """JSON body of signed POST /v1/prepaid/credits/status (CONTRACT v2.14).
 
-    The JSON body stays v2.13's list of refunds; this header adds the signing buyer's failed-delivery credit at
-    that merchant. Credit is call-only: `refundableSompi` (deposited and unspent, minus the open hold) is what a
-    refund may take; `creditBalanceSompi` can only pay for calls.
+    Failed-delivery credit is call-only: `refundable_sompi` (deposited and unspent, minus an open refund or
+    cancel-cooldown hold) is what a refund may take; `credit_balance_sompi` can only pay for calls.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
-    merchantId: uuid.UUID
-    creditedSompi: BalanceSompiStr
+    merchant_id: uuid.UUID
+    credited_sompi: BalanceSompiStr
     """All failed-delivery credit ever added to this balance (the `credited_sompi` total)."""
-    creditBalanceSompi: BalanceSompiStr
+    credit_balance_sompi: BalanceSompiStr
     """Unspent call-only credit (spent before deposited sompi; never refundable)."""
-    refundableSompi: BalanceSompiStr
-    creditCount: Annotated[int, Field(ge=0)]
-    credits: Annotated[list[BuyerCreditItem], Field(max_length=MAX_SUMMARY_CREDITS)]
+    refundable_sompi: BalanceSompiStr
+    credit_count: Annotated[int, Field(ge=0)]
+    credits: Annotated[list[BuyerCreditStatusItem], Field(max_length=MAX_SUMMARY_CREDITS)]
     """The newest credits, at most 10; the merchant lists all with GET /v1/prepaid/credits."""
 
 

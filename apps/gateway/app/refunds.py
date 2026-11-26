@@ -20,7 +20,9 @@ returned is never taxed). The gateway only keeps the record:
    one (or a ``paying`` one whose claim is older than ``prepaid_refund_claim_ttl_seconds``) with a signed challenge,
    never while an attempted payout is pending. Both release the hold. A payout that lands anyway is still recorded.
 4. ``GET /v1/prepaid/refunds/status`` is public without reasons or payout errors; ``POST /v1/prepaid/refunds/status``
-   with a signed ``status`` challenge returns the full rows.
+   with a signed ``status`` challenge returns the full rows (a JSON array, unchanged). Failed-delivery credit is
+   read with ``POST /v1/prepaid/credits/challenge`` then a signed ``POST /v1/prepaid/credits/status`` (action
+   ``credits``); a refunds ``status`` challenge cannot be used there, and the reverse is also refused.
 
 Every step queues a webhook event (``prepaid.refund.requested|paid|rejected|cancelled|payout_reverted``).
 """
@@ -85,11 +87,13 @@ from app.models import (
 from app.payments import PaymentVerificationError, PayoutSighting, RpcUnavailableError
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
-    HEADER_CREDIT_SUMMARY,
+    CREDIT_STATUS_ACTION,
     MAX_SUMMARY_CREDITS,
     SLUG_RE,
-    BuyerCreditItem,
-    BuyerCreditSummary,
+    BuyerCreditStatus,
+    BuyerCreditStatusItem,
+    PrepaidCreditStatusChallenge,
+    PrepaidCreditStatusChallengeRequest,
     PrepaidLedgerEntryRead,
     PrepaidRefundChallenge,
     PrepaidRefundChallengeRequest,
@@ -184,12 +188,13 @@ class StoredRefundChallenge:
         public_key = str(data["payerPublicKey"])
         refund_id = data["refundId"]
         if (
-            action not in ("request", "cancel", "status")
+            action not in ("request", "cancel", "status", CREDIT_STATUS_ACTION)
             or amount < 0
-            or (action == "status") != (amount == 0)
+            or (action in ("status", CREDIT_STATUS_ACTION)) != (amount == 0)
             or expires_at.tzinfo is None
             or not _HEX64.fullmatch(public_key)
             or (action == "cancel") != (refund_id is not None)
+            or (action == CREDIT_STATUS_ACTION and refund_id is not None)
         ):
             raise ValueError("stored refund challenge is malformed")
         return cls(
@@ -772,19 +777,107 @@ async def signed_refund_status(signed: PrepaidRefundSigned, session: DbSession, 
                 )
             ).scalars()
         )
-        summary = await _credit_summary(session, stored.merchant_id, stored.payer_public_key)
     except SQLAlchemyError:
         logger.exception("signed refund status lookup failed")
         return _store_unavailable()
     await _consume_challenge(redis, signed.nonce)
     return JSONResponse(
         content=[PrepaidRefundRead.model_validate(row).model_dump(mode="json") for row in rows],
-        headers={"Cache-Control": "no-store", HEADER_CREDIT_SUMMARY: summary.to_header()},
+        headers={"Cache-Control": "no-store"},
     )
 
 
-async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_key: str) -> BuyerCreditSummary:
-    """CONTRACT v2.14: the signing buyer's failed-delivery credit at this merchant (for the signed status reply)."""
+@router.post(
+    "/credits/challenge",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PrepaidCreditStatusChallenge,
+    dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
+)
+async def credit_status_challenge(
+    payload: PrepaidCreditStatusChallengeRequest, session: DbSession, redis: RedisDep
+) -> Response:
+    """The text to sign to read this key's failed-delivery credit at the merchant behind `slug` (action `credits`).
+
+    Shares the refund challenge store, nonce lock, message layout (`Purpose: kasgate:v1:prepaid-refund`) and
+    single-use consume path with refunds/status; the action string is `credits`, so the two challenges cannot be
+    replayed across endpoints. A missing balance is still a valid challenge (the status reply is zeros).
+    """
+    settings = get_settings()
+    public_key = payer_public_key(payload.payer_address)
+    if public_key is None:
+        return _error(
+            400,
+            "invalid_payer",
+            "payer_address must be a P2PK Schnorr address (kaspa:q...): only its key can sign credit-status requests",
+        )
+    try:
+        endpoint = await _endpoint_merchant(session, payload.slug)
+        if endpoint is None:
+            return _error(404, "endpoint_not_found", f"no active endpoint with slug '{payload.slug}'")
+        balance = await _balance_of(session, endpoint.merchant_id, public_key)
+    except SQLAlchemyError:
+        logger.exception("credit status challenge lookup failed")
+        return _store_unavailable()
+    nonce = new_payment_nonce()
+    stored = StoredRefundChallenge(
+        action=CREDIT_STATUS_ACTION,
+        slug=endpoint.slug,
+        merchant_id=endpoint.merchant_id,
+        payer_address=payload.payer_address,
+        payer_public_key=public_key,
+        amount_sompi=0,
+        refund_id=None,
+        expires_at=datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=settings.payment_max_age_seconds),
+    )
+    try:
+        await redis.set(refund_challenge_key(nonce), stored.to_json(), ex=settings.payment_max_age_seconds)
+    except RedisError:
+        logger.exception("refund challenge store unavailable")
+        return _error(503, "service_unavailable", "prepaid refunds are temporarily unavailable")
+    challenge = PrepaidCreditStatusChallenge(
+        nonce=nonce,
+        message=stored.message(nonce),
+        action=CREDIT_STATUS_ACTION,
+        slug=endpoint.slug,
+        merchant_id=endpoint.merchant_id,
+        payer_address=payload.payer_address,
+        amount_sompi="0",
+        refund_id=None,
+        spendable_sompi=str(spendable_sompi(balance)),
+        refundable_sompi=str(refundable_sompi(balance)),
+        expires_at=stored.expires_at,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=challenge.model_dump(mode="json"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post(
+    "/credits/status",
+    response_model=BuyerCreditStatus,
+    dependencies=[Depends(limit_by_ip(RATE_LIMIT_PREPAID_REFUND))],
+)
+async def signed_credit_status(signed: PrepaidRefundSigned, session: DbSession, redis: RedisDep) -> Response:
+    """This key's failed-delivery credit at one merchant, from a signed `credits` challenge."""
+    stored, failure = await _claim_signed(redis, signed, CREDIT_STATUS_ACTION)
+    if failure is not None or stored is None:
+        return failure or _store_unavailable()
+    try:
+        summary = await _credit_summary(session, stored.merchant_id, stored.payer_public_key)
+    except SQLAlchemyError:
+        logger.exception("signed credit status lookup failed")
+        return _store_unavailable()
+    await _consume_challenge(redis, signed.nonce)
+    return JSONResponse(
+        content=summary.model_dump(mode="json"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_key: str) -> BuyerCreditStatus:
+    """CONTRACT v2.14: the signing buyer's failed-delivery credit at this merchant (credits/status)."""
     balance = await _balance_of(session, merchant_id, public_key)
     rows: list[PrepaidLedgerEntry] = []
     count = 0
@@ -806,22 +899,22 @@ async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_
             ).scalars()
         )
     credits = [
-        BuyerCreditItem(
-            txId=row.tx_id or "",
+        BuyerCreditStatusItem(
+            tx_id=row.tx_id or "",
             slug=row.slug or "",
-            creditSompi=str(row.amount_sompi),
-            shortfallSompi=str(row.shortfall_sompi),
+            credit_sompi=str(row.amount_sompi),
+            shortfall_sompi=str(row.shortfall_sompi),
             reason="attempts_exhausted" if row.credit_reason == CREDIT_REASON_ATTEMPTS_EXHAUSTED else "window_expired",
-            createdAt=row.created_at,
+            created_at=row.created_at,
         )
         for row in rows
     ]
-    return BuyerCreditSummary(
-        merchantId=merchant_id,
-        creditedSompi=str(0 if balance is None else balance.credited_sompi),
-        creditBalanceSompi=str(0 if balance is None else balance.credit_balance_sompi),
-        refundableSompi=str(refundable_sompi(balance)),
-        creditCount=count,
+    return BuyerCreditStatus(
+        merchant_id=merchant_id,
+        credited_sompi=str(0 if balance is None else balance.credited_sompi),
+        credit_balance_sompi=str(0 if balance is None else balance.credit_balance_sompi),
+        refundable_sompi=str(refundable_sompi(balance)),
+        credit_count=count,
         credits=credits,
     )
 

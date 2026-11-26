@@ -106,10 +106,13 @@ adds or drops credit for calls already paid. There is no per-endpoint override (
 * Response header `X-KasGate-Credit` (Base64 JSON, exposed via CORS, stripped from upstream responses so an
   upstream cannot forge it): `{creditId, kind, txId, merchantId, creditSompi, balanceSompi, reason,
   shortfallSompi?}`, sent only when something was credited.
-* Buyer view: the signed `POST /v1/prepaid/refunds/status` reply keeps its body (the list of refunds) and adds
-  `X-KasGate-Credit-Summary` (Base64 JSON `{merchantId, creditedSompi, creditBalanceSompi, refundableSompi,
-  creditCount, credits}`, the newest 10 credits as `{txId, slug, creditSompi, shortfallSompi, reason, createdAt}`).
-  The public `GET` status does not carry it.
+* Buyer view: `POST /v1/prepaid/credits/challenge` `{slug, payer_address}` then signed
+  `POST /v1/prepaid/credits/status` `{nonce, signature}` (action `credits`; same challenge store, message layout,
+  Purpose, key binding, single-use consume and rate limit as refunds/status). Reply is
+  `{merchant_id, credited_sompi, credit_balance_sompi, refundable_sompi, credit_count, credits}` with the newest
+  10 credits as `{tx_id, slug, credit_sompi, shortfall_sompi, reason, created_at}`. A buyer with no credits gets
+  zeros and `credits: []`. A refunds `status` challenge cannot be replayed here, and the reverse is refused.
+  `GET` and signed `POST /v1/prepaid/refunds/status` stay bare JSON arrays of refunds.
 
 ## Webhooks
 
@@ -153,5 +156,5 @@ The sweep runs in the ledger worker (`LEDGER_WORKER_ENABLED`, `LEDGER_POLL_INTER
 ## Out of scope
 
 * No per-endpoint override of the failed-delivery policy (merchant-level only).
-* No public credit-lookup route; the buyer's view is the signed refund-status summary above. SDK and MCP reading
-  of `X-KasGate-Credit` and `X-KasGate-Credit-Summary` is 05's follow-up.
+* No other public credit-lookup route; the buyer's view is the signed `POST /v1/prepaid/credits/status` above.
+  SDK and MCP reading of `X-KasGate-Credit` and of that endpoint is 05's follow-up.

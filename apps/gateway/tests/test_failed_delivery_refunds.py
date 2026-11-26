@@ -5,19 +5,20 @@ negative). Calls spend the credit first; a refund or cancel-cooldown hold never 
 deposited sompi first; expiry drops it.
 """
 
-import base64
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ledger import expire_due_balances, refundable_sompi, run_ledger_pass, spendable_sompi
 from app.models import PrepaidBalance, PrepaidDebit, PrepaidLedgerEntry
-from app.schemas import HEADER_CREDIT_SUMMARY, BuyerCreditSummary, compute_fee_split
+from app.schemas import CREDIT_STATUS_ACTION, BuyerCreditStatus, PrepaidCreditStatusChallenge, compute_fee_split
 from tests.conftest import (
+    OTHER_KEY,
     PAYER_ADDRESS,
     PRICE_SOMPI,
     Seed,
@@ -201,7 +202,15 @@ async def test_expiry_drops_unspent_credit_but_keeps_the_refund_hold(
     _identity(after)
 
 
-async def test_signed_refund_status_carries_the_buyers_credit_summary(
+async def _credit_status_challenge(
+    client: httpx.AsyncClient, *, slug: str = "cheap", payer: str = PAYER_ADDRESS
+) -> PrepaidCreditStatusChallenge:
+    response = await client.post("/v1/prepaid/credits/challenge", json={"slug": slug, "payer_address": payer})
+    assert response.status_code == 201, response.text
+    return PrepaidCreditStatusChallenge.model_validate(response.json())
+
+
+async def test_signed_credit_status_returns_the_buyers_credit(
     client: httpx.AsyncClient,
     shop: Seed,
     upstream: Upstream,
@@ -211,21 +220,25 @@ async def test_signed_refund_status_carries_the_buyers_credit_summary(
     await fund(client)
     override_settings(prepaid_max_balance_sompi=CAP)
     await _credit_weather(client, upstream)
-    status = await challenge_of(client, action="status")
-    reply = await client.post("/v1/prepaid/refunds/status", json=signed(status))
+    challenge = await _credit_status_challenge(client)
+    assert challenge.action == CREDIT_STATUS_ACTION and challenge.amount_sompi == "0" and challenge.refund_id is None
+    assert f"Action: {CREDIT_STATUS_ACTION}" in challenge.message
+    assert "Purpose: kasgate:v1:prepaid-refund" in challenge.message
+    assert "Amount: 0" in challenge.message and "Refund: -" in challenge.message
+    reply = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
     assert reply.status_code == 200, reply.text
-    assert reply.json() == []  # the body stays v2.13's list of refunds
-    summary = BuyerCreditSummary.model_validate_json(base64.b64decode(reply.headers[HEADER_CREDIT_SUMMARY]))
-    assert summary.merchantId == shop.merchant_id
-    assert (summary.creditedSompi, summary.creditBalanceSompi, summary.refundableSompi) == (
+    assert "X-KasGate-Credit-Summary" not in reply.headers
+    status = BuyerCreditStatus.model_validate(reply.json())
+    assert status.merchant_id == shop.merchant_id
+    assert (status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi) == (
         str(CAPPED_CREDIT),
         str(CAPPED_CREDIT),
         str(CREDIT_SOMPI),
     )
-    assert summary.creditCount == 1
-    [item] = summary.credits
-    assert (item.txId, item.slug, item.reason) == (TX, "weather", "attempts_exhausted")
-    assert (item.creditSompi, item.shortfallSompi) == (
+    assert status.credit_count == 1
+    [item] = status.credits
+    assert (item.tx_id, item.slug, item.reason) == (TX, "weather", "attempts_exhausted")
+    assert (item.credit_sompi, item.shortfall_sompi) == (
         str(CAPPED_CREDIT),
         str(SPLIT.merchant_sompi - CAPPED_CREDIT),
     )
@@ -238,9 +251,84 @@ async def test_signed_refund_status_carries_the_buyers_credit_summary(
             ).scalars()
         )
     assert entry.shortfall_sompi == SPLIT.merchant_sompi - CAPPED_CREDIT
-    # The public, unsigned view carries no credit summary.
+    # Refund status endpoints stay bare arrays and carry no credit-summary header.
+    refunds = await challenge_of(client, action="status")
+    refund_reply = await client.post("/v1/prepaid/refunds/status", json=signed(refunds))
+    assert refund_reply.status_code == 200 and refund_reply.json() == []
+    assert "X-KasGate-Credit-Summary" not in refund_reply.headers
     public = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
-    assert public.status_code == 200 and HEADER_CREDIT_SUMMARY not in public.headers
+    assert public.status_code == 200 and isinstance(public.json(), list)
+    assert "X-KasGate-Credit-Summary" not in public.headers
+
+
+async def test_signed_credit_status_is_empty_when_the_buyer_has_no_credits(
+    client: httpx.AsyncClient, shop: Seed
+) -> None:
+    challenge = await _credit_status_challenge(client)
+    reply = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
+    assert reply.status_code == 200, reply.text
+    status = BuyerCreditStatus.model_validate(reply.json())
+    assert status.merchant_id == shop.merchant_id
+    assert (status.credited_sompi, status.credit_balance_sompi, status.refundable_sompi) == ("0", "0", "0")
+    assert status.credit_count == 0 and status.credits == []
+
+
+async def test_signed_credit_status_rejects_the_wrong_key_without_burning_the_challenge(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await _credit_weather(client, upstream)
+    challenge = await _credit_status_challenge(client)
+    forged = await client.post("/v1/prepaid/credits/status", json=signed(challenge, OTHER_KEY))
+    assert forged.status_code == 400 and forged.json()["error"] == "invalid_signature"
+    ok = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
+    assert ok.status_code == 200, ok.text
+    assert BuyerCreditStatus.model_validate(ok.json()).credit_count == 1
+
+
+async def test_signed_credit_status_rejects_a_reused_challenge(client: httpx.AsyncClient, shop: Seed) -> None:
+    challenge = await _credit_status_challenge(client)
+    first = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
+    assert first.status_code == 200, first.text
+    replay = await client.post("/v1/prepaid/credits/status", json=signed(challenge))
+    assert replay.status_code in (409, 410)
+    assert replay.json()["error"] in ("challenge_replayed", "challenge_expired")
+
+
+async def test_signed_credit_and_refund_status_challenges_cannot_be_replayed_across_actions(
+    client: httpx.AsyncClient, shop: Seed, upstream: Upstream
+) -> None:
+    await fund(client)
+    await _credit_weather(client, upstream)
+    credits = await _credit_status_challenge(client)
+    refunds = await challenge_of(client, action="status")
+    cross_credits = await client.post("/v1/prepaid/credits/status", json=signed(refunds))
+    assert cross_credits.status_code == 400 and cross_credits.json()["error"] == "invalid_signature"
+    assert "status" in cross_credits.json()["message"] and CREDIT_STATUS_ACTION in cross_credits.json()["message"]
+    cross_refunds = await client.post("/v1/prepaid/refunds/status", json=signed(credits))
+    assert cross_refunds.status_code == 400 and cross_refunds.json()["error"] == "invalid_signature"
+    assert CREDIT_STATUS_ACTION in cross_refunds.json()["message"]
+    # Action mismatches do not burn the nonce, so each challenge still works on its own endpoint.
+    mine = await client.post("/v1/prepaid/credits/status", json=signed(credits))
+    assert mine.status_code == 200 and BuyerCreditStatus.model_validate(mine.json()).credit_count == 1
+    theirs = await client.post("/v1/prepaid/refunds/status", json=signed(refunds))
+    assert theirs.status_code == 200 and theirs.json() == []
+
+
+async def test_buyer_credit_status_model_is_strict(client: httpx.AsyncClient, shop: Seed, upstream: Upstream) -> None:
+    await _credit_weather(client, upstream)
+    challenge = await _credit_status_challenge(client)
+    body = (await client.post("/v1/prepaid/credits/status", json=signed(challenge))).json()
+    BuyerCreditStatus.model_validate(body)
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({**body, "extra": "nope"})
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({k: v for k, v in body.items() if k != "credited_sompi"})
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({**body, "credits": [{**body["credits"][0], "extra": 1}]})
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({**body, "credit_count": -1})
+    with pytest.raises(ValidationError):
+        BuyerCreditStatus.model_validate({**body, "credited_sompi": "01"})  # leading zero is not a BalanceSompiStr
 
 
 LAPSED = timedelta(hours=1)
