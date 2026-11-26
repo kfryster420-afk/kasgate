@@ -40,7 +40,7 @@ from tests.test_failed_delivery_credit import (
     _fail_upstream,
     _settlement,
 )
-from tests.test_prepaid import add_endpoint, debit_header, fund, get_debit_challenge
+from tests.test_prepaid import CHEAP_SOMPI, add_endpoint, debit_header, fund, get_debit_challenge, prepaid_call
 
 POLICY = "/v1/prepaid/failed-delivery-policy"
 
@@ -280,37 +280,37 @@ async def test_held_identity_under_concurrent_credit_debit_and_refund(
     assert balance.refund_hold_sompi + balance.debited_sompi <= 40_000_000 + SPLIT.merchant_sompi
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contradicts QA decision 3 (01, 2026-11-26): failed-delivery credit is call-only and never refundable "
-        "on-chain. Kept unedited and pinned (strict) so the contradiction stays visible; the replacement "
-        "invariants are in tests/test_failed_delivery_refunds.py."
-    ),
-)
-async def test_held_credited_balance_can_be_refunded_and_identity_holds(
+async def test_held_credited_balance_is_spendable_on_calls_not_refundable_and_identity_holds(
     client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
+    """Decision 3: failed-delivery credit is call-only. The earlier expectation (credit refundable on-chain in
+    full) no longer holds; a refund may take only deposited and unspent sompi."""
     await add_endpoint(sessionmaker, seeded.merchant_id, "cheap")
     _fail_upstream(upstream)
     await _exhaust(client)
-    challenge = (
-        await client.post("/v1/prepaid/refunds/challenge", json={"slug": "cheap", "payer_address": PAYER_ADDRESS})
-    ).json()
-    assert challenge["amount_sompi"] == str(SPLIT.merchant_sompi)  # credit is refundable on-chain in full
-    opened = await client.post(
-        "/v1/prepaid/refunds",
-        json={"nonce": challenge["nonce"], "signature": sign_message(challenge["message"], PAYER_KEY)},
-    )
-    assert opened.status_code == 201
-    paid = await client.post(
-        f"/v1/prepaid/refunds/{opened.json()['id']}/payout", json={"tx_id": "ab" * 32}, headers=bearer(seeded.api_key)
-    )
-    assert paid.status_code == 200
     balance = await _balance(sessionmaker, seeded.merchant_id)
-    assert balance is not None and balance.balance_sompi == 0
-    assert balance.refunded_sompi == balance.credited_sompi == SPLIT.merchant_sompi
+    assert balance is not None
+    assert balance.credited_sompi == balance.credit_balance_sompi == SPLIT.merchant_sompi
+    assert balance.refunded_sompi == 0
     assert_identity(balance)
+    # refundable = balance - hold - unspent credit = 0: a request for the credit (or the default amount) is refused.
+    too_much = await client.post(
+        "/v1/prepaid/refunds/challenge",
+        json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": SPLIT.merchant_sompi},
+    )
+    assert too_much.status_code == 409 and too_much.json()["error"] == "insufficient_balance"
+    default = await client.post("/v1/prepaid/refunds/challenge", json={"slug": "cheap", "payer_address": PAYER_ADDRESS})
+    assert default.status_code == 422 and default.json()["error"] == "refund_too_small"
+    # The credit still pays calls.
+    upstream.handler = None
+    paid = await prepaid_call(client)
+    assert paid.status_code == 200, paid.text
+    spent = await _balance(sessionmaker, seeded.merchant_id)
+    assert spent is not None
+    assert spent.credit_balance_sompi == SPLIT.merchant_sompi - CHEAP_SOMPI
+    assert spent.debited_sompi == CHEAP_SOMPI
+    assert spent.refunded_sompi == 0
+    assert_identity(spent)
 
 
 async def test_held_credit_lands_after_overdue_credit_expires(
