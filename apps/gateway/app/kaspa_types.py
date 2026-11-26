@@ -13,6 +13,7 @@ from app.config import NETWORK_ADDRESS_PREFIX, get_settings
 
 KASPA_ADDRESS_RE = re.compile(r"^(kaspa|kaspatest):[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{61,63}$")
 TX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+P2PK_SCHNORR_SCRIPT_RE = re.compile(r"20([0-9a-f]{64})ac")
 SOMPI_STR_RE = r"^[1-9][0-9]{0,17}$"
 
 MAX_SOMPI = 999_999_999_999_999_999  # 18 digits, same cap as SompiStr
@@ -48,3 +49,15 @@ def serialized_script_public_key(address: str) -> str:
     """
     script = pay_to_address_script(Address(address))
     return f"{int(script.version):04x}{str(script.script).lower()}"
+
+
+def payer_public_key(address: str) -> str | None:
+    """The x-only Schnorr key of a P2PK address (script 20 <key> ac), or None for any other address kind."""
+    try:
+        script = pay_to_address_script(Address(address))
+    except Exception:
+        return None
+    if int(script.version) != 0:
+        return None
+    match = P2PK_SCHNORR_SCRIPT_RE.fullmatch(str(script.script).lower())
+    return match.group(1) if match else None

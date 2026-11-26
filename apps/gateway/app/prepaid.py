@@ -35,25 +35,22 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import and_, case, func, literal, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
-from app.ledger import expire_balance_for, spendable_sompi
-from app.models import (
-    PREPAID_DEBIT_DEBITED,
-    Endpoint,
-    Merchant,
-    PrepaidBalance,
-    PrepaidDebit,
-    PrepaidDeposit,
-    Settlement,
+from app.ledger import (
+    credit_expiry,
+    expire_balance_for,
+    in_flight_debit_sompi,
+    refundable_sompi,
+    spendable_sompi,
 )
+from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
 from app.proxy import (
@@ -182,23 +179,6 @@ async def _lock_balance_row(
     return row[0], int(row[1])
 
 
-async def _in_flight_debit_sompi(session: AsyncSession, balance_id: uuid.UUID) -> int:
-    """Sompi already taken for a debit whose upstream has not been recorded yet (status still debited, no
-    upstream_status_code). Successful completed debits stay `debited` but have a status code; refunded rows do not
-    count. Must be read under the balance row's FOR UPDATE lock, which also serialises refunds of those debits.
-    """
-    total = (
-        await session.execute(
-            select(func.coalesce(func.sum(PrepaidDebit.amount_sompi), 0)).where(
-                PrepaidDebit.balance_id == balance_id,
-                PrepaidDebit.status == PREPAID_DEBIT_DEBITED,
-                PrepaidDebit.upstream_status_code.is_(None),
-            )
-        )
-    ).scalar_one()
-    return int(total)
-
-
 def _cap_exceeded(cap: int, current: int) -> JSONResponse:
     return _error(
         422,
@@ -259,6 +239,9 @@ def _balance_read(
         refund_hold_sompi=str(0 if balance is None else balance.refund_hold_sompi),
         spendable_sompi=str(spendable_sompi(balance)),
         expires_at=None if balance is None else balance.expires_at,
+        credited_sompi=str(0 if balance is None else balance.credited_sompi),
+        credit_balance_sompi=str(0 if balance is None else balance.credit_balance_sompi),
+        refundable_sompi=str(refundable_sompi(balance)),
     )
 
 
@@ -327,16 +310,6 @@ def _balance_read_signed(request: Request, *, address: str, slug: str, public_ke
         required=False,
         kind="balance",
     )
-
-
-async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
-    """CONTRACT v2.13: the endpoint's credit expiry override, else the merchant default; None = never expires."""
-    if endpoint.prepaid_expiry_days is not None:
-        return endpoint.prepaid_expiry_days
-    days: int | None = (
-        await session.execute(select(Merchant.prepaid_expiry_days).where(Merchant.id == endpoint.merchant_id))
-    ).scalar_one_or_none()
-    return days
 
 
 # ---------------------------------------------------------------- deposits
@@ -567,7 +540,7 @@ async def deposit(
                 )
             ).scalar_one()
         )
-        in_flight = await _in_flight_debit_sompi(session, balance_id)
+        in_flight = await in_flight_debit_sompi(session, balance_id)
         cap = get_settings().prepaid_max_balance_sompi
     except SQLAlchemyError:
         await session.rollback()
@@ -603,21 +576,10 @@ async def deposit(
         # CONTRACT v2.13: overdue credit expires before new credit lands (idempotent if already expired under the
         # cap lock; also catches an expiry that matured during settle), and the new credit gets the policy expiry.
         await expire_balance_for(session, endpoint.merchant_id, public_key)
-        days = await expiry_policy_days(session, endpoint)
-        new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)
-        next_expiry: ColumnElement[datetime | None]
-        if new_expiry is None:
-            next_expiry = literal(None, PrepaidBalance.expires_at.type)
-        else:
-            promised_never = and_(
-                PrepaidBalance.expires_at.is_(None), PrepaidBalance.balance_sompi > PrepaidBalance.refund_hold_sompi
-            )
-            next_expiry = case(
-                (promised_never, literal(None, PrepaidBalance.expires_at.type)),
-                else_=func.greatest(func.coalesce(PrepaidBalance.expires_at, new_expiry), new_expiry),
-            )
-        # Backstop: the credit only applies while it keeps the balance within the cap. The row is locked above, so a
-        # miss means the cap moved under a settled deposit: it is dead-lettered below, never silently credited.
+        _new_expiry, next_expiry = await credit_expiry(session, endpoint)
+        # Backstop: the credit only applies while it keeps the balance (plus in-flight debits) within the cap. The
+        # row is locked above, so a miss means the cap moved under a settled deposit: it is dead-lettered below,
+        # never silently credited.
         credited = (
             await session.execute(
                 update(PrepaidBalance)

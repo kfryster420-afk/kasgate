@@ -180,7 +180,9 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     await subscribe(client, shop)
     await fund(client)
     challenge = await challenge_of(client)
-    assert (challenge.amount_sompi, challenge.spendable_sompi) == (str(CREDIT_SOMPI), str(CREDIT_SOMPI))
+    assert challenge.amount_sompi == str(CREDIT_SOMPI)
+    dumped = challenge.model_dump()
+    assert "spendable_sompi" not in dumped and "refundable_sompi" not in dumped
     lines = challenge.message.splitlines()
     assert lines[0] == "KasGate" and "Purpose: kasgate:v1:prepaid-refund" in lines and "Action: request" in lines
     assert f"Address: {PAYER_ADDRESS}" in lines and "Refund: -" in lines

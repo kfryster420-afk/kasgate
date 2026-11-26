@@ -109,7 +109,6 @@ class RefundGateway:
             "payer_address": parsed.payer_address,
             "amount_sompi": str(amount),
             "refund_id": None if parsed.refund_id is None else str(parsed.refund_id),
-            "spendable_sompi": str(SPENDABLE),
             "expires_at": expires.isoformat(),
         } | self.overrides
         self.last = {"message": message, "amount": amount, "action": parsed.action}
@@ -196,14 +195,15 @@ async def test_mismatched_challenges_are_never_signed(rgw, make_client, override
     assert paths(rgw) == ["/v1/prepaid/refunds/challenge"]
 
 
-async def test_tampered_text_or_overreach_is_never_signed(rgw, make_client) -> None:
+async def test_tampered_text_or_a_mismatched_amount_is_never_signed(rgw, make_client) -> None:
     client: KasGateClient = make_client(rgw)
     rgw.message_override = "KasGate\nsomething else"
     with pytest.raises(InvalidChallengeError, match="does not match"):
         await client.prepaid_refund_request("http://gateway.test", "weather")
     rgw.message_override = None
+    # amount_sompi disagrees with the signed text (the unsigned challenge no longer reports spendable)
     rgw.overrides = {"amount_sompi": str(SPENDABLE + 1)}
-    with pytest.raises(InvalidChallengeError, match="more than the spendable"):
+    with pytest.raises(InvalidChallengeError, match="does not match"):
         await client.prepaid_refund_request("http://gateway.test", "weather")
     assert "/v1/prepaid/refunds" not in paths(rgw)
 

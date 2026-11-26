@@ -1,4 +1,5 @@
 import ipaddress
+import math
 from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
@@ -85,6 +86,14 @@ class Settings(BaseSettings):
     # A submitted refund payout that the node still cannot see after this long goes back to `requested` (its
     # tx_id stays on record and is still re-checked until `prepaid_payout_attempt_max_seconds`).
     prepaid_payout_pending_max_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    # Total time one upstream call may take (connect, response and body) before it counts as a timeout.
+    upstream_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    # Failed-delivery auto-credit (run by the ledger worker): a paid call whose last delivery failed is credited once
+    # its redelivery window, one full upstream attempt (UPSTREAM_TIMEOUT_SECONDS, rounded up) and this extra margin
+    # have passed, so a redelivery claimed just before the window closed has finished first.
+    failed_delivery_credit_grace_seconds: int = Field(default=30, ge=1, le=3600)
+    # How far back the sweeper looks for uncredited failed deliveries (bounds each pass).
+    failed_delivery_credit_lookback_seconds: int = Field(default=604_800, ge=3600, le=7_776_000)
     # An attempted payout tx_id the node has never confirmed is given up (`abandoned`) after this long.
     prepaid_payout_attempt_max_seconds: int = Field(default=604_800, ge=3600, le=31_536_000)
     # Re-check backoff after a transient node error on an attempted payout: base * 2^errors, capped.
@@ -103,7 +112,8 @@ class Settings(BaseSettings):
     prepaid_payout_unseen_backoff_fraction: float = Field(default=0.1, gt=0, le=1)
     # POST /v1/prepaid/refunds/{id}/payout per merchant per minute.
     rl_refund_payout_per_merchant_per_minute: int = Field(default=20, ge=1)
-    # Signed buyer refund writes (POST /v1/prepaid/refunds, /cancel, /status) per client IP per minute.
+    # Signed buyer refund/credit-status writes (POST /v1/prepaid/refunds, /cancel, /status, /credits/status)
+    # per client IP per minute.
     rl_prepaid_refund_per_minute: int = Field(default=30, ge=1)
     # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate
     # limits. Empty (default): X-Forwarded-For is ignored and the TCP peer address is the client.
@@ -127,6 +137,11 @@ class Settings(BaseSettings):
     @property
     def address_prefix(self) -> str:
         return NETWORK_ADDRESS_PREFIX[self.kaspa_network]
+
+    @property
+    def failed_delivery_credit_wait_seconds(self) -> int:
+        """Seconds after the redelivery window before the sweep may credit: one upstream attempt plus the grace."""
+        return math.ceil(self.upstream_timeout_seconds) + self.failed_delivery_credit_grace_seconds
 
     @model_validator(mode="after")
     def _treasury_matches_network(self) -> "Settings":

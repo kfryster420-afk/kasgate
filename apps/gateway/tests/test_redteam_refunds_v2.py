@@ -178,6 +178,11 @@ def _old_0008_script_dir(tmp: Path) -> Path:
     script = tmp / "alembic"
     shutil.copytree(GATEWAY_DIR / "alembic", script, ignore=shutil.ignore_patterns("__pycache__"))
     (script / "versions" / "0008_prepaid_refunds.py").write_text(old)
+    # This branch stacks 0009 on 0008. Leaving 0009 in the tree would make `upgrade head` run 0009 after the
+    # 15d7bd4 0008, which is not the "database migrated with the first 0008" this test sets up.
+    for path in (script / "versions").glob("*.py"):
+        if path.name.split("_", 1)[0].isdigit() and int(path.name.split("_", 1)[0]) > 8:
+            path.unlink()
     return script
 
 
