@@ -26,6 +26,7 @@ HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
 PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
+PREPAID_REFUNDS_READ_PURPOSE = "kasgate:v1:refunds-status-read"
 PREPAID_EMPTY_BODY_HASH = "-"
 PREPAID_RECEIPT_EXTENSION = "kasgate_prepaid_receipt"
 DEPOSIT_QUOTE_PATH = "/v1/prepaid/deposits/quote"
@@ -91,10 +92,11 @@ class PrepaidChallenge(_Model):
 
 
 class PrepaidBalance(_Model):
-    """`GET /v1/prepaid/balance`. The unsigned public read carries only `spendable_sompi` and `expires_at`; the
-    balance, the ledger totals and `updated_at` come only on a buyer-signed read (X-KasGate-Balance-Timestamp +
-    X-KasGate-Balance-Signature, which `KasGateClient.prepaid_balance` sends by default). Every other field is
-    therefore optional: read `spendable_sompi` for what calls can pay, never `balance_sompi`."""
+    """`GET /v1/prepaid/balance`. The unsigned public read returns every field, with only `spendable_sompi` and
+    `expires_at` set and the rest null (including `merchant_id`, `payer_address`, `balance_sompi` and `updated_at`).
+    A buyer-signed read (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature, which
+    `KasGateClient.prepaid_balance` sends by default) fills the rest. Every field other than spendable/expiry is
+    optional so that shape parses; read `spendable_sompi` for what calls can pay, never `balance_sompi`."""
 
     merchant_id: uuid.UUID | None = None
     payer_address: str | None = None
@@ -115,7 +117,9 @@ class PrepaidBalance(_Model):
 
 
 RefundAction = Literal["request", "cancel", "status"]
-RefundStatus = Literal["requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"]
+RefundStatus = Literal[
+    "requested", "paying", "payout_submitted", "paid", "rejected", "cancelled"
+]
 
 
 class PrepaidRefundChallenge(_Model):
@@ -135,8 +139,9 @@ class PrepaidRefund(_Model):
     """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was accepted on-chain.
 
     `paying`: the merchant claimed it and is paying (it can no longer be cancelled until `claim_expires_at`). The
-    public list hides `reason`, `last_error` and the claim (`paying` reads as `requested`, claim times null);
-    `prepaid_refunds(..., signed=True)` returns them. `hold_until`: a refund cancelled after a claim keeps its
+    GET list is buyer-signed (same headers as the balance read, Purpose `kasgate:v1:refunds-status-read`) and still
+    hides `reason`, `last_error` and the claim (`paying` reads as `requested`, claim times null);
+    `prepaid_refunds(..., signed=True)` (a POST status challenge) returns them. `hold_until`: a refund cancelled after a claim keeps its
     amount set aside until then (a payout may still land). `late_paid_from` is set when the payout landed after the
     refund was cancelled or rejected (`shortfall_sompi`: credit already gone by then)."""
 
@@ -163,17 +168,49 @@ class PrepaidRefund(_Model):
     shortfall_sompi: BalanceStr = "0"
 
 
-def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
-    """The text a buyer signs for a signed read of its own prepaid state (byte-identical to the gateway's
-    `build_prepaid_balance_read_message`). Its Purpose differs from every money-moving KasGate text, so the
-    signature authorises nothing but the read."""
+def build_prepaid_signed_read_message(
+    *, domain: str, address: str, slug: str, timestamp: int, purpose: str
+) -> str:
+    """The timestamped read text (domain, address, slug, unix seconds) used by GET /v1/prepaid/balance and
+    GET /v1/prepaid/refunds/status. Only `purpose` differs between the two, so a signature cannot be reused
+    across them."""
     return (
         "KasGate\n"
         f"Domain: {domain}\n"
-        f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Purpose: {purpose}\n"
         f"Address: {address}\n"
         f"Slug: {slug}\n"
         f"Timestamp: {timestamp}"
+    )
+
+
+def build_prepaid_balance_read_message(
+    *, domain: str, address: str, slug: str, timestamp: int
+) -> str:
+    """The text a buyer signs for a signed read of its own prepaid balance (byte-identical to the gateway's
+    `build_prepaid_balance_read_message` at fix/earlier-features a96a16a). Purpose
+    `kasgate:v1:prepaid-balance-read`; the signature authorises nothing but this read."""
+    return build_prepaid_signed_read_message(
+        domain=domain,
+        address=address,
+        slug=slug,
+        timestamp=timestamp,
+        purpose=PREPAID_BALANCE_READ_PURPOSE,
+    )
+
+
+def build_prepaid_refunds_read_message(
+    *, domain: str, address: str, slug: str, timestamp: int
+) -> str:
+    """The text a buyer signs for GET /v1/prepaid/refunds/status (byte-identical to the gateway's
+    `build_prepaid_refunds_read_message` at a96a16a). Same shape as the balance-read text; only the Purpose
+    (`kasgate:v1:refunds-status-read`) differs."""
+    return build_prepaid_signed_read_message(
+        domain=domain,
+        address=address,
+        slug=slug,
+        timestamp=timestamp,
+        purpose=PREPAID_REFUNDS_READ_PURPOSE,
     )
 
 
@@ -274,23 +311,34 @@ def validate_refund_challenge(
     InvalidChallengeError; nothing is signed when it raises.
     """
     amount = int(challenge.amount_sompi)
-    if (challenge.payer_address, challenge.slug, challenge.action, challenge.refund_id) != (
+    if (
+        challenge.payer_address,
+        challenge.slug,
+        challenge.action,
+        challenge.refund_id,
+    ) != (
         address,
         slug,
         action,
         refund_id,
     ):
-        raise InvalidChallengeError("refund challenge is for another payer, endpoint, action or refund")
+        raise InvalidChallengeError(
+            "refund challenge is for another payer, endpoint, action or refund"
+        )
     if action == "request":
         if amount_sompi is not None and amount != amount_sompi:
-            raise InvalidChallengeError(f"refund challenge names {amount} sompi, not the {amount_sompi} requested")
+            raise InvalidChallengeError(
+                f"refund challenge names {amount} sompi, not the {amount_sompi} requested"
+            )
         if amount <= 0:
             raise InvalidChallengeError("refund challenge names no amount")
     if action == "status" and amount != 0:
         raise InvalidChallengeError("a status challenge must name amount 0")
     if action == "cancel" and amount <= 0:
         raise InvalidChallengeError("refund challenge names no amount")
-    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (now or datetime.now(UTC)):
+    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (
+        now or datetime.now(UTC)
+    ):
         raise InvalidChallengeError("refund challenge has already expired")
     expected = build_prepaid_refund_message(
         domain=domain,
@@ -303,7 +351,9 @@ def validate_refund_challenge(
         expires_at=challenge.expires_at,
     )
     if challenge.message != expected:
-        raise InvalidChallengeError("refund challenge text does not match the request; refusing to sign it")
+        raise InvalidChallengeError(
+            "refund challenge text does not match the request; refusing to sign it"
+        )
     return amount
 
 
@@ -311,7 +361,9 @@ def slug_of(path: str) -> str:
     """The endpoint slug of a /p/{slug}[/...][?...] proxy path."""
     match = _PROXY_PATH_RE.fullmatch(path)
     if match is None:
-        raise InvalidChallengeError(f"{path!r} is not a KasGate proxy path (/p/<slug>...)")
+        raise InvalidChallengeError(
+            f"{path!r} is not a KasGate proxy path (/p/<slug>...)"
+        )
     return match.group(1)
 
 
@@ -335,14 +387,23 @@ def validate_debit_challenge(
     amount = int(challenge.amount_sompi)
     if amount > cap_sompi:
         raise PriceCapExceededError(amount, cap_sompi)
-    if (challenge.payer_address, challenge.method, challenge.path, challenge.body_hash) != (
+    if (
+        challenge.payer_address,
+        challenge.method,
+        challenge.path,
+        challenge.body_hash,
+    ) != (
         address,
         method,
         path,
         body_hash,
     ):
-        raise InvalidChallengeError("prepaid challenge is for another payer, method, path or body")
-    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (now or datetime.now(UTC)):
+        raise InvalidChallengeError(
+            "prepaid challenge is for another payer, method, path or body"
+        )
+    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (
+        now or datetime.now(UTC)
+    ):
         raise InvalidChallengeError("prepaid challenge has already expired")
     expected = build_prepaid_debit_message(
         domain=domain,
@@ -356,5 +417,7 @@ def validate_debit_challenge(
         expires_at=challenge.expires_at,
     )
     if challenge.message != expected:
-        raise InvalidChallengeError("prepaid challenge text does not match the request; refusing to sign it")
+        raise InvalidChallengeError(
+            "prepaid challenge text does not match the request; refusing to sign it"
+        )
     return amount

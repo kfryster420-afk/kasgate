@@ -88,19 +88,21 @@ await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  
   names (the gateway's refundable default). The unsigned challenge does not report `spendable_sompi` or
   `refundable_sompi`; those live on the signed credits/status and on `prepaid_balance`. The signature moves no coins:
   the merchant pays the amount back on-chain to this key's address, with no platform fee.
-- `GET /v1/prepaid/refunds/status` is a buyer-signed read (the gateway answers unsigned calls with 401): the SDK sends
-  `X-KasGate-Balance-Timestamp` + `X-KasGate-Balance-Signature` over the balance-read text (purpose
-  `kasgate:v1:prepaid-balance-read`, this domain, address, slug and unix time), the same read signature as
-  `prepaid_balance`; it authorises nothing else. That list hides the merchant's reject reason and claim (`paying`
-  reads as `requested`); `signed=True` signs a single-use `status` challenge (amount 0) instead to read them
+- `GET /v1/prepaid/refunds/status` is a buyer-signed read (the gateway answers unsigned, invalid or cross-purpose
+  calls with 401 `invalid_balance_signature`): the SDK sends `X-KasGate-Balance-Timestamp` +
+  `X-KasGate-Balance-Signature` over the refunds-status-read text (purpose `kasgate:v1:refunds-status-read`, this
+  domain, address, slug and unix time). Only the Purpose line differs from the balance-read text, so a signature
+  cannot be reused across the two. That list hides the merchant's reject reason and claim (`paying` reads as
+  `requested`); `signed=True` signs a single-use `status` challenge (amount 0) instead to read them
   (`claimed_at`, `claim_expires_at`). A refund cancelled after the merchant had
   claimed it keeps its amount set aside until `hold_until`; a cancel is refused while a payout of it is on-chain.
   `late_paid_from` / `shortfall_sompi` show a payout that landed after a cancel or reject.
-- `prepaid_balance` is a signed read by default (same headers as above) and reports `balance_sompi`, the ledger totals
-  (`deposited`, `debited`, `refunded`, `expired`, `refund_hold_sompi`), `updated_at`, `spendable_sompi` and
-  `expires_at`. `prepaid_balance(..., signed=False)` is the unsigned public read, which carries only `spendable_sompi`
-  and `expires_at`; every other field of `PrepaidBalance` is then `None`. Read `spendable_sompi` for what calls can pay;
-  nothing in the SDK falls back to `balance_sompi`. A balance for another payer address is refused.
+- `prepaid_balance` is a signed read by default (same headers, purpose `kasgate:v1:prepaid-balance-read`) and reports
+  `balance_sompi`, the ledger totals (`deposited`, `debited`, `refunded`, `expired`, `refund_hold_sompi`),
+  `updated_at`, `spendable_sompi` and `expires_at`. `prepaid_balance(..., signed=False)` is the unsigned public read,
+  which returns every field with only `spendable_sompi` and `expires_at` set and the rest null. Read
+  `spendable_sompi` for what calls can pay; nothing in the SDK falls back to `balance_sompi`. A 401
+  `invalid_balance_signature` is `InvalidBalanceSignatureError`. A balance for another payer address is refused.
 
 ## Failed-delivery credits (CONTRACT v2.14)
 
@@ -143,8 +145,8 @@ older = await client.credit_status("https://gw.example", "weather", before=statu
   fields rejected, sompi are decimal strings read as ints, at most 100 `credits`, each with its `credit_id`, no
   credit_id twice, `next_cursor` required and null on the last page). Errors raise the SDK's typed errors
   (`PaymentRejectedError` carries the gateway's `status_code` / `error` such as `rate_limited` or `invalid_cursor`;
-  replay `409` and expiry `410` have their own classes). The challenge's `spendable_sompi` / `refundable_sompi` are
-  informational and optional. A key with no balance gets zeros and `credits == []`.
+  replay `409` and expiry `410` have their own classes). The unsigned credits challenge no longer carries
+  `spendable_sompi` or `refundable_sompi` (they are optional if an older gateway still sends them). A key with no balance gets zeros and `credits == []`.
 - `confirm_credit(gateway_url, slug, credit, *, baseline_credited_sompi=None)` walks the signed status 100 credits per
   page (a fresh challenge each, at most `credit_page_budget` pages, default 10, restart and re-walk included) until it
   meets the hinted credit. It says `confirmed` (`basis="credit_id"`) only when a credit's `credit_id` is the header's

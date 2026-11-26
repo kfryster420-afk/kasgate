@@ -62,6 +62,7 @@ from .credit import (
 from .exceptions import (
     ConfigurationError,
     InsufficientPrepaidBalanceError,
+    InvalidBalanceSignatureError,
     InvalidChallengeError,
     KasGateError,
     PaymentExpiredError,
@@ -81,7 +82,9 @@ from .prepaid import (
     HEADER_BALANCE_TIMESTAMP,
     HEADER_PREPAID_DEBIT,
     HEADER_PREPAID_RECEIPT,
+    PREPAID_BALANCE_READ_PURPOSE,
     PREPAID_RECEIPT_EXTENSION,
+    PREPAID_REFUNDS_READ_PURPOSE,
     REFUND_CHALLENGE_PATH,
     REFUND_STATUS_PATH,
     REFUNDS_PATH,
@@ -94,7 +97,7 @@ from .prepaid import (
     PrepaidRefund,
     PrepaidRefundChallenge,
     RefundAction,
-    build_prepaid_balance_read_message,
+    build_prepaid_signed_read_message,
     prepaid_body_hash,
     slug_of,
     validate_debit_challenge,
@@ -227,7 +230,9 @@ class KasGateClient:
             or isinstance(credit_page_budget, bool)
             or not 1 <= credit_page_budget <= MAX_CREDIT_PAGE_BUDGET
         ):
-            raise ConfigurationError(f"credit_page_budget must be an integer within 1..{MAX_CREDIT_PAGE_BUDGET}")
+            raise ConfigurationError(
+                f"credit_page_budget must be an integer within 1..{MAX_CREDIT_PAGE_BUDGET}"
+            )
         if not 1_000 <= max_signature_header_bytes <= GATEWAY_MAX_HEADER_BYTES:
             raise ConfigurationError(
                 f"max_signature_header_bytes must be within 1000..{GATEWAY_MAX_HEADER_BYTES}"
@@ -312,7 +317,11 @@ class KasGateClient:
         `auto_confirm_credit`, which then reads signed status pages, one fresh challenge each, only when a hint arrived).
         """
         response = await self._paid_request(
-            method, url, max_price_kas=max_price_kas, expected_pay_to=expected_pay_to, **kwargs
+            method,
+            url,
+            max_price_kas=max_price_kas,
+            expected_pay_to=expected_pay_to,
+            **kwargs,
         )
         await self._observe_credit(response, url)
         return response
@@ -343,7 +352,9 @@ class KasGateClient:
                 if tried.status_code == 402:
                     response = tried  # trial used up or refused: the gateway's normal 402, paid below
                 else:
-                    await tried.aclose()  # e.g. 429 trial rate limit or 409: pay instead
+                    await (
+                        tried.aclose()
+                    )  # e.g. 429 trial rate limit or 409: pay instead
                     response = await self._http.request(method, url, **kwargs)
         for attempt in range(2):
             if response.status_code != 402:
@@ -417,7 +428,6 @@ class KasGateClient:
     async def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("DELETE", url, **kwargs)
 
-
     async def discover(
         self,
         gateway_url: str | httpx.URL,
@@ -472,9 +482,7 @@ class KasGateClient:
                     f"catalog request failed: {type(exc).__name__}"
                 ) from exc
             if response.status_code != 200:
-                raise ProtocolMismatchError(
-                    f"catalog answered {response.status_code}"
-                )
+                raise ProtocolMismatchError(f"catalog answered {response.status_code}")
             try:
                 last_page = CatalogPage.model_validate(response.json())
             except (ValueError, TypeError) as exc:
@@ -515,15 +523,25 @@ class KasGateClient:
         treasury outputs, fee floor, pinned fee_to, expiry). The credit is the merchant share only. `amount_sompi`
         is the explicit ceiling for this one payment; `max_price_sompi` does not apply to deposits.
         """
-        if not isinstance(amount_sompi, int) or isinstance(amount_sompi, bool) or amount_sompi <= 0:
+        if (
+            not isinstance(amount_sompi, int)
+            or isinstance(amount_sompi, bool)
+            or amount_sompi <= 0
+        ):
             raise ConfigurationError("amount_sompi must be a positive integer")
         origin = self._origin(self._absolute(gateway_url))
         floor = await self._resolve_min_output(origin)
         if amount_sompi < min_price_sompi(floor):
-            raise ConfigurationError(f"a deposit must be at least {min_price_sompi(floor)} sompi")
+            raise ConfigurationError(
+                f"a deposit must be at least {min_price_sompi(floor)} sompi"
+            )
         quoted = await self._http.post(
             origin + DEPOSIT_QUOTE_PATH,
-            json={"slug": slug, "payer_address": self.address, "amount_sompi": amount_sompi},
+            json={
+                "slug": slug,
+                "payer_address": self.address,
+                "amount_sompi": amount_sompi,
+            },
         )
         if quoted.status_code != 201:
             code, message = error_details(quoted)
@@ -531,7 +549,9 @@ class KasGateClient:
         try:
             quote = PrepaidDepositQuote.model_validate(quoted.json())
         except ValueError as exc:
-            raise InvalidChallengeError(f"deposit quote cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"deposit quote cannot be decoded: {exc}"
+            ) from exc
         challenge = quote.required
         merchant, fee = validate_challenge(
             challenge,
@@ -548,23 +568,32 @@ class KasGateClient:
             or int(quote.credit_sompi) != merchant
             or int(quote.fee_sompi) != fee
         ):
-            raise InvalidChallengeError("deposit quote does not match the requested deposit")
+            raise InvalidChallengeError(
+                "deposit quote does not match the requested deposit"
+            )
         async with self._pay_lock:
             confirmed = await self._utxo_provider(self.address)
             entries = self._ledger.available(confirmed)
             built = self._build(challenge, entries, merchant, fee, floor)
             header = self._signature_header(built, challenge.nonce)
             try:
-                paid = await self._http.post(origin + DEPOSIT_PATH, headers={HEADER_PAYMENT_SIGNATURE: header})
+                paid = await self._http.post(
+                    origin + DEPOSIT_PATH, headers={HEADER_PAYMENT_SIGNATURE: header}
+                )
                 if self._is_node_unavailable(paid):
                     await asyncio.sleep(self._retry_delay(paid))
-                    paid = await self._http.post(origin + DEPOSIT_PATH, headers={HEADER_PAYMENT_SIGNATURE: header})
+                    paid = await self._http.post(
+                        origin + DEPOSIT_PATH,
+                        headers={HEADER_PAYMENT_SIGNATURE: header},
+                    )
             except BaseException:
                 self._ledger.quarantine(built)
                 raise
             return self._finish_deposit(paid, built, merchant)
 
-    def _finish_deposit(self, response: httpx.Response, built: BuiltPayment, credit: int) -> PrepaidDepositReceipt:
+    def _finish_deposit(
+        self, response: httpx.Response, built: BuiltPayment, credit: int
+    ) -> PrepaidDepositReceipt:
         status = response.status_code
         if status not in (200, 201):
             code, message = error_details(response)
@@ -584,7 +613,9 @@ class KasGateClient:
             receipt = PrepaidDepositReceipt.model_validate(response.json())
         except ValueError as exc:
             self._ledger.quarantine(built)
-            raise PaymentReceiptError(f"deposit receipt cannot be decoded: {exc}", response, built.tx_id) from exc
+            raise PaymentReceiptError(
+                f"deposit receipt cannot be decoded: {exc}", response, built.tx_id
+            ) from exc
         if (
             parsed.txId != built.tx_id
             or parsed.network != self.network
@@ -593,24 +624,43 @@ class KasGateClient:
         ):
             self._ledger.quarantine(built)
             raise PaymentReceiptError(
-                "deposit receipt does not match the transaction we signed", response, built.tx_id
+                "deposit receipt does not match the transaction we signed",
+                response,
+                built.tx_id,
             )
         self._ledger.mark_spent(built)
         return receipt
 
-    def _signed_read_headers(self, url: httpx.URL, slug: str) -> dict[str, str]:
+    def _signed_read_headers(
+        self, url: httpx.URL, slug: str, *, purpose: str
+    ) -> dict[str, str]:
         """Headers for a buyer-signed read (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature).
 
-        Signs `build_prepaid_balance_read_message` (this gateway's domain, this address, `slug`, the time): a read
-        only, it authorises no payment, debit or refund. Used for the balance and the refund list."""
+        Signs `build_prepaid_signed_read_message` for this gateway's domain, this address, `slug`, the time and
+        `purpose`: a read only, it authorises no payment, debit or refund. `purpose` is
+        `PREPAID_BALANCE_READ_PURPOSE` for GET /balance and `PREPAID_REFUNDS_READ_PURPOSE` for GET /refunds/status;
+        a signature for one cannot be reused on the other."""
         timestamp = int(time.time())
-        message = build_prepaid_balance_read_message(
-            domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
+        message = build_prepaid_signed_read_message(
+            domain=url.netloc.decode("ascii").lower(),
+            address=self.address,
+            slug=slug,
+            timestamp=timestamp,
+            purpose=purpose,
         )
         return {
             HEADER_BALANCE_TIMESTAMP: str(timestamp),
             HEADER_BALANCE_SIGNATURE: kaspa.sign_message(message, self._private_key),
         }
+
+    @staticmethod
+    def _raise_signed_read_error(response: httpx.Response) -> None:
+        """Raise a typed error for a failed signed or public prepaid read. 401 invalid_balance_signature
+        (unsigned, invalid, expired or cross-purpose) is InvalidBalanceSignatureError."""
+        code, message = error_details(response)
+        if response.status_code == 401 and code == "invalid_balance_signature":
+            raise InvalidBalanceSignatureError(401, code, message, response)
+        raise PaymentRejectedError(response.status_code, code, message, response)
 
     async def prepaid_balance(
         self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = True
@@ -625,17 +675,24 @@ class KasGateClient:
         response = await self._http.get(
             origin + BALANCE_PATH,
             params={"slug": slug, "payer_address": self.address},
-            headers=self._signed_read_headers(url, slug) if signed else None,
+            headers=self._signed_read_headers(
+                url, slug, purpose=PREPAID_BALANCE_READ_PURPOSE
+            )
+            if signed
+            else None,
         )
         if response.status_code != 200:
-            code, message = error_details(response)
-            raise PaymentRejectedError(response.status_code, code, message, response)
+            self._raise_signed_read_error(response)
         try:
             balance = PrepaidBalance.model_validate(response.json())
         except ValueError as exc:
-            raise PaymentReceiptError(f"prepaid balance cannot be decoded: {exc}", response) from exc
+            raise PaymentReceiptError(
+                f"prepaid balance cannot be decoded: {exc}", response
+            ) from exc
         if balance.payer_address is not None and balance.payer_address != self.address:
-            raise PaymentReceiptError("prepaid balance is for another payer address", response)
+            raise PaymentReceiptError(
+                "prepaid balance is for another payer address", response
+            )
         return balance
 
     # ------------------------------------------------------------------ failed-delivery credit (CONTRACT v2.14)
@@ -662,7 +719,12 @@ class KasGateClient:
         """
         try:
             page = CreditStatusRequest.model_validate(
-                {"nonce": "0" * 32, "signature": "0" * 128, "before": before, "limit": limit}
+                {
+                    "nonce": "0" * 32,
+                    "signature": "0" * 128,
+                    "before": before,
+                    "limit": limit,
+                }
             )
         except ValueError as exc:
             raise ConfigurationError(
@@ -677,11 +739,15 @@ class KasGateClient:
         )
         if challenged.status_code != 201:
             code, message = error_details(challenged)
-            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+            raise PaymentRejectedError(
+                challenged.status_code, code, message, challenged
+            )
         try:
             challenge = CreditStatusChallenge.model_validate(challenged.json())
         except ValueError as exc:
-            raise InvalidChallengeError(f"credits challenge cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"credits challenge cannot be decoded: {exc}"
+            ) from exc
         validate_credit_challenge(
             challenge,
             domain=url.netloc.decode("ascii").lower(),
@@ -694,7 +760,9 @@ class KasGateClient:
             before=page.before,
             limit=page.limit,
         )
-        response = await self._http.post(origin + CREDIT_STATUS_PATH, json=signed.body())
+        response = await self._http.post(
+            origin + CREDIT_STATUS_PATH, json=signed.body()
+        )
         if response.status_code != 200:
             code, message = error_details(response)
             if response.status_code == 409 and code == "challenge_replayed":
@@ -705,14 +773,18 @@ class KasGateClient:
         try:
             status = BuyerCreditStatus.model_validate(response.json())
         except ValueError as exc:
-            raise PaymentReceiptError(f"credit status cannot be decoded: {exc}", response) from exc
+            raise PaymentReceiptError(
+                f"credit status cannot be decoded: {exc}", response
+            ) from exc
         if status.merchant_id != challenge.merchant_id:
             raise PaymentReceiptError(
                 "credit status is for another merchant than the signed challenge",
                 response,
             )
         if page.limit is not None and len(status.credits) > page.limit:
-            raise PaymentReceiptError("credit status lists more credits than the requested limit", response)
+            raise PaymentReceiptError(
+                "credit status lists more credits than the requested limit", response
+            )
         return status
 
     async def _walk_credit_status(
@@ -737,9 +809,16 @@ class KasGateClient:
             found = False
             while pages < self.credit_page_budget:
                 try:
-                    page = await self.credit_status(gateway_url, slug, before=cursor, limit=MAX_STATUS_CREDITS)
+                    page = await self.credit_status(
+                        gateway_url, slug, before=cursor, limit=MAX_STATUS_CREDITS
+                    )
                 except PaymentRejectedError as exc:
-                    if exc.status_code == 400 and exc.code == "invalid_cursor" and cursor is not None and not restarted:
+                    if (
+                        exc.status_code == 400
+                        and exc.code == "invalid_cursor"
+                        and cursor is not None
+                        and not restarted
+                    ):
                         pages += 1
                         restarted = True
                         first, seen, cursors, cursor = None, {}, set(), None
@@ -749,22 +828,34 @@ class KasGateClient:
                 if first is None:
                     first = page
                 elif page.merchant_id != first.merchant_id:
-                    raise PaymentReceiptError("credit status pages are for different merchants", None)
+                    raise PaymentReceiptError(
+                        "credit status pages are for different merchants", None
+                    )
                 for item in page.credits:
                     if seen.setdefault(item.credit_id, item) != item:
-                        raise PaymentReceiptError("credit status pages list one credit_id twice, differently", None)
-                if any(item.credit_id == hint.creditId or item.tx_id == hint.txId for item in page.credits):
+                        raise PaymentReceiptError(
+                            "credit status pages list one credit_id twice, differently",
+                            None,
+                        )
+                if any(
+                    item.credit_id == hint.creditId or item.tx_id == hint.txId
+                    for item in page.credits
+                ):
                     found = True
                     break
                 if page.next_cursor is None:
                     complete = True
                     break
                 if page.next_cursor in cursors:
-                    raise PaymentReceiptError("credit status pages do not advance", None)
+                    raise PaymentReceiptError(
+                        "credit status pages do not advance", None
+                    )
                 cursors.add(page.next_cursor)
                 cursor = page.next_cursor
             if first is None:
-                raise PaymentReceiptError("the credit page budget ran out before a status page was read", None)
+                raise PaymentReceiptError(
+                    "the credit page budget ran out before a status page was read", None
+                )
             if found or not complete:
                 return first, list(seen.values()), complete, pages
             if first.credit_count <= len(seen):
@@ -801,9 +892,13 @@ class KasGateClient:
             or not isinstance(baseline_credited_sompi, int)
             or baseline_credited_sompi < 0
         ):
-            raise ConfigurationError("baseline_credited_sompi must be a non-negative integer or None")
+            raise ConfigurationError(
+                "baseline_credited_sompi must be a non-negative integer or None"
+            )
         try:
-            first, items, complete, pages = await self._walk_credit_status(gateway_url, slug, observation.hint)
+            first, items, complete, pages = await self._walk_credit_status(
+                gateway_url, slug, observation.hint
+            )
         except PaymentRejectedError as exc:
             confirmation = CreditConfirmation(
                 confirmed=False,
@@ -849,15 +944,21 @@ class KasGateClient:
         if isinstance(credit, httpx.Response):
             found = credit.extensions.get(CREDIT_EXTENSION)
             if not isinstance(found, CreditObservation):
-                raise ConfigurationError("the response carries no X-KasGate-Credit hint")
+                raise ConfigurationError(
+                    "the response carries no X-KasGate-Credit hint"
+                )
             return found
         if isinstance(credit, FailedDeliveryCreditHint):
             return CreditObservation(status="hint", hint=credit)
         if isinstance(credit, CreditObservation):
             return credit
-        raise ConfigurationError("credit must be a response, a CreditObservation or a FailedDeliveryCreditHint")
+        raise ConfigurationError(
+            "credit must be a response, a CreditObservation or a FailedDeliveryCreditHint"
+        )
 
-    async def _observe_credit(self, response: httpx.Response, url: str | httpx.URL) -> None:
+    async def _observe_credit(
+        self, response: httpx.Response, url: str | httpx.URL
+    ) -> None:
         """Attach the credit observation of `response` (never raises, never leaves a header unexamined)."""
         raw = response.headers.get(HEADER_CREDIT)
         if raw is None:
@@ -875,7 +976,9 @@ class KasGateClient:
             try:
                 target = self._absolute(url)
                 slug = slug_of(target.raw_path.decode("ascii"))
-                observation = await self.confirm_credit(self._origin(target), slug, observation)
+                observation = await self.confirm_credit(
+                    self._origin(target), slug, observation
+                )
             except (KasGateError, ValueError, UnicodeError) as exc:
                 observation = CreditObservation(
                     status="unconfirmed",
@@ -923,12 +1026,18 @@ class KasGateClient:
         if challenged.status_code != 201:
             code, message = error_details(challenged)
             if code == "insufficient_balance":
-                raise InsufficientPrepaidBalanceError(challenged.status_code, code, message, challenged)
-            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+                raise InsufficientPrepaidBalanceError(
+                    challenged.status_code, code, message, challenged
+                )
+            raise PaymentRejectedError(
+                challenged.status_code, code, message, challenged
+            )
         try:
             challenge = PrepaidChallenge.model_validate(challenged.json())
         except ValueError as exc:
-            raise InvalidChallengeError(f"prepaid challenge cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"prepaid challenge cannot be decoded: {exc}"
+            ) from exc
         validate_debit_challenge(
             challenge,
             domain=request.url.netloc.decode("ascii").lower(),
@@ -953,16 +1062,27 @@ class KasGateClient:
             if response.status_code == 402 and code == "payment_expired":
                 raise PaymentExpiredError(402, code, message, response)
             if response.status_code in (402, 503):
-                raise PaymentRejectedError(response.status_code, code, message, response)
+                raise PaymentRejectedError(
+                    response.status_code, code, message, response
+                )
             if 200 <= response.status_code < 300:
-                raise PaymentReceiptError("prepaid call succeeded without a debit receipt", response)
+                raise PaymentReceiptError(
+                    "prepaid call succeeded without a debit receipt", response
+                )
             return response
         try:
             receipt = PrepaidReceipt.from_header(raw_receipt)
         except ValueError as exc:
-            raise PaymentReceiptError(f"prepaid receipt cannot be decoded: {exc}", response) from exc
-        if receipt.nonce != challenge.nonce or receipt.amountSompi != challenge.amount_sompi:
-            raise PaymentReceiptError("prepaid receipt does not match the signed debit", response)
+            raise PaymentReceiptError(
+                f"prepaid receipt cannot be decoded: {exc}", response
+            ) from exc
+        if (
+            receipt.nonce != challenge.nonce
+            or receipt.amountSompi != challenge.amount_sompi
+        ):
+            raise PaymentReceiptError(
+                "prepaid receipt does not match the signed debit", response
+            )
         response.extensions[PREPAID_RECEIPT_EXTENSION] = receipt
         return response
 
@@ -975,44 +1095,58 @@ class KasGateClient:
         when `amount_sompi` is None; at least 0.2 KAS). The amount is held at once; the merchant then pays it
         on-chain from their own wallet (no platform fee) and the refund becomes `paid`. Poll `prepaid_refunds`."""
         if amount_sompi is not None and (
-            not isinstance(amount_sompi, int) or isinstance(amount_sompi, bool) or amount_sompi <= 0
+            not isinstance(amount_sompi, int)
+            or isinstance(amount_sompi, bool)
+            or amount_sompi <= 0
         ):
             raise ConfigurationError("amount_sompi must be a positive integer or None")
-        return await self._signed_refund(gateway_url, slug, "request", amount_sompi, None)
+        return await self._signed_refund(
+            gateway_url, slug, "request", amount_sompi, None
+        )
 
     async def prepaid_refund_cancel(
         self, gateway_url: str | httpx.URL, slug: str, refund_id: uuid.UUID | str
     ) -> PrepaidRefund:
         """Withdraw a refund the merchant has not paid yet; the held credit becomes spendable again."""
-        return await self._signed_refund(gateway_url, slug, "cancel", None, uuid.UUID(str(refund_id)))
+        return await self._signed_refund(
+            gateway_url, slug, "cancel", None, uuid.UUID(str(refund_id))
+        )
 
     async def prepaid_refunds(
         self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = False
     ) -> list[PrepaidRefund]:
         """This key's refunds at the merchant behind `slug`, newest first.
 
-        Default: `GET /v1/prepaid/refunds/status` as a buyer-signed read (the same timestamped read signature as
-        `prepaid_balance`; the gateway answers unsigned calls with 401). The merchant's reject `reason` and payout
-        errors are withheld there. With `signed=True` it signs a single-use `status` challenge (moves nothing) and
-        posts it, and the rows include them."""
+        Default: `GET /v1/prepaid/refunds/status` as a buyer-signed read (the same timestamp and signature headers
+        as `prepaid_balance`, Purpose `kasgate:v1:refunds-status-read`; the gateway answers unsigned, invalid or
+        cross-purpose calls with 401 `invalid_balance_signature`). The merchant's reject `reason` and payout errors
+        are withheld there. With `signed=True` it signs a single-use `status` challenge (moves nothing) and posts
+        it, and the rows include them."""
         if signed:
-            origin, (_, signed_body) = await self._sign_refund_challenge(gateway_url, slug, "status", None, None)
-            response = await self._http.post(origin + REFUND_STATUS_PATH, json=signed_body)
+            origin, (_, signed_body) = await self._sign_refund_challenge(
+                gateway_url, slug, "status", None, None
+            )
+            response = await self._http.post(
+                origin + REFUND_STATUS_PATH, json=signed_body
+            )
         else:
             url = self._absolute(gateway_url)
             origin = self._origin(url)
             response = await self._http.get(
                 origin + REFUND_STATUS_PATH,
                 params={"slug": slug, "payer_address": self.address},
-                headers=self._signed_read_headers(url, slug),
+                headers=self._signed_read_headers(
+                    url, slug, purpose=PREPAID_REFUNDS_READ_PURPOSE
+                ),
             )
         if response.status_code != 200:
-            code, message = error_details(response)
-            raise PaymentRejectedError(response.status_code, code, message, response)
+            self._raise_signed_read_error(response)
         try:
             return [PrepaidRefund.model_validate(item) for item in response.json()]
         except (ValueError, TypeError) as exc:
-            raise InvalidChallengeError(f"refund list cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"refund list cannot be decoded: {exc}"
+            ) from exc
 
     async def _signed_refund(
         self,
@@ -1025,7 +1159,9 @@ class KasGateClient:
         origin, (challenge, signed) = await self._sign_refund_challenge(
             gateway_url, slug, action, amount_sompi, refund_id
         )
-        target = REFUNDS_PATH if refund_id is None else f"{REFUNDS_PATH}/{refund_id}/cancel"
+        target = (
+            REFUNDS_PATH if refund_id is None else f"{REFUNDS_PATH}/{refund_id}/cancel"
+        )
         response = await self._http.post(origin + target, json=signed)
         if response.status_code not in (200, 201):
             code, message = error_details(response)
@@ -1035,9 +1171,15 @@ class KasGateClient:
         try:
             refund = PrepaidRefund.model_validate(response.json())
         except ValueError as exc:
-            raise PaymentReceiptError(f"refund cannot be decoded: {exc}", response) from exc
-        if refund.payer_address != self.address or int(refund.amount_sompi) != int(challenge.amount_sompi):
-            raise PaymentReceiptError("refund does not match the signed request", response)
+            raise PaymentReceiptError(
+                f"refund cannot be decoded: {exc}", response
+            ) from exc
+        if refund.payer_address != self.address or int(refund.amount_sompi) != int(
+            challenge.amount_sompi
+        ):
+            raise PaymentReceiptError(
+                "refund does not match the signed request", response
+            )
         return refund
 
     async def _sign_refund_challenge(
@@ -1052,7 +1194,11 @@ class KasGateClient:
         {nonce, signature}))."""
         url = self._absolute(gateway_url)
         origin = self._origin(url)
-        body: dict[str, Any] = {"slug": slug, "payer_address": self.address, "action": action}
+        body: dict[str, Any] = {
+            "slug": slug,
+            "payer_address": self.address,
+            "action": action,
+        }
         if amount_sompi is not None:
             body["amount_sompi"] = amount_sompi
         if refund_id is not None:
@@ -1061,12 +1207,18 @@ class KasGateClient:
         if challenged.status_code != 201:
             code, message = error_details(challenged)
             if code == "insufficient_balance":
-                raise InsufficientPrepaidBalanceError(challenged.status_code, code, message, challenged)
-            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+                raise InsufficientPrepaidBalanceError(
+                    challenged.status_code, code, message, challenged
+                )
+            raise PaymentRejectedError(
+                challenged.status_code, code, message, challenged
+            )
         try:
             challenge = PrepaidRefundChallenge.model_validate(challenged.json())
         except ValueError as exc:
-            raise InvalidChallengeError(f"refund challenge cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"refund challenge cannot be decoded: {exc}"
+            ) from exc
         validate_refund_challenge(
             challenge,
             domain=url.netloc.decode("ascii").lower(),
@@ -1076,23 +1228,31 @@ class KasGateClient:
             amount_sompi=amount_sompi,
             refund_id=refund_id,
         )
-        signed = {"nonce": challenge.nonce, "signature": kaspa.sign_message(challenge.message, self._private_key)}
+        signed = {
+            "nonce": challenge.nonce,
+            "signature": kaspa.sign_message(challenge.message, self._private_key),
+        }
         return origin, (challenge, signed)
 
     # ------------------------------------------------------------------ free trial calls (CONTRACT v2.12)
 
-    async def trial_status(self, gateway_url: str | httpx.URL, slug: str) -> TrialStatus:
+    async def trial_status(
+        self, gateway_url: str | httpx.URL, slug: str
+    ) -> TrialStatus:
         """How many free trial calls this key has left on `slug` (public read; never signs)."""
         origin = self._origin(self._absolute(gateway_url))
         response = await self._http.get(
-            origin + TRIAL_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
+            origin + TRIAL_STATUS_PATH,
+            params={"slug": slug, "payer_address": self.address},
         )
         if response.status_code != 200:
             code, message = error_details(response)
             raise PaymentRejectedError(response.status_code, code, message, response)
         return TrialStatus.model_validate(response.json())
 
-    async def trial_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    async def trial_request(
+        self, method: str, url: str | httpx.URL, **kwargs: Any
+    ) -> httpx.Response:
         """Make ONE /p/{slug} call from this key's free trial and never pay: raises PaymentRejectedError (code
         `trial_exhausted`) when no trial call is left. The receipt is `trial_receipt_of(response)`; a failed upstream
         (no response or 5xx) gives the trial call back and the receipt says `refunded`."""
@@ -1135,11 +1295,15 @@ class KasGateClient:
             if not strict:
                 return None
             code, message = error_details(challenged)
-            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+            raise PaymentRejectedError(
+                challenged.status_code, code, message, challenged
+            )
         try:
             challenge = TrialChallenge.model_validate(challenged.json())
         except ValueError as exc:
-            raise InvalidChallengeError(f"trial challenge cannot be decoded: {exc}") from exc
+            raise InvalidChallengeError(
+                f"trial challenge cannot be decoded: {exc}"
+            ) from exc
         validate_trial_challenge(
             challenge,
             domain=request.url.netloc.decode("ascii").lower(),
@@ -1163,16 +1327,24 @@ class KasGateClient:
                 if response.status_code == 402 and code == "payment_expired":
                     raise PaymentExpiredError(402, code, message, response)
                 if response.status_code in (402, 429, 503):
-                    raise PaymentRejectedError(response.status_code, code, message, response)
+                    raise PaymentRejectedError(
+                        response.status_code, code, message, response
+                    )
                 if 200 <= response.status_code < 300:
-                    raise PaymentReceiptError("trial call succeeded without a trial receipt", response)
+                    raise PaymentReceiptError(
+                        "trial call succeeded without a trial receipt", response
+                    )
             return response
         try:
             receipt = TrialReceipt.from_header(raw_receipt)
         except ValueError as exc:
-            raise PaymentReceiptError(f"trial receipt cannot be decoded: {exc}", response) from exc
+            raise PaymentReceiptError(
+                f"trial receipt cannot be decoded: {exc}", response
+            ) from exc
         if receipt.nonce != challenge.nonce:
-            raise PaymentReceiptError("trial receipt does not match the signed trial call", response)
+            raise PaymentReceiptError(
+                "trial receipt does not match the signed trial call", response
+            )
         response.extensions[TRIAL_RECEIPT_EXTENSION] = receipt
         return response
 
