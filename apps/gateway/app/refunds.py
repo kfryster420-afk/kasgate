@@ -1135,7 +1135,11 @@ async def claim_refund(
                 status=PREPAID_REFUND_PAYING,
                 claimed_at=func.now(),
                 first_claimed_at=func.coalesce(PrepaidRefund.first_claimed_at, func.now()),
-                first_claimed_daa_score=func.coalesce(PrepaidRefund.first_claimed_daa_score, daa),
+                # Written only with the first first_claimed_at: a null score from a node outage stays null
+                # (the pre-cancel UTXO filter is skipped). A renewal must never backfill a later virtual DAA.
+                first_claimed_daa_score=case(
+                    (PrepaidRefund.first_claimed_at.is_(None), daa), else_=PrepaidRefund.first_claimed_daa_score
+                ),
                 updated_at=func.now(),
             )
             .returning(PrepaidRefund)
