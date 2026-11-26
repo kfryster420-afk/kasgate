@@ -52,9 +52,10 @@ from tests.conftest import (
     paid_headers,
     seed_endpoint,
 )
-from tests.test_prepaid import SECOND_MERCHANT_ADDRESS, add_endpoint, fund, prepaid_call
+from tests.test_prepaid import CREDIT_SOMPI, DEPOSIT_SOMPI, SECOND_MERCHANT_ADDRESS, add_endpoint, fund, prepaid_call
 
 TX = "cd" * 32
+TX2 = "ce" * 32
 SPLIT = compute_fee_split(PRICE_SOMPI)
 HOOK_URL = "https://hooks.example.com/kasgate"
 WINDOW_PAST = 600 + 60 + 5  # redelivery window + default grace + margin
@@ -676,3 +677,150 @@ async def test_credit_counts_toward_the_balance_identity(
         ).one()
     assert row[0] == row[1] == 40_000_000 + SPLIT.merchant_sompi
     assert row[2] == 1
+
+
+# ---------------------------------------------------------------- expiry and the balance cap
+
+
+async def _set_expiry_policy(client: httpx.AsyncClient, seed: Seed, days: int | None) -> None:
+    response = await client.patch("/v1/merchants/me", json={"prepaid_expiry_days": days}, headers=bearer(seed.api_key))
+    assert response.status_code == 200, response.text
+
+
+def _expires_around(value: datetime | None, before: datetime, days: int) -> None:
+    assert value is not None
+    assert before + timedelta(days=days) - timedelta(minutes=1) <= value <= datetime.now(UTC) + timedelta(days=days)
+
+
+async def test_credit_extends_expiry_like_a_deposit_and_never_shortens_it(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """expires_at = max(current, now + policy at credit time); a later current expiry is kept."""
+    await _set_expiry_policy(client, seeded, 30)
+    _fail_upstream(upstream)
+    before = datetime.now(UTC)
+    await _exhaust(client, TX)
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    first = row.expires_at
+    _expires_around(first, before, 30)
+
+    await _set_expiry_policy(client, seeded, 7)
+    assert (await _balance(sessionmaker, seeded.merchant_id)).expires_at == first  # not retroactive
+
+    await _exhaust(client, TX2)
+    later = await _balance(sessionmaker, seeded.merchant_id)
+    assert later is not None and later.expires_at == first  # a 7-day policy must not shorten the 30-day expiry
+    assert later.credited_sompi == 2 * SPLIT.merchant_sompi
+
+
+async def test_credit_extends_an_earlier_existing_expiry(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await _set_expiry_policy(client, seeded, 7)
+    _fail_upstream(upstream)
+    await _exhaust(client, TX)
+    early = datetime.now(UTC) + timedelta(days=1)
+    async with sessionmaker() as session:
+        await session.execute(update(PrepaidBalance).values(expires_at=early))
+        await session.commit()
+    await _set_expiry_policy(client, seeded, 30)
+    before = datetime.now(UTC)
+    await _exhaust(client, TX2)
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None and row.expires_at is not None and row.expires_at > early
+    _expires_around(row.expires_at, before, 30)
+
+
+async def test_credit_expiry_is_not_retroactive_for_credit_promised_never_to_expire(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    _fail_upstream(upstream)
+    await _exhaust(client, TX)
+    assert (await _balance(sessionmaker, seeded.merchant_id)).expires_at is None
+    await _set_expiry_policy(client, seeded, 7)
+    await _exhaust(client, TX2)
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None and row.expires_at is None  # promised "never" stays, like a deposit
+    assert row.credited_sompi == 2 * SPLIT.merchant_sompi
+
+
+async def test_a_never_policy_credit_clears_the_existing_expiry(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await _set_expiry_policy(client, seeded, 7)
+    _fail_upstream(upstream)
+    await _exhaust(client, TX)
+    assert (await _balance(sessionmaker, seeded.merchant_id)).expires_at is not None
+    await _set_expiry_policy(client, seeded, None)
+    await _exhaust(client, TX2)
+    assert (await _balance(sessionmaker, seeded.merchant_id)).expires_at is None
+
+
+async def test_credit_uses_the_expiry_policy_in_force_at_credit_time(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await _set_expiry_policy(client, seeded, 1)
+    _fail_upstream(upstream)
+    response = await client.get("/p/weather", headers=await paid_headers(client, TX))
+    assert response.status_code == 502
+    assert HEADER_FAILED_DELIVERY_CREDIT not in response.headers
+    await _age(sessionmaker, WINDOW_PAST)
+    await _set_expiry_policy(client, seeded, 30)
+    before = datetime.now(UTC)
+    assert await sweep_failed_deliveries(sessionmaker, limit=10) == 1
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    _expires_around(row.expires_at, before, 30)
+    [entry] = await _credits(sessionmaker)
+    assert entry.credit_reason == "window_expired"
+
+
+async def test_credit_expires_overdue_credit_before_adding_the_new_credit(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await _set_expiry_policy(client, seeded, 1)
+    _fail_upstream(upstream)
+    await _exhaust(client, TX)
+    async with sessionmaker() as session:
+        await session.execute(update(PrepaidBalance).values(expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+        await session.commit()
+    before = datetime.now(UTC)
+    await _exhaust(client, TX2)
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    assert (row.expired_sompi, row.credited_sompi, row.balance_sompi) == (
+        SPLIT.merchant_sompi,
+        2 * SPLIT.merchant_sompi,
+        SPLIT.merchant_sompi,
+    )
+    _expires_around(row.expires_at, before, 1)
+
+
+async def test_credit_may_exceed_prepaid_max_balance_as_restitution(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: SettingsOverride,
+) -> None:
+    """A failed-delivery credit is restitution of sompi the buyer already paid, so it may exceed the deposit cap."""
+    await add_endpoint(sessionmaker, seeded.merchant_id, "cheap")
+    await fund(client)
+    override_settings(prepaid_max_balance_sompi=DEPOSIT_SOMPI)
+    refused = await client.post(
+        "/v1/prepaid/deposits/quote",
+        json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": DEPOSIT_SOMPI},
+    )
+    assert refused.status_code == 422 and "cap" in refused.json()["detail"]
+    _fail_upstream(upstream)
+    receipt = _receipt((await _exhaust(client))[-1])
+    assert int(receipt.creditSompi) == SPLIT.merchant_sompi
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    assert (row.deposited_sompi, row.credited_sompi, row.balance_sompi) == (
+        CREDIT_SOMPI,
+        SPLIT.merchant_sompi,
+        CREDIT_SOMPI + SPLIT.merchant_sompi,
+    )
+    assert row.balance_sompi > DEPOSIT_SOMPI

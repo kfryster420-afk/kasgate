@@ -4,7 +4,7 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 
 ## Unreleased
 
-### Added: failed-delivery auto-credit (proposed CONTRACT v2.14, after v2.13)
+### Added: failed-delivery auto-credit (CONTRACT v2.14, after v2.13 / PR #1)
 
 - When a paid call's upstream answers 5xx or not at all and redelivery is closed (the last allowed delivery failed,
   or the redelivery window plus `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` passed), the merchant share of the payment is
@@ -21,7 +21,13 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - k402 `kaspa-utxo` payments, non-P2PK payers and prepaid deposits are never credited.
 - Alembic migration `0009_failed_delivery_credits` (down_revision `0008_prepaid_refunds`, guarded downgrade).
 - Settings: `FAILED_DELIVERY_CREDIT_GRACE_SECONDS`, `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
-- Docs: [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md), runbook.
+- A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never
+  shortens a later expiry, never retroactive.
+- A credit may exceed `PREPAID_MAX_BALANCE_SOMPI` (restitution of an already-paid call); a deposit still may not.
+- Out of scope: no per-endpoint opt-out, no public credit lookup. Buyer-facing credit status will follow #1's
+  buyer-signed status endpoint; SDK/MCP parsing of `X-KasGate-Credit` is a follow-up.
+- Docs: [docs/CONTRACTS.md](docs/CONTRACTS.md) v2.14, [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md),
+  runbook.
 
 ### Added: prepaid refunds and credit expiry (CONTRACT v2.13)
 

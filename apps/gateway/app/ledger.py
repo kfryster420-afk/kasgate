@@ -90,8 +90,11 @@ async def credit_expiry(
 ) -> tuple[datetime | None, ColumnElement[datetime | None]]:
     """Expiry for credit landing on a balance through `endpoint` (a deposit or a failed-delivery credit).
 
-    Returns the `expires_at` of a NEW balance and the expression for an EXISTING one: new credit gets the policy
-    expiry, an existing later expiry is kept, and a balance already promised "never expires" keeps that promise.
+    Uses the v2.13 policy in force now (the endpoint's `prepaid_expiry_days`, else the merchant default), never
+    retroactively: `expires_at = max(current expires_at, now + policy days)`. A later existing expiry is not
+    shortened. Returns the `expires_at` of a NEW balance and the expression for an EXISTING one: new credit gets
+    the policy expiry, an existing later expiry is kept, credit already promised "never expires" keeps that
+    promise, and a "never" policy clears the expiry (same rules as a deposit).
     """
     days = await expiry_policy_days(session, endpoint)
     new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)

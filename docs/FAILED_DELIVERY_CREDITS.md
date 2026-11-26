@@ -7,8 +7,7 @@ spent. With failed-delivery auto-credit, the **merchant share** of such a paymen
 buyer at that merchant (CONTRACT v2.13 prepaid balance, scheme `kasgate-prepaid-v1`), spendable on any of the
 merchant's endpoints with ordinary `X-KasGate-Prepaid` debits.
 
-Proposed contract version: v2.14 (additive; the contract text is in the PR description and goes into
-docs/CONTRACTS.md after the v2.13 refunds work has merged).
+CONTRACT v2.14 (additive, in [CONTRACTS.md](CONTRACTS.md)) depends on v2.13 / PR #1 and must merge after it.
 
 ## When a call is credited
 
@@ -36,12 +35,16 @@ both a redelivery and a credit.
 
 `credit_sompi = settlement.merchant_amount_sompi` (output 0). The platform fee (output 1) is not reversed and
 nothing moves on-chain: the merchant was paid by the original transaction, and the credit is calls the merchant
-owes, like any prepaid balance. Before crediting, overdue credit on that balance expires (v2.13 order), and the
-credit follows the same expiry policy as a deposit on that endpoint (`prepaid_expiry_days` of the endpoint, else
-the merchant default; never shortens an existing expiry).
+owes, like any prepaid balance. Before crediting, overdue credit on that balance expires (v2.13 order). A credit
+extends the balance expiry like a deposit, using the v2.13 policy **in force at credit time** (the endpoint's
+`prepaid_expiry_days`, else the merchant default), never retroactively: `expires_at = max(current expires_at,
+now + policy days)`. A later existing expiry is never shortened. Credit already promised "never" stays
+non-expiring when a later credit lands under a policy; a "never" policy credit clears the expiry.
 
 The balance identity becomes
-`balance = deposited + credited - debited - refunded - expired`, with `credited_sompi >= 0`.
+`balance = deposited + credited - debited - refunded - expired`, with `credited_sompi >= 0`. A credit may take
+the balance above `PREPAID_MAX_BALANCE_SOMPI` (a deposit that would is still 422): this is restitution of sompi
+the buyer already paid on-chain, not a new deposit.
 
 ## Merchant policy (opt-out)
 
@@ -50,6 +53,8 @@ On by default. `GET /v1/prepaid/failed-delivery-policy` [Bearer] returns
 `{"enabled": true}` opts back in. A change is never retroactive: a call is covered only if it settled after the
 latest `enabled_at` and before `disabled_at` (if any). Opting out does not drop credits for calls that were
 settled while the policy was on. Merchants that existed before migration 0009 are covered from the upgrade time.
+There is no per-endpoint override of this opt-out (out of scope; expiry may still follow a v2.13 per-endpoint
+`prepaid_expiry_days`, because that is the deposit expiry policy, not this merchant-level credit policy).
 
 ## API
 
@@ -65,6 +70,9 @@ settled while the policy was on. Merchants that existed before migration 0009 ar
   `credited_sompi`.
 * Response header `X-KasGate-Credit` (Base64 JSON, exposed via CORS, stripped from upstream responses so an
   upstream cannot forge it): `{creditId, kind, txId, merchantId, creditSompi, balanceSompi, reason}`.
+* There is no public credit-lookup route (out of scope). Buyers see `X-KasGate-Credit` and `credited_sompi` on
+  the public balance. Buyer-facing credit status will follow the buyer-signed status endpoint from v2.13 / #1;
+  SDK and MCP parsing of `X-KasGate-Credit` is a follow-up (agent 05).
 
 ## Webhook
 
@@ -97,3 +105,9 @@ like every KasGate webhook (`X-KasGate-Signature: t=<unix>,v1=<HMAC-SHA256(secre
 
 The sweep runs in the ledger worker (`LEDGER_WORKER_ENABLED`, `LEDGER_POLL_INTERVAL_SECONDS`, batches of
 `LEDGER_BATCH_SIZE`). With the worker off, only `attempts_exhausted` credits happen.
+
+## Out of scope
+
+* No per-endpoint override of the failed-delivery opt-out policy (merchant-level only).
+* No public credit-lookup route. Buyer-facing credit status will come with #1's buyer-signed status endpoint
+  later. SDK and MCP reading of `X-KasGate-Credit` is 05's follow-up.
