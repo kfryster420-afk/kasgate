@@ -15,6 +15,7 @@ from app.api_routes import router as api_router
 from app.api_routes import well_known_router
 from app.config import get_settings
 from app.db import engine as db_engine
+from app.debit_sweeper import DebitSweeper
 from app.deps import get_sessionmaker
 from app.failed_delivery import router as failed_delivery_router
 from app.failed_delivery import sweep_pass as failed_delivery_sweep_pass
@@ -69,12 +70,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ledger_worker = ledger_worker
     if settings.ledger_worker_enabled:
         ledger_worker.start()
+    debit_sweeper = DebitSweeper(get_sessionmaker(), redis)
+    app.state.debit_sweeper = debit_sweeper
+    if settings.prepaid_debit_sweeper_enabled:
+        debit_sweeper.start()
     await kaspa_engine.start()
     try:
         yield
     finally:
         await dispatcher.stop()
         await ledger_worker.stop()
+        await debit_sweeper.stop()
         await kaspa_engine.stop()
         await webhook_client.aclose()
         await http_client.aclose()
