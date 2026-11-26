@@ -17,7 +17,7 @@ from typing_extensions import Self
 
 from .catalog import DiscoverResult
 from .client import KasGateClient
-from .credit import CreditObservation, FailedDeliveryCreditHint
+from .credit import BuyerCreditStatus, CreditObservation, FailedDeliveryCreditHint
 from .prepaid import PrepaidBalance, PrepaidDepositReceipt, PrepaidRefund
 from .trials import TrialStatus
 
@@ -90,6 +90,9 @@ class KasGateSyncClient:
 
     def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
         return self._call(self._client.prepaid_balance(gateway_url, slug))
+
+    def credit_status(self, gateway_url: str | httpx.URL, slug: str) -> BuyerCreditStatus:
+        return self._call(self._client.credit_status(gateway_url, slug))
 
     def confirm_credit(
         self,

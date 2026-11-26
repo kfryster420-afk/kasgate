@@ -7,9 +7,11 @@ signature, so the SDK never reports a credit as real from the header alone:
 
 * `credit_of(response)` returns a `CreditObservation` whose status is `hint` (parsed, not checked), `invalid`
   (malformed, oversized or inconsistent with the paid call) or, after the balance check, `confirmed` / `unconfirmed`.
-* `KasGateClient.confirm_credit()` (or `auto_confirm_credit=True`) reads the public `GET /v1/prepaid/balance` and only
-  then says `confirmed`: the balance must belong to the hinted merchant and its cumulative `credited_sompi` must
-  cover the hinted credit (and, when a baseline is known, must have grown by at least that amount).
+* `KasGateClient.confirm_credit()` (or `auto_confirm_credit=True`) asks the gateway for the buyer's SIGNED credit
+  status (`POST /v1/prepaid/credits/challenge`, sign the text with the depositing key, `POST /v1/prepaid/credits/status`)
+  and only then says `confirmed`: the status must belong to the hinted merchant and list a credit with the hinted
+  `txId`, amount and reason (at the slug that was called). Only when that payment is not among the newest 10 credits
+  does a caller-supplied `baseline_credited_sompi` allow a weaker `increase` confirmation.
 
 A credit is call-only prepaid credit at one merchant: it is not refundable and it is not spend that came back, so it
 never changes a spend budget. Parsing never raises.
@@ -19,13 +21,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
-from .prepaid import PrepaidBalance
+from .exceptions import InvalidChallengeError
+from .prepaid import build_prepaid_refund_message
 
 HEADER_CREDIT = "X-KasGate-Credit"
 CREDIT_EXTENSION = "kasgate_credit"
@@ -36,9 +41,28 @@ _TX_ID = r"^[0-9a-f]{64}$"
 _POSITIVE_SOMPI = r"^[1-9][0-9]{0,17}$"
 _BALANCE_SOMPI = r"^(?:0|[1-9][0-9]{0,17})$"
 
+# The buyer's signed credit status (same challenge store, message layout and Purpose as refunds; Action: credits).
+CREDIT_CHALLENGE_PATH = "/v1/prepaid/credits/challenge"
+CREDIT_STATUS_PATH = "/v1/prepaid/credits/status"
+CREDITS_ACTION = "credits"
+MAX_STATUS_CREDITS = 10
+
 CreditStatus = Literal["hint", "confirmed", "unconfirmed", "invalid"]
-ConfirmationBasis = Literal["increase", "cumulative", "none"]
+ConfirmationBasis = Literal["tx_id", "increase", "none"]
 CreditReason = Literal["attempts_exhausted", "window_expired"]
+_NONCE = r"^[0-9a-f]{32}$"
+_SLUG = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
+_SOMPI_RE = re.compile(_BALANCE_SOMPI)
+
+
+def _sompi(value: object) -> int:
+    """A gateway sompi value: a decimal STRING in canonical form, parsed to int (numbers and odd forms are refused)."""
+    if not isinstance(value, str) or _SOMPI_RE.fullmatch(value) is None:
+        raise ValueError("sompi must be a canonical decimal string")
+    return int(value)
+
+
+Sompi = Annotated[int, BeforeValidator(_sompi)]
 
 
 class FailedDeliveryCreditHint(BaseModel):
@@ -64,17 +88,22 @@ class FailedDeliveryCreditHint(BaseModel):
 
 
 class CreditConfirmation(BaseModel):
-    """What the balance check found. `confirmed` is True only when the public balance corroborates the hint."""
+    """What the signed credit status found. `confirmed` is True only when the gateway's own list corroborates the hint."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     confirmed: bool
     basis: ConfirmationBasis
-    """`increase`: credited_sompi grew by at least the hinted credit since `baseline_credited_sompi`.
-    `cumulative`: no baseline was known; credited_sompi only covers the hinted credit (a weaker check).
-    `none`: the check could not be completed or the balance contradicts the hint."""
+    """`tx_id`: the signed status lists a credit with the hinted txId, amount and reason.
+    `increase`: that payment is not among the newest 10 credits, so `credited_sompi` grew by at least the hinted
+    credit since the caller's `baseline_credited_sompi` (a weaker check).
+    `none`: the check could not be completed or the status contradicts the hint."""
     credited_sompi: int | None = None
     baseline_credited_sompi: int | None = None
+    http_status: int | None = None
+    """The gateway's HTTP status when the check failed because of an error answer."""
+    error_code: str | None = None
+    """The gateway's `error` code (for example `rate_limited`) when the check failed because of an error answer."""
     detail: str
 
 
@@ -138,9 +167,7 @@ def observe_credit(
     elif tx_id is not None and hint.txId != tx_id:
         problem = "the credit hint names a different payment than the one settled for this call"
     elif merchant_sompi is not None and hint.credit_sompi != merchant_sompi:
-        problem = (
-            "the hinted credit differs from the merchant share of the settled payment"
-        )
+        problem = "the hinted credit differs from the merchant share of the settled payment"
     elif hint.balance_sompi < hint.credit_sompi:
         problem = "the hinted balance is smaller than the hinted credit"
     if problem is not None:
@@ -148,56 +175,157 @@ def observe_credit(
     return CreditObservation(status="hint", hint=hint)
 
 
+class CreditStatusChallenge(BaseModel):
+    """`POST /v1/prepaid/credits/challenge` reply: sign `message` with the depositing key (strict, no extra fields)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    nonce: Annotated[str, Field(pattern=_NONCE)]
+    message: str
+    action: Literal["credits"]
+    slug: Annotated[str, Field(pattern=_SLUG)]
+    merchant_id: uuid.UUID
+    payer_address: str
+    amount_sompi: Literal["0"]
+    refund_id: None
+    spendable_sompi: Sompi
+    refundable_sompi: Sompi
+    expires_at: datetime
+
+
+class BuyerCreditItem(BaseModel):
+    """One failed-delivery credit in the signed status (newest first). Sompi strings are parsed to int."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tx_id: Annotated[str, Field(pattern=_TX_ID)]
+    slug: Annotated[str, Field(pattern=_SLUG)]
+    credit_sompi: Sompi
+    shortfall_sompi: Sompi
+    reason: CreditReason
+    created_at: datetime
+
+
+class BuyerCreditStatus(BaseModel):
+    """`POST /v1/prepaid/credits/status` reply: this key's failed-delivery credit at one merchant (CONTRACT v2.14).
+
+    Strict: unknown fields, JSON numbers where the gateway sends decimal strings, or more than 10 credits are
+    refused. Call-only credit (`credit_balance_sompi`) is never refundable; `refundable_sompi` is what a refund may
+    take. `credit_count` is the lifetime number of credits, `credits` only the newest 10."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    merchant_id: uuid.UUID
+    credited_sompi: Sompi
+    credit_balance_sompi: Sompi
+    refundable_sompi: Sompi
+    credit_count: Annotated[int, Field(strict=True, ge=0)]
+    credits: Annotated[list[BuyerCreditItem], Field(max_length=MAX_STATUS_CREDITS)]
+
+    @model_validator(mode="after")
+    def _count_covers_list(self) -> BuyerCreditStatus:
+        if self.credit_count < len(self.credits):
+            raise ValueError("credit_count is smaller than the number of credits listed")
+        return self
+
+
+def validate_credit_challenge(
+    challenge: CreditStatusChallenge,
+    *,
+    domain: str,
+    address: str,
+    slug: str,
+    now: datetime | None = None,
+) -> None:
+    """Check a credits challenge against what the SDK asked for before anything is signed.
+
+    The text is rebuilt locally (this payer, this domain, `Action: credits`, amount 0, no refund) and must equal the
+    gateway's byte for byte, so a gateway cannot get a refund-request or cancel signature out of this call.
+    Raises InvalidChallengeError; nothing is signed when it raises."""
+    if (challenge.payer_address, challenge.slug) != (address, slug):
+        raise InvalidChallengeError("credits challenge is for another payer or endpoint")
+    if challenge.expires_at.tzinfo is None or challenge.expires_at <= (now or datetime.now(UTC)):
+        raise InvalidChallengeError("credits challenge has already expired")
+    expected = build_prepaid_refund_message(
+        domain=domain,
+        action=CREDITS_ACTION,
+        address=address,
+        merchant_id=challenge.merchant_id,
+        amount_sompi=0,
+        refund_id=None,
+        nonce=challenge.nonce,
+        expires_at=challenge.expires_at,
+    )
+    if challenge.message != expected:
+        raise InvalidChallengeError("credits challenge text does not match the request; refusing to sign it")
+
+
 def judge_credit(
     hint: FailedDeliveryCreditHint,
-    balance: PrepaidBalance,
+    status: BuyerCreditStatus,
+    *,
+    slug: str | None = None,
     baseline_credited_sompi: int | None = None,
 ) -> CreditConfirmation:
-    """Compare a hint with the buyer's public prepaid balance at the merchant."""
-    if balance.credited_sompi is None:
-        return CreditConfirmation(
-            confirmed=False,
-            basis="none",
-            detail="the gateway balance does not report credited_sompi",
-        )
-    credited = int(balance.credited_sompi)
-    if balance.merchant_id != hint.merchantId:
-        return CreditConfirmation(
-            confirmed=False,
-            basis="none",
-            credited_sompi=credited,
-            baseline_credited_sompi=baseline_credited_sompi,
-            detail="the balance belongs to a different merchant than the hint",
-        )
+    """Compare a hint with the buyer's signed credit status.
+
+    Confirmed (`tx_id`) only when the status is for the hinted merchant and lists a credit with the hinted txId whose
+    amount and reason equal the hint's (and whose slug is `slug`, the endpoint that was called, when given). A listed
+    txId with different details contradicts the hint. When the txId is not listed AND older credits exist beyond the
+    newest 10, a `baseline_credited_sompi` (read before the call) allows a weaker `increase` confirmation; without it
+    the hint stays unconfirmed. If every credit is listed and none matches, the hint is simply not a credit.
+    """
+    credited = status.credited_sompi
     amount = hint.credit_sompi
-    if baseline_credited_sompi is not None:
-        grew = credited - baseline_credited_sompi
-        ok = grew >= amount
-        detail = (
-            f"credited_sompi grew by {grew} sompi (hint: {amount})"
-            if ok
-            else f"credited_sompi grew by {grew} sompi, less than the hinted {amount}"
-        )
+
+    def no(detail: str) -> CreditConfirmation:
         return CreditConfirmation(
-            confirmed=ok,
-            basis="increase",
+            confirmed=False,
+            basis="none",
             credited_sompi=credited,
             baseline_credited_sompi=baseline_credited_sompi,
             detail=detail,
         )
-    ok = credited >= amount
-    detail = (
-        f"credited_sompi is {credited} sompi, covering the hinted {amount} (no earlier balance to compare with)"
-        if ok
-        else f"credited_sompi is {credited} sompi, less than the hinted {amount}"
-    )
-    return CreditConfirmation(
-        confirmed=ok,
-        basis="cumulative",
-        credited_sompi=credited,
-        baseline_credited_sompi=None,
-        detail=detail,
-    )
+
+    if status.merchant_id != hint.merchantId:
+        return no("the credit status belongs to a different merchant than the hint")
+    item = next((entry for entry in status.credits if entry.tx_id == hint.txId), None)
+    if item is not None:
+        if item.credit_sompi != amount:
+            return no(
+                f"the gateway lists this payment with a credit of {item.credit_sompi} sompi, not the hinted {amount}"
+            )
+        if item.reason != hint.reason:
+            return no(f"the gateway lists this payment with reason {item.reason}, not the hinted {hint.reason}")
+        if slug is not None and item.slug != slug:
+            return no(f"the gateway lists this payment at endpoint {item.slug}, not {slug}")
+        return CreditConfirmation(
+            confirmed=True,
+            basis="tx_id",
+            credited_sompi=credited,
+            baseline_credited_sompi=baseline_credited_sompi,
+            detail=f"the signed credit status lists this payment with a credit of {amount} sompi",
+        )
+    if status.credit_count <= len(status.credits):
+        return no("the signed credit status lists no credit for this payment")
+    if baseline_credited_sompi is None:
+        return no(
+            f"this payment is not among the newest {MAX_STATUS_CREDITS} credits and no earlier credited_sompi was "
+            "given to compare with"
+        )
+    grew = credited - baseline_credited_sompi
+    if grew >= amount:
+        return CreditConfirmation(
+            confirmed=True,
+            basis="increase",
+            credited_sompi=credited,
+            baseline_credited_sompi=baseline_credited_sompi,
+            detail=(
+                f"this payment is not among the newest {MAX_STATUS_CREDITS} credits; credited_sompi grew by {grew} "
+                f"sompi since the baseline (hint: {amount})"
+            ),
+        )
+    return no(f"credited_sompi grew by {grew} sompi since the baseline, less than the hinted {amount}")
 
 
 def credit_of(response: httpx.Response) -> CreditObservation | None:

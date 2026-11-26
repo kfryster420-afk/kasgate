@@ -136,6 +136,7 @@ EXPECTED_TOOLS = {
     "prepaid_refunds",
     "trial_status",
     "call_free_trial",
+    "get_credit_status",
 }
 
 

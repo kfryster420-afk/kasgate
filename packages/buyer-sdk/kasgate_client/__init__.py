@@ -21,15 +21,21 @@ from .constants import (
     SOMPI_PER_KAS,
 )
 from .credit import (
+    CREDIT_CHALLENGE_PATH,
     CREDIT_EXTENSION,
+    CREDIT_STATUS_PATH,
     HEADER_CREDIT,
+    BuyerCreditItem,
+    BuyerCreditStatus,
     CreditConfirmation,
     CreditObservation,
+    CreditStatusChallenge,
     FailedDeliveryCreditHint,
     credit_of,
     judge_credit,
     observe_credit,
     parse_credit_header,
+    validate_credit_challenge,
 )
 from .exceptions import (
     ChallengeExpiredError,
@@ -110,7 +116,9 @@ from .trials import (
 )
 
 __all__ = [
+    "CREDIT_CHALLENGE_PATH",
     "CREDIT_EXTENSION",
+    "CREDIT_STATUS_PATH",
     "DEFAULT_MAX_NETWORK_FEE_SOMPI",
     "DEFAULT_MAX_PRICE_SOMPI",
     "DEFAULT_MIN_CHANGE_SOMPI",
@@ -139,12 +147,15 @@ __all__ = [
     "WEBHOOK_SIGNATURE_HEADER",
     "WEBHOOK_TIMESTAMP_HEADER",
     "WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS",
+    "BuyerCreditItem",
+    "BuyerCreditStatus",
     "CatalogEndpoint",
     "CatalogPage",
     "ChallengeExpiredError",
     "ConfigurationError",
     "CreditConfirmation",
     "CreditObservation",
+    "CreditStatusChallenge",
     "DiscoverResult",
     "DustChangeError",
     "FailedDeliveryCreditHint",
@@ -202,6 +213,7 @@ __all__ = [
     "receipt_of",
     "sompi_to_kas",
     "trial_receipt_of",
+    "validate_credit_challenge",
     "validate_debit_challenge",
     "validate_refund_challenge",
     "validate_trial_challenge",

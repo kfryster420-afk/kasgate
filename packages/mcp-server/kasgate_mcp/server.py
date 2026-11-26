@@ -204,14 +204,18 @@ def _describe_prepaid_receipt(receipt: PrepaidReceipt) -> dict[str, Any]:
 
 CREDIT_NOTES = {
     "hint": (
-        "UNVERIFIED: X-KasGate-Credit is an unsigned hint. Do not count this as credit until the balance check "
-        "confirms it (prepaid_balance, field credited_sompi)."
+        "UNVERIFIED: X-KasGate-Credit is an unsigned hint. Do not count this as credit until the gateway's signed "
+        "credit status lists it (get_credit_status)."
     ),
     "confirmed": (
-        "Confirmed against the public prepaid balance. This is call-only credit at this merchant: spend it with "
-        "call_prepaid_endpoint. It is not refundable and it does not reduce the session budget's spent amount."
+        "Confirmed: the gateway's signed credit status lists this credit. This is call-only credit at this merchant: "
+        "spend it with call_prepaid_endpoint. It is not refundable and it does not reduce the session budget's "
+        "spent amount."
     ),
-    "unconfirmed": "The balance check did not corroborate this hint. Do not rely on any credit from it.",
+    "unconfirmed": (
+        "The signed credit status did not corroborate this hint (or could not be read). Do not rely on any credit "
+        "from it; get_credit_status can check again."
+    ),
     "invalid": "The credit header was malformed or did not fit this call and was ignored. No credit is claimed.",
 }
 
@@ -240,6 +244,8 @@ def _describe_credit(observation: CreditObservation) -> dict[str, Any]:
             "basis": confirmation.basis,
             "credited_sompi": confirmation.credited_sompi,
             "baseline_credited_sompi": confirmation.baseline_credited_sompi,
+            "http_status": confirmation.http_status,
+            "error_code": confirmation.error_code,
             "detail": confirmation.detail,
         },
         "error": observation.error,
@@ -279,7 +285,8 @@ def build_server(
             "the paying tools use them automatically before paying (see `trial` in the result), trial_status shows "
             "what is left and call_free_trial makes a call that can never pay. A tighter max_price_kas can only "
             "lower the configured ceiling, never raise it. A failed paid call may report a `credit`: treat it as real "
-            "only when credit.confirmed is true (the balance check), never from the header alone. Keys are never logged."
+            "only when credit.confirmed is true (the gateway's signed credit status lists it), never from the header "
+            "alone; get_credit_status shows this key's credits at a merchant. Keys are never logged."
         ),
     )
     state: dict[str, Any] = {"http": http_client, "buyer": buyer}
@@ -377,7 +384,7 @@ def build_server(
         result["trial"] = _describe_trial_receipt(trial) if trial else None
         observation = credit_of(response)
         if observation is not None and observation.status == "hint" and cfg.auto_confirm_credit:
-            # A client that was not built to confirm on its own (an injected one): check the balance here.
+            # A client that was not built to confirm on its own (an injected one): check the signed status here.
             observation = await client.confirm_credit(cfg.gateway_url, slug, observation)
         # Spend is never reduced by a credit: the payment above stays spent, the credit is call-only prepaid credit.
         result["credit"] = _describe_credit(observation) if observation is not None else None
@@ -448,7 +455,7 @@ def build_server(
         whichever is lower). `path` is appended to the endpoint (e.g. "v1/items?limit=3"); `body` is sent as JSON.
         This tool does not draw down the session spend cap; use call_with_budget for session-capped spending.
         If the upstream failed for good and the gateway announced a credit, `credit` says so: only
-        `credit.confirmed == true` (checked against the public prepaid balance) counts; the header alone is an
+        `credit.confirmed == true` (the gateway's signed credit status lists it) counts; the header alone is an
         unsigned hint.
         """
         return await _execute_paid_call(slug, method, path, body, max_price_kas)
@@ -562,6 +569,48 @@ def build_server(
             if balance.spendable_sompi is not None
             else int(balance.balance_sompi),
             "expires_at": balance.expires_at.isoformat() if balance.expires_at else None,
+        }
+
+    @server.tool()
+    async def get_credit_status(slug: str) -> dict[str, Any]:
+        """This buyer key's failed-delivery credit at the merchant behind `slug`, from the gateway's SIGNED status.
+
+        Signs one `credits` challenge (it moves no coins and never touches the session budget) and returns lifetime
+        `credited_sompi`, the unspent call-only `credit_balance_sompi` (spend it with call_prepaid_endpoint; never
+        refundable), `refundable_sompi`, `credit_count` and the newest 10 `credits`. A key with no balance gets zeros.
+        This is the check behind `credit.confirmed` on the paid-call tools.
+        """
+        slug = validate_slug(slug)
+        try:
+            status = await paying_client().credit_status(cfg.gateway_url, slug)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return {
+            "merchant_id": str(status.merchant_id),
+            "credited_sompi": status.credited_sompi,
+            "credited_kas": sompi_to_kas(status.credited_sompi),
+            "credit_balance_sompi": status.credit_balance_sompi,
+            "credit_balance_kas": sompi_to_kas(status.credit_balance_sompi),
+            "refundable_sompi": status.refundable_sompi,
+            "credit_count": status.credit_count,
+            "credits": [
+                {
+                    "tx_id": item.tx_id,
+                    "slug": item.slug,
+                    "credit_sompi": item.credit_sompi,
+                    "credit_kas": sompi_to_kas(item.credit_sompi),
+                    "shortfall_sompi": item.shortfall_sompi,
+                    "reason": item.reason,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in status.credits
+            ],
+            "note": (
+                "Call-only credit: it can pay calls at this merchant, it is not refundable, and it does not change "
+                "the session budget. `credits` lists only the newest 10 of credit_count."
+            ),
         }
 
     def _describe_refund(refund: PrepaidRefund) -> dict[str, Any]:

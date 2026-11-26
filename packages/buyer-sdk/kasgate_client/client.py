@@ -40,13 +40,18 @@ from .constants import (
     WELL_KNOWN_X402_PATH,
 )
 from .credit import (
+    CREDIT_CHALLENGE_PATH,
     CREDIT_EXTENSION,
+    CREDIT_STATUS_PATH,
     HEADER_CREDIT,
+    BuyerCreditStatus,
     CreditConfirmation,
     CreditObservation,
+    CreditStatusChallenge,
     FailedDeliveryCreditHint,
     judge_credit,
     observe_credit,
+    validate_credit_challenge,
 )
 from .exceptions import (
     ConfigurationError,
@@ -286,13 +291,13 @@ class KasGateClient:
 
         A response that carries `X-KasGate-Credit` (a paid call that failed for good and was credited, CONTRACT
         v2.14) gets a `CreditObservation`, read with `credit_of(response)`. The header is an unsigned hint: it is
-        `confirmed` only after the balance check (`confirm_credit`, or automatically with `auto_confirm_credit`).
+        `confirmed` only after the signed credit status lists it (`confirm_credit`, or automatically with
+        `auto_confirm_credit`, which then makes one challenge + one status call, only when a hint arrived).
         """
-        baseline = await self._credit_baseline(url) if self.auto_confirm_credit else None
         response = await self._paid_request(
             method, url, max_price_kas=max_price_kas, expected_pay_to=expected_pay_to, **kwargs
         )
-        await self._observe_credit(response, url, baseline)
+        await self._observe_credit(response, url)
         return response
 
     async def _paid_request(
@@ -587,7 +592,60 @@ class KasGateClient:
             raise PaymentRejectedError(response.status_code, code, message, response)
         return PrepaidBalance.model_validate(response.json())
 
-    # ------------------------------------------------------------------ failed-delivery credit hints (CONTRACT v2.14)
+    # ------------------------------------------------------------------ failed-delivery credit (CONTRACT v2.14)
+
+    async def credit_status(self, gateway_url: str | httpx.URL, slug: str) -> BuyerCreditStatus:
+        """This key's failed-delivery credit at the merchant behind `slug`, from the gateway's SIGNED credit status.
+
+        Asks for a `credits` challenge, rebuilds its text locally (this payer, this domain, `Action: credits`, amount
+        0) and signs it with the depositing key; it moves no coins and is single use. Returns lifetime
+        `credited_sompi`, the unspent call-only `credit_balance_sompi`, `refundable_sompi`, `credit_count` and the
+        newest 10 credits. A buyer with no balance gets zeros and no credits. Raises `PaymentRejectedError`
+        (`status_code`/`code` of the gateway answer; `PaymentReplayedError` for 409, `PaymentExpiredError` for 410),
+        `InvalidChallengeError` for a challenge that is not exactly what was asked for, and `PaymentReceiptError`
+        for an answer that is not a strict BuyerCreditStatus.
+        """
+        url = self._absolute(gateway_url)
+        origin = self._origin(url)
+        challenged = await self._http.post(
+            origin + CREDIT_CHALLENGE_PATH,
+            json={"slug": slug, "payer_address": self.address},
+        )
+        if challenged.status_code != 201:
+            code, message = error_details(challenged)
+            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+        try:
+            challenge = CreditStatusChallenge.model_validate(challenged.json())
+        except ValueError as exc:
+            raise InvalidChallengeError(f"credits challenge cannot be decoded: {exc}") from exc
+        validate_credit_challenge(
+            challenge,
+            domain=url.netloc.decode("ascii").lower(),
+            address=self.address,
+            slug=slug,
+        )
+        signed = {
+            "nonce": challenge.nonce,
+            "signature": kaspa.sign_message(challenge.message, self._private_key),
+        }
+        response = await self._http.post(origin + CREDIT_STATUS_PATH, json=signed)
+        if response.status_code != 200:
+            code, message = error_details(response)
+            if response.status_code == 409 and code == "challenge_replayed":
+                raise PaymentReplayedError(409, code, message, response)
+            if response.status_code == 410:
+                raise PaymentExpiredError(410, code, message, response)
+            raise PaymentRejectedError(response.status_code, code, message, response)
+        try:
+            status = BuyerCreditStatus.model_validate(response.json())
+        except ValueError as exc:
+            raise PaymentReceiptError(f"credit status cannot be decoded: {exc}", response) from exc
+        if status.merchant_id != challenge.merchant_id:
+            raise PaymentReceiptError(
+                "credit status is for another merchant than the signed challenge",
+                response,
+            )
+        return status
 
     async def confirm_credit(
         self,
@@ -597,14 +655,15 @@ class KasGateClient:
         *,
         baseline_credited_sompi: int | None = None,
     ) -> CreditObservation:
-        """Check an `X-KasGate-Credit` hint against the public prepaid balance before calling it real.
+        """Check an `X-KasGate-Credit` hint against the gateway's signed credit status before calling it real.
 
-        `credit` is the response (or its `credit_of(...)` observation, or a bare hint). The balance at the merchant
-        behind `slug` must belong to the hinted merchant and its `credited_sompi` must cover the hinted credit; pass
-        `baseline_credited_sompi` (the `credited_sompi` read before the call) to require that it GREW by that much.
-        Returns a new observation: `confirmed`, or `unconfirmed` with the reason (credit not visible, wrong
-        merchant, gateway unreachable). An `invalid` observation stays invalid. Never raises for gateway problems
-        and signs nothing.
+        `credit` is the response (or its `credit_of(...)` observation, or a bare hint) of a call to `slug`. The
+        status (`credit_status`) must be for the hinted merchant and list a credit with the hinted txId, amount and
+        reason at `slug`. Only if that payment is not among the newest 10 credits can `baseline_credited_sompi` (the
+        `credited_sompi` read before the call) confirm it by increase. Returns a new observation: `confirmed`, or
+        `unconfirmed` with the reason in `confirmation` (credit not listed, details differ, gateway 429/503/410/409,
+        unreachable, malformed answer). An `invalid` observation stays invalid. Never raises for gateway or network
+        problems; a bad `credit` or baseline argument is a ConfigurationError.
         """
         observation = self._as_observation(credit)
         if observation.hint is None or observation.status == "invalid":
@@ -616,16 +675,36 @@ class KasGateClient:
         ):
             raise ConfigurationError("baseline_credited_sompi must be a non-negative integer or None")
         try:
-            balance = await self.prepaid_balance(gateway_url, slug)
-        except (httpx.HTTPError, KasGateError, ValueError) as exc:
+            status = await self.credit_status(gateway_url, slug)
+        except PaymentRejectedError as exc:
             confirmation = CreditConfirmation(
                 confirmed=False,
                 basis="none",
                 baseline_credited_sompi=baseline_credited_sompi,
-                detail=f"the balance check failed ({type(exc).__name__}); the credit is unverified",
+                http_status=exc.status_code,
+                error_code=exc.code[:64],
+                detail=f"the signed credit status was refused (HTTP {exc.status_code} {exc.code[:64]}); the credit is unverified",
+            )
+        except (
+            httpx.HTTPError,
+            KasGateError,
+            ValueError,
+            TypeError,
+            UnicodeError,
+        ) as exc:
+            confirmation = CreditConfirmation(
+                confirmed=False,
+                basis="none",
+                baseline_credited_sompi=baseline_credited_sompi,
+                detail=f"the signed credit status check failed ({type(exc).__name__}); the credit is unverified",
             )
         else:
-            confirmation = judge_credit(observation.hint, balance, baseline_credited_sompi)
+            confirmation = judge_credit(
+                observation.hint,
+                status,
+                slug=slug,
+                baseline_credited_sompi=baseline_credited_sompi,
+            )
         return CreditObservation(
             status="confirmed" if confirmation.confirmed else "unconfirmed",
             hint=observation.hint,
@@ -633,7 +712,9 @@ class KasGateClient:
         )
 
     @staticmethod
-    def _as_observation(credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response) -> CreditObservation:
+    def _as_observation(
+        credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response,
+    ) -> CreditObservation:
         if isinstance(credit, httpx.Response):
             found = credit.extensions.get(CREDIT_EXTENSION)
             if not isinstance(found, CreditObservation):
@@ -645,17 +726,7 @@ class KasGateClient:
             return credit
         raise ConfigurationError("credit must be a response, a CreditObservation or a FailedDeliveryCreditHint")
 
-    async def _credit_baseline(self, url: str | httpx.URL) -> int | None:
-        """`credited_sompi` before the call (best effort), so a later hint must show a real increase."""
-        try:
-            target = self._absolute(url)
-            slug = slug_of(target.raw_path.decode("ascii"))
-            balance = await self.prepaid_balance(self._origin(target), slug)
-        except (httpx.HTTPError, KasGateError, ValueError, UnicodeError):
-            return None
-        return None if balance.credited_sompi is None else int(balance.credited_sompi)
-
-    async def _observe_credit(self, response: httpx.Response, url: str | httpx.URL, baseline: int | None) -> None:
+    async def _observe_credit(self, response: httpx.Response, url: str | httpx.URL) -> None:
         """Attach the credit observation of `response` (never raises, never leaves a header unexamined)."""
         raw = response.headers.get(HEADER_CREDIT)
         if raw is None:
@@ -673,9 +744,7 @@ class KasGateClient:
             try:
                 target = self._absolute(url)
                 slug = slug_of(target.raw_path.decode("ascii"))
-                observation = await self.confirm_credit(
-                    self._origin(target), slug, observation, baseline_credited_sompi=baseline
-                )
+                observation = await self.confirm_credit(self._origin(target), slug, observation)
             except (KasGateError, ValueError, UnicodeError) as exc:
                 observation = CreditObservation(
                     status="unconfirmed",
@@ -683,7 +752,7 @@ class KasGateClient:
                     confirmation=CreditConfirmation(
                         confirmed=False,
                         basis="none",
-                        detail=f"the balance check could not run ({type(exc).__name__}); the credit is unverified",
+                        detail=f"the credit check could not run ({type(exc).__name__}); the credit is unverified",
                     ),
                 )
         response.extensions[CREDIT_EXTENSION] = observation

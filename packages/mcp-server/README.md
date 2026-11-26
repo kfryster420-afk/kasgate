@@ -13,6 +13,7 @@ Stdio MCP server for KasGate. Tools:
 | `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. Does not draw down the session cap. |
 | `prepaid_deposit(slug, amount_kas)` | CONTRACT v2.11: funds a prepaid balance at the endpoint's merchant with one on-chain payment (>= 0.6 KAS; merchant share = credit, fee max(1.5 %, 0.2 KAS) to the treasury). Reserved against the session cap and per-call max before signing, committed on success. |
 | `prepaid_balance(slug)` | this key's prepaid balance at that merchant (read only); `credited_sompi` is the cumulative failed-delivery credit. |
+| `get_credit_status(slug)` | CONTRACT v2.14: this key's failed-delivery credit at that merchant from the gateway's signed status: `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`, `credit_count` and the newest 10 `credits` (`tx_id`, `slug`, `credit_sompi`, `shortfall_sompi`, `reason`, `created_at`). Signs one `credits` text (moves nothing, no session cap). Gateway errors (`rate_limited`, `challenge_expired`, ...) are tool errors. |
 | `call_prepaid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` paid by one signed debit from the prepaid balance (no transaction). Refuses to sign unless the debit text matches the request and the amount is within the cap; returns the debit receipt (`debited` or `refunded`). Does not draw the session cap again. |
 | `prepaid_refund_request(slug, amount_kas?)` | CONTRACT v2.13: asks the merchant to pay unused credit back to this key's address (all spendable credit when `amount_kas` is omitted; at least 0.2 KAS). Signs one refund request (checked against what was asked), never a transaction; does not touch the session cap. |
 | `prepaid_refund_cancel(slug, refund_id)` | withdraws a refund the merchant has not paid yet; the held credit becomes spendable again. |
@@ -33,7 +34,7 @@ Stdio MCP server for KasGate. Tools:
 | `KASGATE_MAX_PRICE_KAS` | Hard ceiling per call, default `20`; the `max_price_kas` tool argument can only lower it. |
 | `KASGATE_SESSION_BUDGET_KAS` | Session spend cap for `call_with_budget`, default `20`. Concurrent calls reserve the quoted price atomically and cannot together exceed this cap. |
 | `KASGATE_REQUEST_TIMEOUT` | Seconds the server waits for a gateway response (including the payment settlement), default `60`. Must be a positive number or the server exits at startup. |
-| `KASGATE_AUTO_CONFIRM_CREDIT` | `1` (default) checks an `X-KasGate-Credit` hint against the public `/v1/prepaid/balance` before the paid-call tools report it as confirmed; `0` leaves it an unverified hint. A credit is never reported as confirmed without that check. |
+| `KASGATE_AUTO_CONFIRM_CREDIT` | `1` (default) checks an `X-KasGate-Credit` hint against the gateway's signed credit status (one `credits` challenge + status exchange, only when a hint arrives) before the paid-call tools report it as confirmed; `0` leaves it an unverified hint. A credit is never reported as confirmed without that check. |
 | `KASGATE_USE_FREE_TRIALS` | `1` (default) lets the paying tools answer a 402 that offers a free trial with a signed trial call before paying; `0` always pays. Trial calls never count against the session budget. |
 
 ## Failed-delivery credits (CONTRACT v2.14)
@@ -43,9 +44,9 @@ payment whose merchant share became call-only prepaid credit); it is `null` othe
 
 | `credit.status` | meaning |
 | --- | --- |
-| `confirmed` | the public balance shows the credit (`confirmed: true`); only then are `credit_sompi` / `credit_kas` set at the top of `credit` |
+| `confirmed` | the signed credit status lists the credit (`confirmed: true`); only then are `credit_sompi` / `credit_kas` set at the top of `credit` |
 | `hint` | parsed but not checked (auto-confirm off): the amounts are only under `credit.hint` and `confirmed` is `false` |
-| `unconfirmed` | checked and the balance does not show it: do not rely on it |
+| `unconfirmed` | checked and the signed status does not list it, or the check failed (`confirmation.http_status` / `error_code` say why, e.g. 429 `rate_limited`): do not rely on it; `get_credit_status` can check again |
 | `invalid` | malformed, oversized or inconsistent with the payment: ignored, `credit.error` says why |
 
 The credit is never subtracted from the session budget: the payment stays spent (`spent_sompi` is unchanged) because the
@@ -54,8 +55,8 @@ credit can only be used for more calls at that merchant and cannot be refunded.
 ```json
 {"status_code": 502, "credit": {"status": "confirmed", "confirmed": true, "credit_sompi": 1477500000, "credit_kas": "14.775",
  "hint": {"credit_id": "…", "tx_id": "…", "merchant_id": "…", "credit_sompi": 1477500000, "reason": "attempts_exhausted"},
- "confirmation": {"basis": "cumulative", "credited_sompi": 1477500000, "baseline_credited_sompi": null, "detail": "…"},
- "error": null, "note": "Confirmed against the public prepaid balance. This is call-only credit … not refundable …"}}
+ "confirmation": {"basis": "tx_id", "credited_sompi": 1477500000, "baseline_credited_sompi": null, "http_status": null, "error_code": null, "detail": "…"},
+ "error": null, "note": "Confirmed: the gateway's signed credit status lists this credit. This is call-only credit … not refundable …"}}
 ```
 
 The key's contents are never logged, never part of an error message and not shown in `repr(Config)`. A missing, malformed
