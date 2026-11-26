@@ -6,6 +6,7 @@ import { ApiError, apiFetch } from "@/lib/api-client";
 import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { formatDateTime, shortHash } from "@/lib/format";
 import { getKasware, isSignatureToken, isWalletRejection, kaswareNetworkRefusal, walletErrorText } from "@/lib/kasware";
+import { balanceReadMessage, normaliseBalanceSignature } from "@/lib/balance-read";
 import { checkRefundChallenge } from "@/lib/refund-challenge";
 import { refundErrorMessage, txIdsInMessage } from "@/lib/refund-errors";
 import { claimExpiresAt } from "@/lib/refund-payout";
@@ -23,8 +24,18 @@ function isP2pkAddress(address: string): boolean {
 }
 
 /** `signed`: the rows came from a signed status read, so they carry the merchant's reasons and payout errors. */
-type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; refunds: PrepaidRefundRead[]; signed: boolean };
-type Busy = null | "connect" | "lookup" | "request" | "status" | `cancel:${string}`;
+/** `balanceSigned`: the balance came from a buyer-signed read, so its ledger totals (held, deposited, …) are present. */
+type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[]; signed: boolean };
+type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | `cancel:${string}`;
+
+type SignedBalance = PrepaidBalanceRead & { deposited_sompi: string; debited_sompi: string; refunded_sompi: string; expired_sompi: string; refund_hold_sompi: string };
+
+const SOMPI_RE = /^(0|[1-9][0-9]{0,17})$/;
+
+/** True when every ledger total is present and a strict decimal sompi string (the signed read). */
+function hasLedgerTotals(balance: PrepaidBalanceRead): balance is SignedBalance {
+  return [balance.deposited_sompi, balance.debited_sompi, balance.refunded_sompi, balance.expired_sompi, balance.refund_hold_sompi].every((v) => typeof v === "string" && SOMPI_RE.test(v));
+}
 
 export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   const pricing = usePricing();
@@ -58,7 +69,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
       apiFetch<PrepaidBalanceRead>(`/api/prepaid/balance?${query}`),
       apiFetch<PrepaidRefundRead[]>(`/api/prepaid/refunds/status?${query}&limit=50`),
     ]);
-    const next = { slug: slugValue, address: addressValue, balance, refunds, signed: false };
+    const next = { slug: slugValue, address: addressValue, balance, balanceSigned: false, refunds, signed: false };
     setLookup(next);
     return next;
   }, []);
@@ -221,6 +232,48 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   }
 
   /** Signed `status` read: the same rows with the merchant's reject reasons and payout errors (the public view hides them). */
+  /** CONTRACT v2.12.1 signed balance read: KasWare signs the timestamped balance-read text; no challenge round trip. */
+  async function signBalance() {
+    if (!lookup) return;
+    setNotice(null);
+    setBusy("balance");
+    setError(null);
+    try {
+      const wallet = getKasware();
+      if (!wallet) throw new Error("KasWare was not detected in this browser. The full balance is shown only to the depositing key.");
+      if (!EXPECTED_AUTH_DOMAIN) throw new Error("This app has no gateway URL configured, so it can't build the balance message.");
+      const accounts = await wallet.requestAccounts();
+      if (accounts[0]?.trim().toLowerCase() !== lookup.address) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
+      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+      if (wrongNetwork) throw new Error(wrongNetwork);
+      const timestamp = Math.floor(Date.now() / 1000);
+      const message = balanceReadMessage({ domain: EXPECTED_AUTH_DOMAIN, address: lookup.address, slug: lookup.slug, timestamp });
+      let raw: string;
+      try {
+        raw = await wallet.signMessage(message, { type: "schnorr" });
+      } catch (e) {
+        if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Only spendable credit and expiry are shown.");
+        throw new Error(`KasWare: ${walletErrorText(e)}`);
+      }
+      const signature = normaliseBalanceSignature(raw);
+      if (!signature) throw new Error("KasWare returned a signature in an unexpected format (expected 128 hex characters).");
+      const balance = await apiFetch<PrepaidBalanceRead>("/api/prepaid/balance/signed", {
+        method: "POST",
+        body: { slug: lookup.slug, payer_address: lookup.address, timestamp: String(timestamp), signature },
+      });
+      if (!hasLedgerTotals(balance)) throw new Error("The gateway answered without the ledger totals. Try again.");
+      setLookup({ ...lookup, balance, balanceSigned: true });
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "invalid_balance_signature") {
+        setError("The gateway didn't accept the balance signature: the KasWare account isn't the depositing key, or this device's clock is more than 5 minutes off. Nothing was shown.");
+      } else {
+        setError(refundErrorMessage(e));
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function showReasons() {
     if (!lookup) return;
     setNotice(null);
@@ -299,31 +352,82 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                 <RefreshCw className="h-3.5 w-3.5" aria-hidden />
               </button>
             </div>
-            <dl className="mt-4 grid gap-4 sm:grid-cols-4">
-              <div>
-                <dt className="label">Balance</dt>
-                <dd>
-                  <KasAmount sompi={balance.balance_sompi} align="left" tone="text-zinc-100" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Spendable</dt>
-                <dd>
-                  <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Held by a refund request</dt>
-                <dd>
-                  <KasAmount sompi={balance.refund_hold_sompi} align="left" tone="text-amber-300" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Expires</dt>
-                <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
-                {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
-              </div>
-            </dl>
+            {lookup.balanceSigned && hasLedgerTotals(balance) ? (
+              <dl className="mt-4 grid gap-4 sm:grid-cols-4" data-balance-signed>
+                <div>
+                  <dt className="label">Balance</dt>
+                  <dd>
+                    <KasAmount sompi={balance.balance_sompi} align="left" tone="text-zinc-100" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Spendable</dt>
+                  <dd>
+                    <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Held by a refund request</dt>
+                  <dd>
+                    <KasAmount sompi={balance.refund_hold_sompi} align="left" tone="text-amber-300" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Expires</dt>
+                  <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
+                  {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
+                </div>
+                <div>
+                  <dt className="label">Deposited</dt>
+                  <dd>
+                    <KasAmount sompi={balance.deposited_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Spent on calls</dt>
+                  <dd>
+                    <KasAmount sompi={balance.debited_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Refunded</dt>
+                  <dd>
+                    <KasAmount sompi={balance.refunded_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Expired</dt>
+                  <dd>
+                    <KasAmount sompi={balance.expired_sompi} align="left" />
+                  </dd>
+                </div>
+              </dl>
+            ) : (
+              <>
+                <dl className="mt-4 grid gap-4 sm:grid-cols-4" data-balance-public>
+                  <div>
+                    <dt className="label">Spendable</dt>
+                    <dd>
+                      <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="label">Expires</dt>
+                    <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
+                    {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
+                  </div>
+                </dl>
+                <div className="mt-3 flex flex-wrap items-center gap-3">
+                  <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void signBalance()} disabled={busy !== null || !canSign} data-sign-balance>
+                    {busy === "balance" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                    Sign to see the full balance
+                  </button>
+                  <p className="text-[11px] text-zinc-500">
+                    Held, deposited, spent, refunded and expired amounts are shown only to the depositing key: KasWare signs a read-only message (it authorises nothing else).
+                  </p>
+                </div>
+              </>
+            )}
           </section>
 
           <section className="card space-y-3 p-5" aria-labelledby="buyer-request-heading">
@@ -395,7 +499,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                           <p className={`mt-1 max-w-[280px] text-[11px] ${Date.parse(refund.hold_until) > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
                             {Date.parse(refund.hold_until) > now
                               ? `Cooldown: this amount stays held until ${formatDateTime(refund.hold_until)} because the merchant had started paying it. If their payout lands before then, it is recorded as paid; otherwise the credit is spendable again.`
-                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released.`}
+                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released once no payout of this refund is still being checked.`}
                           </p>
                         ) : null}
                         {payoutFound?.refundId === refund.id ? (

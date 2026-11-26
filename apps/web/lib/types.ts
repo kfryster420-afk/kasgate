@@ -161,21 +161,32 @@ export interface PrepaidReceipt {
 export interface PrepaidBalanceRead {
   merchant_id: Uuid;
   payer_address: string;
+  /** Always present (the 402 `balanceUrl` relies on it). Includes credit held by an open refund request. */
   balance_sompi: Sompi;
-  deposited_sompi: Sompi;
-  debited_sompi: Sompi;
+  /** CONTRACT v2.12.1: null on the unsigned public read; merchant reads and buyer-signed reads always fill it. */
+  deposited_sompi: Sompi | null;
+  debited_sompi: Sompi | null;
   updated_at: IsoDateTime | null;
-  /** CONTRACT v2.13: paid back on-chain by refund payouts. */
-  refunded_sompi: Sompi;
-  /** CONTRACT v2.13: swept by the credit-expiry worker. */
-  expired_sompi: Sompi;
-  /** CONTRACT v2.13: set aside by an open refund request; still in the balance but not spendable. */
-  refund_hold_sompi: Sompi;
-  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. */
+  /** CONTRACT v2.13: paid back on-chain by refund payouts. Null on the unsigned public read. */
+  refunded_sompi: Sompi | null;
+  /** CONTRACT v2.13: swept by the credit-expiry worker. Null on the unsigned public read. */
+  expired_sompi: Sompi | null;
+  /** CONTRACT v2.13: set aside by an open refund request (or a cancel cooldown); still in the balance but not spendable. Null on the unsigned public read. */
+  refund_hold_sompi: Sompi | null;
+  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. Always public. */
   spendable_sompi: Sompi;
   /** CONTRACT v2.13: when the credit expires (null = never). */
   expires_at: IsoDateTime | null;
 }
+
+/** Merchant `GET /v1/prepaid/balances` rows always carry every ledger total. */
+export type MerchantPrepaidBalanceRead = PrepaidBalanceRead & {
+  deposited_sompi: Sompi;
+  debited_sompi: Sompi;
+  refunded_sompi: Sompi;
+  expired_sompi: Sompi;
+  refund_hold_sompi: Sompi;
+};
 
 export interface PrepaidDepositRead {
   id: Uuid;

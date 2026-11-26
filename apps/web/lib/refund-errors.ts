@@ -20,7 +20,7 @@ const REFUND_ERROR_TEXT: Record<string, string> = {
   payout_abandoned:
     "KasGate gave up on that transaction after it stayed unconfirmed too long. Re-posting its txid can't revive it: post the signed transaction instead to prove and re-broadcast it.",
   too_many_attempts:
-    "This refund already has the maximum number of unconfirmed payout attempts. Wait until they are confirmed or given up before recording another one. Don't pay again.",
+    "This refund already has the maximum number of unconfirmed txid attempts. Post the signed transaction instead (it doesn't count toward the limit), or wait until they are confirmed or given up. Don't pay again.",
   insufficient_balance: "The spendable prepaid credit doesn't cover that amount.",
   endpoint_not_found: "No active endpoint has that slug.",
   wrong_network: "The payout is for the wrong Kaspa network.",

@@ -348,7 +348,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
             <p className={`mt-1 max-w-[280px] text-[11px] ${holdEnds > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
               {holdEnds > now
                 ? `Cooldown: the amount stays held until ${formatDateTime(refund.hold_until ?? "")} because you had claimed it. A payout that lands before then is still recorded and debited in full.`
-                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released.`}
+                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released once no payout attempt for this refund is still pending.`}
             </p>
           ) : null}
           {reverted ? (
@@ -638,6 +638,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                 <th className="th">Kind</th>
                 <th className="th text-right">Amount</th>
                 <th className="th text-right">Balance after</th>
+                <th className="th text-right">USD at settlement</th>
                 <th className="th">Tx / note</th>
               </tr>
             </thead>
@@ -659,6 +660,11 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                   </td>
                   <td className="td">
                     <KasAmount sompi={entry.balance_after_sompi} />
+                  </td>
+                  <td className="td text-right" data-ledger-usd>
+                    <span className="text-xs text-zinc-500" title="The gateway records no KAS/USD rate for refund payouts and expiries (PrepaidLedgerEntryRead has no USD fields); the deposits these credits came from carry their USD value in Settlements.">
+                      not recorded
+                    </span>
                   </td>
                   <td className="td">
                     {entry.tx_id ? txLink(entry.tx_id) : null}

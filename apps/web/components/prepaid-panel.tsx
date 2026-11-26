@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiFetch, errorMessage } from "@/lib/api-client";
 import { formatDateTime, formatUsd, shortAddress, shortHash } from "@/lib/format";
 import { formatKas, formatSompi } from "@/lib/sompi";
-import type { EndpointRead, PrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
+import type { EndpointRead, MerchantPrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
 import { ErrorBanner, Spinner } from "./ui";
 
 const PAGE_SIZE = 25;
@@ -17,7 +17,7 @@ const TABS: { kind: PrepaidLedgerKind; label: string }[] = [
 ];
 
 type Rows =
-  | { kind: "balances"; rows: PrepaidBalanceRead[] }
+  | { kind: "balances"; rows: MerchantPrepaidBalanceRead[] }
   | { kind: "deposits"; rows: PrepaidDepositRead[] }
   | { kind: "debits"; rows: PrepaidDebitRead[] };
 
