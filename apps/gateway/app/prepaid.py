@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -125,6 +125,51 @@ async def _balance_of(session: AsyncSession, merchant_id: uuid.UUID, public_key:
             )
         )
     ).scalar_one_or_none()
+
+
+class _CapBackstopError(Exception):
+    """The conditional credit found the balance already at the cap: the settled deposit must not be credited."""
+
+
+async def _lock_balance_row(
+    session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str
+) -> int:
+    """Lock the (merchant, key) balance row FOR UPDATE and return its balance.
+
+    A zero row is inserted first (ON CONFLICT DO NOTHING) so a buyer's very first deposits serialize too: a second
+    insert of the same unique key waits for the first transaction. The row is held until the deposit commits or
+    rolls back, so two in-flight deposits for one key can never both pass the cap check.
+    """
+    await session.execute(
+        pg_insert(PrepaidBalance)
+        .values(
+            id=uuid.uuid4(),
+            merchant_id=merchant_id,
+            payer_address=payer_address,
+            payer_public_key=public_key,
+            balance_sompi=0,
+            deposited_sompi=0,
+            debited_sompi=0,
+        )
+        .on_conflict_do_nothing(index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key])
+    )
+    balance = (
+        await session.execute(
+            select(PrepaidBalance.balance_sompi)
+            .where(PrepaidBalance.merchant_id == merchant_id, PrepaidBalance.payer_public_key == public_key)
+            .with_for_update()
+        )
+    ).scalar_one()
+    return int(balance)
+
+
+def _cap_exceeded(cap: int, current: int) -> JSONResponse:
+    return _error(
+        422,
+        "prepaid_cap_exceeded",
+        f"this deposit would take the prepaid balance above the {cap} sompi cap (current balance {current} sompi); "
+        "the transaction was not submitted",
+    )
 
 
 def _store_unavailable() -> JSONResponse:
@@ -363,13 +408,30 @@ async def deposit(
     if not tx_locked:
         return _error(409, "payment_replayed", "this transaction or payment nonce is already being processed")
 
+    # Cap re-check under a row lock on the (merchant, key) balance, BEFORE anything reaches the node: quotes only
+    # checked the balance of their own moment, so N quotes taken together would otherwise all be credited.
+    cap = get_settings().prepaid_max_balance_sompi
+    try:
+        current = await _lock_balance_row(session, endpoint.merchant_id, signature.payerAddress, public_key)
+    except SQLAlchemyError:
+        await session.rollback()
+        await _release_payment_locks(redis, tx_id, nonce)
+        logger.exception("prepaid balance lock failed")
+        return _store_unavailable()
+    if current + required.merchant_amount_sompi > cap:
+        await session.rollback()
+        await _release_payment_locks(redis, tx_id, nonce)
+        return _cap_exceeded(cap, current)
+
     try:
         await engine.resolve_inputs(signature, tx)
         verified = await engine.settle(tx, pre_verified, required)
     except PaymentVerificationError as exc:
+        await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         return _verification_failure(exc, required)
     except Exception:
+        await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         logger.exception("unexpected failure while settling deposit tx %s", tx_id)
         return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
@@ -382,29 +444,27 @@ async def deposit(
     try:
         session.add(settlement)
         await session.flush()
-        balance_id, balance = (
+        # Backstop: the credit only applies while it keeps the balance within the cap. The row is locked above, so a
+        # miss means the cap moved under a settled deposit: it is dead-lettered below, never silently credited.
+        credited = (
             await session.execute(
-                pg_insert(PrepaidBalance)
-                .values(
-                    id=uuid.uuid4(),
-                    merchant_id=endpoint.merchant_id,
-                    payer_address=signature.payerAddress,
-                    payer_public_key=public_key,
-                    balance_sompi=credit,
-                    deposited_sompi=credit,
-                    debited_sompi=0,
+                update(PrepaidBalance)
+                .where(
+                    PrepaidBalance.merchant_id == endpoint.merchant_id,
+                    PrepaidBalance.payer_public_key == public_key,
+                    PrepaidBalance.balance_sompi + credit <= get_settings().prepaid_max_balance_sompi,
                 )
-                .on_conflict_do_update(
-                    index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key],
-                    set_={
-                        "balance_sompi": PrepaidBalance.balance_sompi + credit,
-                        "deposited_sompi": PrepaidBalance.deposited_sompi + credit,
-                        "updated_at": func.now(),
-                    },
+                .values(
+                    balance_sompi=PrepaidBalance.balance_sompi + credit,
+                    deposited_sompi=PrepaidBalance.deposited_sompi + credit,
+                    updated_at=func.now(),
                 )
                 .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
             )
-        ).one()
+        ).one_or_none()
+        if credited is None:
+            raise _CapBackstopError
+        balance_id, balance = credited
         record = PrepaidDeposit(
             id=uuid.uuid4(),
             balance_id=balance_id,
@@ -437,6 +497,17 @@ async def deposit(
             source_id=str(record.id),
         )
         await session.commit()
+    except _CapBackstopError:
+        await session.rollback()
+        logger.error("deposit tx %s settled but would exceed the prepaid cap; dead-lettered, not credited", tx_id)
+        await _dead_letter_settlement(
+            redis,
+            json.dumps(
+                {"prepaidDeposit": json.loads(unrecorded), "reason": "prepaid_cap_exceeded", "creditSompi": credit},
+                sort_keys=True,
+            ),
+        )
+        return _error(503, "service_unavailable", "payment was accepted but could not be credited; contact support")
     except IntegrityError:
         await session.rollback()
         logger.error("deposit tx %s (nonce %s) conflicts with an existing settlement", tx_id, nonce, exc_info=True)

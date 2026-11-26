@@ -804,6 +804,7 @@ class X402ErrorBody(StrictModel):
         "upstream_error",
         "invalid_exact_payment",
         "insufficient_balance",
+        "prepaid_cap_exceeded",
         "trial_exhausted",
     ]
     message: str
