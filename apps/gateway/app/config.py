@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     webhook_backoff_max_seconds: float = Field(default=3600.0, gt=0, le=86_400)
     webhook_lease_seconds: int = Field(default=60, ge=15, le=600)
     webhook_max_per_merchant: int = Field(default=10, ge=1, le=100)
+    # POST /v1/webhooks/{id}/test per merchant per minute, and how many settled test events are kept per webhook.
+    rl_webhook_test_per_minute: int = Field(default=10, ge=1)
+    webhook_test_events_kept: int = Field(default=20, ge=1, le=1000)
 
     @property
     def address_prefix(self) -> str:

@@ -31,12 +31,13 @@ from typing import Annotated, Any, Final
 import httpx
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import and_, func, or_, select, update
+from redis.asyncio import Redis
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
-from app.deps import get_db_session, get_sessionmaker
+from app.deps import get_db_session, get_redis, get_sessionmaker
 from app.models import (
     WEBHOOK_DELIVERY_DEAD,
     WEBHOOK_DELIVERY_DELIVERING,
@@ -67,7 +68,7 @@ from app.schemas import (
     WebhookRead,
     WebhookUpdate,
 )
-from app.security import get_current_merchant, get_fernet
+from app.security import RATE_LIMIT_WEBHOOK_TEST, enforce_rate_limit, get_current_merchant, get_fernet
 
 logger = logging.getLogger("kasgate.webhooks")
 
@@ -724,8 +725,14 @@ async def test_webhook(
     session: DbSession,
     maker: Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)],
     client: Annotated[httpx.AsyncClient, Depends(get_webhook_client)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> WebhookDeliveryRead:
-    """Queue a `webhook.test` event for this webhook only and attempt it once right away."""
+    """Queue a `webhook.test` event for this webhook only and attempt it once right away.
+
+    Rate-limited per merchant (`rl_webhook_test_per_minute`); only the newest `webhook_test_events_kept` finished
+    test events per webhook are kept, older ones (and their deliveries) are deleted.
+    """
+    await enforce_rate_limit(redis, RATE_LIMIT_WEBHOOK_TEST, f"merchant:{merchant.id}")
     hook = await _owned_webhook(session, merchant, webhook_id)
     event_id = await enqueue_event(
         session,
@@ -747,7 +754,27 @@ async def test_webhook(
     ).scalar_one()
     await session.commit()
     await deliver_one_now(maker, client, delivery_id)
+    await _prune_test_events(session, merchant.id, hook.id, get_settings().webhook_test_events_kept)
     return await _read_delivery(session, delivery_id)
+
+
+async def _prune_test_events(session: AsyncSession, merchant_id: uuid.UUID, webhook_id: uuid.UUID, keep: int) -> None:
+    """Delete this webhook's test events beyond the newest `keep` (deliveries cascade). Events whose delivery is
+    still pending or in flight are never touched, so a retrying test delivery keeps its rows."""
+    stale = (
+        select(WebhookEvent.id)
+        .join(WebhookDelivery, WebhookDelivery.event_pk == WebhookEvent.id)
+        .where(
+            WebhookEvent.merchant_id == merchant_id,
+            WebhookEvent.event_type == WEBHOOK_TEST_EVENT,
+            WebhookDelivery.webhook_id == webhook_id,
+            WebhookDelivery.status.not_in((WEBHOOK_DELIVERY_PENDING, WEBHOOK_DELIVERY_DELIVERING)),
+        )
+        .order_by(WebhookEvent.created_at.desc(), WebhookEvent.id.desc())
+        .offset(keep)
+    )
+    await session.execute(delete(WebhookEvent).where(WebhookEvent.id.in_(stale.scalar_subquery())))
+    await session.commit()
 
 
 @router.get("/{webhook_id}/deliveries", response_model=list[WebhookDeliveryRead])

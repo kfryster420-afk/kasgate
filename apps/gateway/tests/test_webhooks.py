@@ -735,6 +735,49 @@ async def test_test_fire_delivers_immediately(
     assert (failed.json()["status"], failed.json()["last_status_code"]) == ("pending", 410)
 
 
+async def test_test_fire_is_rate_limited_per_merchant(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+    override_settings: Any,
+) -> None:
+    override_settings(rl_webhook_test_per_minute=2)
+    first = await create_hook(client, seeded, ["trial.used"])
+    second = await create_hook(client, seeded, ["trial.used"])
+    for hook in (first, second):  # the limit is the merchant's, across all of its webhooks
+        fired = await client.post(f"/v1/webhooks/{hook.webhook.id}/test", headers=bearer(seeded.api_key))
+        assert fired.status_code == 200, fired.text
+    limited = await client.post(f"/v1/webhooks/{first.webhook.id}/test", headers=bearer(seeded.api_key))
+    assert limited.status_code == 429, limited.text
+    assert 0 < int(limited.headers["Retry-After"]) <= 60
+    assert len(webhook_receiver.requests) == 2  # the refused fire sent nothing
+    assert len(await events(sessionmaker)) == 2  # and queued nothing
+
+
+async def test_test_fire_keeps_only_the_newest_finished_test_events(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+    override_settings: Any,
+) -> None:
+    override_settings(webhook_test_events_kept=2)
+    created = await create_hook(client, seeded, ["trial.used"])
+    fired = [
+        (await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))).json()
+        for _ in range(4)
+    ]
+    kept = await events(sessionmaker)
+    assert len(kept) == 2 and len(await deliveries(sessionmaker)) == 2
+    assert {e.event_id for e in kept} == {fired[2]["event_id"], fired[3]["event_id"]}
+
+    webhook_receiver.status = 500  # failing test deliveries stay pending for retry and are never pruned
+    for _ in range(3):
+        await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    statuses = sorted(d.status for d in await deliveries(sessionmaker))
+    assert statuses == ["pending", "pending", "pending", "succeeded", "succeeded"]
+
 async def test_dispatcher_delivers_in_the_background(
     client: httpx.AsyncClient,
     seeded: Seed,

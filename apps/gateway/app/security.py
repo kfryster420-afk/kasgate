@@ -574,6 +574,8 @@ RATE_LIMIT_AUTH_VERIFY = RateLimit("auth_verify", "rl_auth_verify_per_minute", 6
 RATE_LIMIT_UNPAID_PROXY = RateLimit("proxy_unpaid", "rl_unpaid_proxy_per_minute", 60)
 # CONTRACT v2.12: free trial calls actually served, per client IP (anti-abuse on top of the per-endpoint daily cap).
 RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hour", 3600)
+# Webhook test-fire, per merchant: each call makes an outbound HTTPS request to the merchant's URL right away.
+RATE_LIMIT_WEBHOOK_TEST = RateLimit("webhook_test", "rl_webhook_test_per_minute", 60)
 
 
 def client_ip(request: Request) -> str:
