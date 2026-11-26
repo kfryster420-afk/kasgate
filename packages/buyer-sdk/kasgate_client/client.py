@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import kaspa
+from typing_extensions import Self
 
 from .catalog import CatalogPage, DiscoverResult
 from .challenge import decode_challenge, validate_challenge
@@ -38,10 +39,20 @@ from .constants import (
     NETWORK_TYPE,
     WELL_KNOWN_X402_PATH,
 )
+from .credit import (
+    CREDIT_EXTENSION,
+    HEADER_CREDIT,
+    CreditConfirmation,
+    CreditObservation,
+    FailedDeliveryCreditHint,
+    judge_credit,
+    observe_credit,
+)
 from .exceptions import (
     ConfigurationError,
     InsufficientPrepaidBalanceError,
     InvalidChallengeError,
+    KasGateError,
     PaymentExpiredError,
     PaymentReceiptError,
     PaymentRejectedError,
@@ -177,6 +188,7 @@ class KasGateClient:
         utxo_quarantine_seconds: float = DEFAULT_UTXO_QUARANTINE_SECONDS,
         http_client: httpx.AsyncClient | None = None,
         use_free_trials: bool = True,
+        auto_confirm_credit: bool = False,
         **httpx_kwargs: Any,
     ) -> None:
         if network not in NETWORK_ADDRESS_PREFIX:
@@ -221,6 +233,7 @@ class KasGateClient:
         self.min_output_sompi = min_output_sompi  # None = read DirectoryManifest.min_output_sompi per gateway
         self.max_redeliveries = max_redeliveries
         self.use_free_trials = bool(use_free_trials)
+        self.auto_confirm_credit = bool(auto_confirm_credit)
         self._manifest_floors: dict[str, int] = {}
         self.unavailable_retry_delay = unavailable_retry_delay
         self.max_signature_header_bytes = max_signature_header_bytes
@@ -246,7 +259,7 @@ class KasGateClient:
     def __repr__(self) -> str:
         return f"KasGateClient(address={self.address!r}, network={self.network!r}, max_price_sompi={self.max_price_sompi})"
 
-    async def __aenter__(self) -> KasGateClient:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -261,6 +274,28 @@ class KasGateClient:
     # ------------------------------------------------------------------ public HTTP verbs
 
     async def request(
+        self,
+        method: str,
+        url: str | httpx.URL,
+        *,
+        max_price_kas: Decimal | str | float | None = None,
+        expected_pay_to: str | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Send a request, paying a 402 challenge if there is one.
+
+        A response that carries `X-KasGate-Credit` (a paid call that failed for good and was credited, CONTRACT
+        v2.14) gets a `CreditObservation`, read with `credit_of(response)`. The header is an unsigned hint: it is
+        `confirmed` only after the balance check (`confirm_credit`, or automatically with `auto_confirm_credit`).
+        """
+        baseline = await self._credit_baseline(url) if self.auto_confirm_credit else None
+        response = await self._paid_request(
+            method, url, max_price_kas=max_price_kas, expected_pay_to=expected_pay_to, **kwargs
+        )
+        await self._observe_credit(response, url, baseline)
+        return response
+
+    async def _paid_request(
         self,
         method: str,
         url: str | httpx.URL,
@@ -551,6 +586,107 @@ class KasGateClient:
             code, message = error_details(response)
             raise PaymentRejectedError(response.status_code, code, message, response)
         return PrepaidBalance.model_validate(response.json())
+
+    # ------------------------------------------------------------------ failed-delivery credit hints (CONTRACT v2.14)
+
+    async def confirm_credit(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response,
+        *,
+        baseline_credited_sompi: int | None = None,
+    ) -> CreditObservation:
+        """Check an `X-KasGate-Credit` hint against the public prepaid balance before calling it real.
+
+        `credit` is the response (or its `credit_of(...)` observation, or a bare hint). The balance at the merchant
+        behind `slug` must belong to the hinted merchant and its `credited_sompi` must cover the hinted credit; pass
+        `baseline_credited_sompi` (the `credited_sompi` read before the call) to require that it GREW by that much.
+        Returns a new observation: `confirmed`, or `unconfirmed` with the reason (credit not visible, wrong
+        merchant, gateway unreachable). An `invalid` observation stays invalid. Never raises for gateway problems
+        and signs nothing.
+        """
+        observation = self._as_observation(credit)
+        if observation.hint is None or observation.status == "invalid":
+            return observation
+        if baseline_credited_sompi is not None and (
+            isinstance(baseline_credited_sompi, bool)
+            or not isinstance(baseline_credited_sompi, int)
+            or baseline_credited_sompi < 0
+        ):
+            raise ConfigurationError("baseline_credited_sompi must be a non-negative integer or None")
+        try:
+            balance = await self.prepaid_balance(gateway_url, slug)
+        except (httpx.HTTPError, KasGateError, ValueError) as exc:
+            confirmation = CreditConfirmation(
+                confirmed=False,
+                basis="none",
+                baseline_credited_sompi=baseline_credited_sompi,
+                detail=f"the balance check failed ({type(exc).__name__}); the credit is unverified",
+            )
+        else:
+            confirmation = judge_credit(observation.hint, balance, baseline_credited_sompi)
+        return CreditObservation(
+            status="confirmed" if confirmation.confirmed else "unconfirmed",
+            hint=observation.hint,
+            confirmation=confirmation,
+        )
+
+    @staticmethod
+    def _as_observation(credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response) -> CreditObservation:
+        if isinstance(credit, httpx.Response):
+            found = credit.extensions.get(CREDIT_EXTENSION)
+            if not isinstance(found, CreditObservation):
+                raise ConfigurationError("the response carries no X-KasGate-Credit hint")
+            return found
+        if isinstance(credit, FailedDeliveryCreditHint):
+            return CreditObservation(status="hint", hint=credit)
+        if isinstance(credit, CreditObservation):
+            return credit
+        raise ConfigurationError("credit must be a response, a CreditObservation or a FailedDeliveryCreditHint")
+
+    async def _credit_baseline(self, url: str | httpx.URL) -> int | None:
+        """`credited_sompi` before the call (best effort), so a later hint must show a real increase."""
+        try:
+            target = self._absolute(url)
+            slug = slug_of(target.raw_path.decode("ascii"))
+            balance = await self.prepaid_balance(self._origin(target), slug)
+        except (httpx.HTTPError, KasGateError, ValueError, UnicodeError):
+            return None
+        return None if balance.credited_sompi is None else int(balance.credited_sompi)
+
+    async def _observe_credit(self, response: httpx.Response, url: str | httpx.URL, baseline: int | None) -> None:
+        """Attach the credit observation of `response` (never raises, never leaves a header unexamined)."""
+        raw = response.headers.get(HEADER_CREDIT)
+        if raw is None:
+            return
+        receipt = receipt_of(response)
+        observation = observe_credit(
+            raw,
+            status_code=response.status_code,
+            tx_id=None if receipt is None else receipt.tx_id,
+            merchant_sompi=None if receipt is None else receipt.merchant_sompi,
+        )
+        if observation is None:
+            return
+        if self.auto_confirm_credit and observation.status == "hint":
+            try:
+                target = self._absolute(url)
+                slug = slug_of(target.raw_path.decode("ascii"))
+                observation = await self.confirm_credit(
+                    self._origin(target), slug, observation, baseline_credited_sompi=baseline
+                )
+            except (KasGateError, ValueError, UnicodeError) as exc:
+                observation = CreditObservation(
+                    status="unconfirmed",
+                    hint=observation.hint,
+                    confirmation=CreditConfirmation(
+                        confirmed=False,
+                        basis="none",
+                        detail=f"the balance check could not run ({type(exc).__name__}); the credit is unverified",
+                    ),
+                )
+        response.extensions[CREDIT_EXTENSION] = observation
 
     async def prepaid_request(
         self,

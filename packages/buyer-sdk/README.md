@@ -88,6 +88,38 @@ await client.prepaid_refund_cancel("https://gw.example", "weather", refund.id)  
 - `prepaid_balance` now also reports `refunded_sompi`, `expired_sompi`, `refund_hold_sompi` (set aside by an open
   refund), `spendable_sompi` and `expires_at` (when the merchant set a credit expiry).
 
+## Failed-delivery credits (CONTRACT v2.14)
+
+When a paid call fails for good (the upstream answered 5xx or not at all) and redelivery is closed, the gateway turns the
+merchant share of that payment into prepaid credit and announces it in the `X-KasGate-Credit` response header. The
+header is **unsigned**: the SDK treats it as a hint and never reports a credit as real until the public balance agrees.
+
+```python
+from kasgate_client import credit_of
+
+response = await client.request("GET", "https://gw.example/p/weather/today")   # 502 after payment
+observation = credit_of(response)             # None when there is no header
+observation.status                            # "hint": parsed, NOT checked
+observation = await client.confirm_credit("https://gw.example", "weather", observation)
+observation.status                            # "confirmed" | "unconfirmed"
+observation.confirmation.basis                # "increase" | "cumulative" | "none"
+
+# or let the client check by itself (reads `credited_sompi` before the call as a baseline):
+client = KasGateClient(key, auto_confirm_credit=True)
+```
+
+- `credit_of(response)` returns a frozen, strict `CreditObservation(status, hint, error, confirmation)`, or `None` without
+  the header. `status` is `hint` (parsed, unchecked), `confirmed`, `unconfirmed` (the balance does not show the credit) or
+  `invalid` (malformed, larger than 2 KiB, not a 5xx, or inconsistent with the payment it came with: another `txId`, an
+  amount other than the merchant share, a balance below the credit). Nothing in the header can raise.
+- `confirm_credit(gateway_url, slug, credit, *, baseline_credited_sompi=None)` reads `GET /v1/prepaid/balance` (public) and
+  says `confirmed` only when the balance belongs to the hinted merchant and `credited_sompi` covers the credit. With a
+  baseline the balance must also have grown by at least the credit (`basis="increase"`); without one the check is the
+  weaker `basis="cumulative"` (an older credit could be covering a forged hint). It never raises for gateway problems.
+- `prepaid_balance` reports `credited_sompi`, the cumulative amount ever credited at that merchant.
+- A credit is call-only prepaid credit at one merchant: it is not refundable and it is not spend that came back, so it
+  must not be subtracted from a spend total. `SyncKasGateClient.confirm_credit` is the blocking twin.
+
 ## Free trial calls (CONTRACT v2.12)
 
 Merchants can give every buyer key N free calls per endpoint. `request()` uses them automatically before paying:

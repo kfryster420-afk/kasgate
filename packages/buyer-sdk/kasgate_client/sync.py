@@ -13,9 +13,11 @@ from collections.abc import Coroutine
 from typing import Any, TypeVar
 
 import httpx
+from typing_extensions import Self
 
 from .catalog import DiscoverResult
 from .client import KasGateClient
+from .credit import CreditObservation, FailedDeliveryCreditHint
 from .prepaid import PrepaidBalance, PrepaidDepositReceipt, PrepaidRefund
 from .trials import TrialStatus
 
@@ -89,6 +91,18 @@ class KasGateSyncClient:
     def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
         return self._call(self._client.prepaid_balance(gateway_url, slug))
 
+    def confirm_credit(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response,
+        *,
+        baseline_credited_sompi: int | None = None,
+    ) -> CreditObservation:
+        return self._call(
+            self._client.confirm_credit(gateway_url, slug, credit, baseline_credited_sompi=baseline_credited_sompi)
+        )
+
     def prepaid_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self._call(self._client.prepaid_request(method, url, **kwargs))
 
@@ -120,7 +134,7 @@ class KasGateSyncClient:
         finally:
             self._stop_loop()
 
-    def __enter__(self) -> KasGateSyncClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info: object) -> None:

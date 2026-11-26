@@ -101,6 +101,8 @@ class PrepaidBalance(_Model):
     spendable_sompi: BalanceStr | None = None
     """What calls can be paid from now (balance minus an open refund's hold, 0 once expired). None = old gateway."""
     expires_at: datetime | None = None
+    # CONTRACT v2.14 (absent from older gateways, hence None): cumulative failed-delivery credit at this merchant.
+    credited_sompi: BalanceStr | None = None
 
 
 RefundAction = Literal["request", "cancel"]

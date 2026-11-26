@@ -16,12 +16,14 @@ from urllib.parse import quote, unquote
 import httpx
 from kasgate_client import (
     DEFAULT_MAX_PRICE_SOMPI,
+    CreditObservation,
     KasGateClient,
     KasGateError,
     PaymentReceipt,
     PrepaidReceipt,
     PrepaidRefund,
     TrialReceipt,
+    credit_of,
     kas_to_sompi,
     prepaid_receipt_of,
     receipt_of,
@@ -94,6 +96,7 @@ class Config:
     session_budget_sompi: int = DEFAULT_MAX_PRICE_SOMPI
     timeout_seconds: float = 60.0
     use_free_trials: bool = True
+    auto_confirm_credit: bool = True
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -131,6 +134,7 @@ class Config:
             session_budget_sompi=session_budget,
             timeout_seconds=timeout,
             use_free_trials=env.get("KASGATE_USE_FREE_TRIALS", "1").strip().lower() in TRUTHY,
+            auto_confirm_credit=env.get("KASGATE_AUTO_CONFIRM_CREDIT", "1").strip().lower() in TRUTHY,
         )
 
 
@@ -198,6 +202,51 @@ def _describe_prepaid_receipt(receipt: PrepaidReceipt) -> dict[str, Any]:
     }
 
 
+CREDIT_NOTES = {
+    "hint": (
+        "UNVERIFIED: X-KasGate-Credit is an unsigned hint. Do not count this as credit until the balance check "
+        "confirms it (prepaid_balance, field credited_sompi)."
+    ),
+    "confirmed": (
+        "Confirmed against the public prepaid balance. This is call-only credit at this merchant: spend it with "
+        "call_prepaid_endpoint. It is not refundable and it does not reduce the session budget's spent amount."
+    ),
+    "unconfirmed": "The balance check did not corroborate this hint. Do not rely on any credit from it.",
+    "invalid": "The credit header was malformed or did not fit this call and was ignored. No credit is claimed.",
+}
+
+
+def _describe_credit(observation: CreditObservation) -> dict[str, Any]:
+    """The `credit` part of a paid-call result. Amounts appear at top level only once the balance confirms them."""
+    hint = observation.hint
+    confirmation = observation.confirmation
+    return {
+        "status": observation.status,
+        "confirmed": observation.confirmed,
+        "credit_sompi": hint.credit_sompi if observation.confirmed and hint else None,
+        "credit_kas": sompi_to_kas(hint.credit_sompi) if observation.confirmed and hint else None,
+        "hint": None
+        if hint is None
+        else {
+            "credit_id": str(hint.creditId),
+            "tx_id": hint.txId,
+            "merchant_id": str(hint.merchantId),
+            "credit_sompi": hint.credit_sompi,
+            "reason": hint.reason,
+        },
+        "confirmation": None
+        if confirmation is None
+        else {
+            "basis": confirmation.basis,
+            "credited_sompi": confirmation.credited_sompi,
+            "baseline_credited_sompi": confirmation.baseline_credited_sompi,
+            "detail": confirmation.detail,
+        },
+        "error": observation.error,
+        "note": CREDIT_NOTES[observation.status],
+    }
+
+
 def _describe_trial_receipt(receipt: TrialReceipt) -> dict[str, Any]:
     return {
         "trial_call_id": str(receipt.trialCallId),
@@ -229,7 +278,8 @@ def build_server(
             "withdraw it with prepaid_refund_cancel). Endpoints may offer free trial calls: "
             "the paying tools use them automatically before paying (see `trial` in the result), trial_status shows "
             "what is left and call_free_trial makes a call that can never pay. A tighter max_price_kas can only "
-            "lower the configured ceiling, never raise it. Keys are never logged."
+            "lower the configured ceiling, never raise it. A failed paid call may report a `credit`: treat it as real "
+            "only when credit.confirmed is true (the balance check), never from the header alone. Keys are never logged."
         ),
     )
     state: dict[str, Any] = {"http": http_client, "buyer": buyer}
@@ -256,6 +306,7 @@ def build_server(
                     timeout=cfg.timeout_seconds,
                     follow_redirects=False,
                     use_free_trials=cfg.use_free_trials,
+                    auto_confirm_credit=cfg.auto_confirm_credit,
                 )
             except KasGateError as exc:
                 raise ToolError(f"cannot start the payment client: {exc}") from exc
@@ -324,6 +375,12 @@ def build_server(
         result["payment"] = _describe_receipt(receipt) if receipt else None
         trial = trial_receipt_of(response)
         result["trial"] = _describe_trial_receipt(trial) if trial else None
+        observation = credit_of(response)
+        if observation is not None and observation.status == "hint" and cfg.auto_confirm_credit:
+            # A client that was not built to confirm on its own (an injected one): check the balance here.
+            observation = await client.confirm_credit(cfg.gateway_url, slug, observation)
+        # Spend is never reduced by a credit: the payment above stays spent, the credit is call-only prepaid credit.
+        result["credit"] = _describe_credit(observation) if observation is not None else None
         return result
 
     @server.tool()
@@ -390,6 +447,9 @@ def build_server(
         Refuses before signing anything if the quoted total exceeds max_price_kas (or the server's ceiling,
         whichever is lower). `path` is appended to the endpoint (e.g. "v1/items?limit=3"); `body` is sent as JSON.
         This tool does not draw down the session spend cap; use call_with_budget for session-capped spending.
+        If the upstream failed for good and the gateway announced a credit, `credit` says so: only
+        `credit.confirmed == true` (checked against the public prepaid balance) counts; the header alone is an
+        unsigned hint.
         """
         return await _execute_paid_call(slug, method, path, body, max_price_kas)
 
@@ -406,7 +466,9 @@ def build_server(
         The catalog (quoted list price) is reserved atomically before any key use or signing. If the live
         402 amount exceeds the reservation, the reservation is released and nothing is signed. The
         reservation is released on any failure and committed on success. Concurrent calls cannot together
-        exceed the session cap. max_price_kas can only tighten the per-call maximum.
+        exceed the session cap. max_price_kas can only tighten the per-call maximum. A failed call that was
+        credited stays fully spent: `credit` (unsigned hint until `credit.confirmed`) is call-only prepaid
+        credit and never lowers the spent amount.
         """
         slug = validate_slug(slug)
         per_call = _parse_optional_max_price_kas(max_price_kas)
@@ -495,6 +557,7 @@ def build_server(
             "refunded_sompi": int(balance.refunded_sompi),
             "expired_sompi": int(balance.expired_sompi),
             "refund_hold_sompi": int(balance.refund_hold_sompi),
+            "credited_sompi": int(balance.credited_sompi) if balance.credited_sompi is not None else None,
             "spendable_sompi": int(balance.spendable_sompi)
             if balance.spendable_sompi is not None
             else int(balance.balance_sompi),

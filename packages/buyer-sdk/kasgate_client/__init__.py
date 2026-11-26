@@ -20,6 +20,17 @@ from .constants import (
     MAX_INPUT_ADDRESSES,
     SOMPI_PER_KAS,
 )
+from .credit import (
+    CREDIT_EXTENSION,
+    HEADER_CREDIT,
+    CreditConfirmation,
+    CreditObservation,
+    FailedDeliveryCreditHint,
+    credit_of,
+    judge_credit,
+    observe_credit,
+    parse_credit_header,
+)
 from .exceptions import (
     ChallengeExpiredError,
     ConfigurationError,
@@ -99,10 +110,12 @@ from .trials import (
 )
 
 __all__ = [
+    "CREDIT_EXTENSION",
     "DEFAULT_MAX_NETWORK_FEE_SOMPI",
     "DEFAULT_MAX_PRICE_SOMPI",
     "DEFAULT_MIN_CHANGE_SOMPI",
     "DEFAULT_MIN_OUTPUT_SOMPI",
+    "HEADER_CREDIT",
     "HEADER_PAYMENT_REQUIRED",
     "HEADER_PAYMENT_RESPONSE",
     "HEADER_PAYMENT_SIGNATURE",
@@ -130,8 +143,11 @@ __all__ = [
     "CatalogPage",
     "ChallengeExpiredError",
     "ConfigurationError",
+    "CreditConfirmation",
+    "CreditObservation",
     "DiscoverResult",
     "DustChangeError",
+    "FailedDeliveryCreditHint",
     "FeeSplitMismatchError",
     "InsufficientFundsError",
     "InsufficientPrepaidBalanceError",
@@ -173,8 +189,12 @@ __all__ = [
     "build_trial_call_message",
     "compute_fee_split",
     "compute_webhook_signature",
+    "credit_of",
+    "judge_credit",
     "kas_to_sompi",
     "min_price_sompi",
+    "observe_credit",
+    "parse_credit_header",
     "payer_proof_message",
     "payment_payload",
     "prepaid_body_hash",
