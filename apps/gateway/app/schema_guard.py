@@ -18,12 +18,15 @@ logger = logging.getLogger(__name__)
 
 REVISION_0008: Final = "0008_prepaid_refunds"
 # Columns of prepaid_refunds that only the final 0008 creates (the earliest draft lacks all of them).
-FINAL_0008_REFUND_COLUMNS: Final = frozenset({"claimed_at", "first_claimed_at", "hold_until", "late_paid_from"})
+FINAL_0008_REFUND_COLUMNS: Final = frozenset(
+    {"claimed_at", "first_claimed_at", "first_claimed_daa_score", "hold_until", "late_paid_from"}
+)
 
 STALE_0008_MESSAGE: Final = (
     "this database was migrated with an earlier draft of revision 0008_prepaid_refunds (CONTRACT v2.13, before "
     "release) and lacks the final refund schema (prepaid_refund_payouts and/or prepaid_refunds.first_claimed_at, "
-    "hold_until). `alembic upgrade head` cannot fix it because the revision id is the same. Take it back to 0007 "
+    "first_claimed_daa_score, hold_until). `alembic upgrade head` cannot fix it because the revision id is the same. "
+    "Take it back to 0007 "
     "and upgrade again: `alembic downgrade 0007_trials_webhooks && alembic upgrade head` (the downgrade refuses "
     "while refund or expiry data exists; on a testnet/dev database, export what you need and rebuild it). See "
     "docs/RUNBOOK.md, 'Migration 0008 revised in place'."

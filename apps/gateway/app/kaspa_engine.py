@@ -181,6 +181,8 @@ class RpcClientProtocol(Protocol):
 
     async def get_mempool_entries_by_addresses(self, request: dict[str, Any]) -> Any: ...
 
+    async def get_block_dag_info(self, request: dict[str, Any] | None = None) -> Any: ...
+
 
 RpcClientFactory = Callable[[], RpcClientProtocol]
 
@@ -325,6 +327,24 @@ def check_payout_outputs(tx_id: str, outputs: OutputMap, to_address: str, amount
     raise PaymentVerificationError(
         "invalid_payout", f"no output of {tx_id} pays the buyer exactly {amount_sompi} sompi (found {values})"
     )
+
+
+def _utxo_daa_score(utxo: dict[str, Any]) -> int | None:
+    """The accepting block's DAA score, or None when the node omitted it (the output still counts)."""
+    raw = utxo.get("blockDaaScore")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise PaymentVerificationError("invalid_payment_header", "a UTXO DAA score is malformed in the node's reply")
+    if isinstance(raw, int):
+        if raw < 0:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "a UTXO DAA score is malformed in the node's reply"
+            )
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    raise PaymentVerificationError("invalid_payment_header", "a UTXO DAA score is malformed in the node's reply")
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -756,8 +776,19 @@ class KaspaEngine:
                 "transaction JSON (KasWare sendKaspa returns it) as `transaction` to prove it is this refund's payout",
             )
 
+    async def virtual_daa_score(self) -> int:
+        """The node's current virtual DAA score (`get_block_dag_info().virtualDaaScore`). Stored at first claim so
+        the pre-cancel UTXO scan can ignore outputs accepted before that moment."""
+        response = await self._rpc("get_block_dag_info", lambda client: client.get_block_dag_info())
+        score = _as_dict(response).get("virtualDaaScore")
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            raise PaymentVerificationError(
+                "invalid_payment_header", "the node's virtual DAA score is missing or malformed"
+            )
+        return score
+
     async def find_refund_payouts(
-        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, min_daa_score: int = 0
     ) -> list[PayoutSighting]:
         """Every transaction the node shows that may be this refund's payout, before a buyer cancel of a refund the
         merchant had claimed. Nothing is submitted.
@@ -765,7 +796,9 @@ class KaspaEngine:
         * Mempool (entries received by ``to_address``): any transaction carrying the payload
           ``kasgate:v1:refund:<refund_id hex>``, whatever it pays (``payload_seen=True``).
         * UTXO index (accepted, payload not readable there): any non-coinbase output paying ``to_address`` exactly
-          ``amount_sompi`` (``payload_seen=False``; the caller skips transactions it already knows).
+          ``amount_sompi`` whose ``blockDaaScore`` is greater than ``min_daa_score`` (the virtual DAA stored at the
+          first claim; outputs accepted at or before the claim are ignored). ``min_daa_score=0`` does not filter.
+          The caller skips transactions it already knows.
 
         Raises ``wrong_network``, a malformed-reply ``invalid_payment_header`` or ``RpcUnavailableError`` (the caller
         must then refuse the cancel: it cannot rule out a payout in flight).
@@ -799,6 +832,10 @@ class KaspaEngine:
                 raise PaymentVerificationError("invalid_payment_header", "a UTXO is malformed in the node's reply")
             if utxo.get("isCoinbase") is True or isinstance(amount, bool) or amount != amount_sompi:
                 continue
+            if min_daa_score > 0:
+                daa = _utxo_daa_score(utxo)
+                if daa is not None and daa <= min_daa_score:
+                    continue
             found.setdefault(entry_tx.lower(), PayoutSighting(entry_tx.lower(), payload_seen=False))
         return list(found.values())
 

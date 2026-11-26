@@ -85,7 +85,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"                   
 | `PREPAID_PAYOUT_ATTEMPT_MAX_SECONDS` | `604800` | An attempted payout tx_id never confirmed for this long is `abandoned` (re-checks stop; the buyer may cancel again). |
 | `PREPAID_PAYOUT_BACKOFF_BASE_SECONDS` / `PREPAID_PAYOUT_BACKOFF_MAX_SECONDS` | `30` / `1800` | Re-check backoff after a node error on an attempted payout (doubles per error). Node errors never revert a payout. |
 | `PREPAID_REFUND_CLAIM_TTL_SECONDS` | `900` | How long a merchant's claim (`paying`) blocks the buyer's cancel without a posted payout. |
-| `PREPAID_REFUND_CLAIM_MAX_SECONDS` | `3600` | Total claim time from the first claim (`first_claimed_at`); renewals past it are refused. |
+| `PREPAID_REFUND_CLAIM_MAX_SECONDS` | `3600` | Total claim time from the first claim (`first_claimed_at`); renewals past it are refused. `first_claimed_at` survives a payout revert, so after this window a reverted refund cannot be claimed again (the merchant pays unclaimed, or rejects); the pre-cancel scan and cooldown still apply. |
 | `PREPAID_REFUND_CANCEL_COOLDOWN_SECONDS` | `1800` | After the buyer cancels a refund the merchant had claimed, the amount stays held this long (`hold_until`) before it is spendable again. `0` releases at once. |
 | `PREPAID_PAYOUT_MAX_PENDING_ATTEMPTS` | `3` | Unconfirmed payout attempts allowed per refund (409 `too_many_attempts` beyond). |
 | `PREPAID_PAYOUT_UNSEEN_BACKOFF_FRACTION` | `0.1` | An unseen attempt is re-checked after its age x this fraction (capped by `PREPAID_PAYOUT_BACKOFF_MAX_SECONDS`). |
