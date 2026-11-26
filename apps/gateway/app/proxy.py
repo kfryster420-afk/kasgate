@@ -53,6 +53,7 @@ forwarded again and counted in `Settlement.delivery_attempts`. Anything else for
 import asyncio
 import json
 import logging
+import math
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
@@ -65,11 +66,11 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from kaspa import Address, PublicKey, pay_to_address_script, verify_message
+from kaspa import PublicKey, verify_message
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,7 +87,17 @@ from app.deps import (
     get_redis,
 )
 from app.exact_v2 import ExactV2Verification, check_authorization_expiry
+from app.failed_delivery import credit_if_exhausted, credit_policy_for
+from app.kaspa_types import payer_public_key as payer_public_key
 from app.models import (
+    DELIVERY_CREDITED,
+    DELIVERY_DELIVERED,
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+    FAILURE_CONNECT_ERROR,
+    FAILURE_OVERSIZED,
+    FAILURE_TIMEOUT,
+    FAILURE_UPSTREAM_5XX,
     PREPAID_DEBIT_DEBITED,
     PREPAID_DEBIT_REFUNDED,
     TRIAL_CALL_REFUNDED,
@@ -95,6 +106,7 @@ from app.models import (
     Merchant,
     PrepaidBalance,
     PrepaidDebit,
+    PrepaidLedgerEntry,
     PriceCurrency,
     Settlement,
     SettlementStatus,
@@ -105,6 +117,7 @@ from app.models import (
 from app.oracle import OracleUnavailableError, usd_value
 from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.schemas import (
+    HEADER_FAILED_DELIVERY_CREDIT,
     HEADER_K402_PAYMENT,
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_RESPONSE,
@@ -189,9 +202,17 @@ PAYMENT_IDENTIFIER_LOCK_PREFIX: Final = "kasgate:pid:"
 MAX_EXACT_V2_HEADER_BYTES: Final = 65_536
 DELIVERY_LOCK_PREFIX: Final = "kasgate:delivery:"
 DELIVERY_LOCK_TTL_SECONDS: Final = 60
+
+
+def _delivery_lock_ttl() -> int:
+    """The in-flight marker outlives one full upstream attempt (UPSTREAM_TIMEOUT_SECONDS) with a margin."""
+    return max(DELIVERY_LOCK_TTL_SECONDS, math.ceil(get_settings().upstream_timeout_seconds) + 30)
+
+
 DEAD_LETTER_KEY: Final = "kasgate:deadletter:settlements"
 SERVICE_UNAVAILABLE_RETRY_SECONDS: Final = "5"
-UPSTREAM_TIMEOUT_SECONDS: Final = 30.0
+# CONTRACT v2.14: delivery outcomes that could not be stored (the settlement stays `pending`, never credited).
+DELIVERY_OUTCOME_DEAD_LETTER_KEY: Final = "kasgate:deadletter:delivery-outcomes"
 MAX_REQUEST_BODY_BYTES: Final = 10 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES: Final = 32 * 1024 * 1024
 USD_QUANTUM: Final = Decimal("0.00000001")
@@ -440,7 +461,13 @@ async def _prepare_upstream(request: Request, endpoint: Endpoint, path_suffix: s
 
 
 class UpstreamFailedError(Exception):
-    pass
+    """No relayable upstream answer. `failure` says why (models.DELIVERY_FAILURES); `status_code` is the real status
+    when the upstream did answer but the gateway refused to relay it (oversized body)."""
+
+    def __init__(self, message: str, *, failure: str = FAILURE_CONNECT_ERROR, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -452,7 +479,7 @@ class UpstreamResult:
 
 async def _call_upstream(client: httpx.AsyncClient, method: str, prepared: PreparedUpstream) -> UpstreamResult:
     try:
-        async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(get_settings().upstream_timeout_seconds):
             request = client.build_request(
                 method, prepared.url, headers=prepared.headers, content=prepared.body or None
             )
@@ -463,12 +490,16 @@ async def _call_upstream(client: httpx.AsyncClient, method: str, prepared: Prepa
                 async for chunk in response.aiter_bytes():
                     size += len(chunk)
                     if size > MAX_RESPONSE_BODY_BYTES:
-                        raise UpstreamFailedError("upstream response exceeds the gateway limit")
+                        raise UpstreamFailedError(
+                            "upstream response exceeds the gateway limit",
+                            failure=FAILURE_OVERSIZED,
+                            status_code=response.status_code,
+                        )
                     chunks.append(chunk)
             finally:
                 await response.aclose()
-    except TimeoutError as exc:
-        raise UpstreamFailedError("upstream request timed out") from exc
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise UpstreamFailedError("upstream request timed out", failure=FAILURE_TIMEOUT) from exc
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise UpstreamFailedError(f"upstream request failed: {type(exc).__name__}") from exc
     return UpstreamResult(
@@ -504,7 +535,7 @@ async def _release_payment_locks(redis: Redis, tx_id: str, nonce: str) -> None:
 async def _hold_delivery_lock(redis: Redis, tx_id: str) -> None:
     """Mark a delivery as in flight so a redelivery cannot run concurrently with it (best effort)."""
     try:
-        await redis.set(delivery_lock_key(tx_id), "1", ex=DELIVERY_LOCK_TTL_SECONDS)
+        await redis.set(delivery_lock_key(tx_id), "1", ex=_delivery_lock_ttl())
     except RedisError:
         logger.warning("could not mark delivery of %s as in flight", tx_id, exc_info=True)
 
@@ -516,15 +547,69 @@ async def _drop_delivery_lock(redis: Redis, tx_id: str) -> None:
         logger.warning("could not clear the in-flight delivery marker for %s", tx_id, exc_info=True)
 
 
-async def _record_upstream_status(session: AsyncSession, settlement_id: uuid.UUID, status_code: int | None) -> None:
+class DeliveryOutcomeError(Exception):
+    """The delivery outcome could not be stored. `payload` is the JSON to reconcile from the dead-letter list."""
+
+    def __init__(self, payload: str) -> None:
+        super().__init__(payload)
+        self.payload = payload
+
+
+async def _write_delivery_outcome(
+    session: AsyncSession, settlement_id: uuid.UUID, outcome: str, failure: str | None, status_code: int | None
+) -> None:
+    """CONTRACT v2.14: replace `pending` with how this delivery ended. Logs at ERROR and raises DeliveryOutcomeError
+    when the store fails (the settlement then stays `pending`, which is never credited)."""
     try:
         await session.execute(
-            update(Settlement).where(Settlement.id == settlement_id).values(upstream_status_code=status_code)
+            update(Settlement)
+            .where(Settlement.id == settlement_id, Settlement.delivery_outcome.is_distinct_from(DELIVERY_CREDITED))
+            .values(upstream_status_code=status_code, delivery_outcome=outcome, delivery_failure=failure)
         )
         await session.commit()
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         await session.rollback()
-        logger.exception("could not store upstream status for settlement %s", settlement_id)
+        payload = json.dumps(
+            {
+                "settlementId": str(settlement_id),
+                "deliveryOutcome": outcome,
+                "deliveryFailure": failure,
+                "upstreamStatusCode": status_code,
+                "at": datetime.now(UTC).isoformat(),
+            },
+            sort_keys=True,
+        )
+        logger.error("could not store the delivery outcome of settlement %s: %s", settlement_id, payload, exc_info=True)
+        raise DeliveryOutcomeError(payload) from exc
+
+
+async def _record_upstream_status(session: AsyncSession, settlement_id: uuid.UUID, status_code: int | None) -> None:
+    """A relayed upstream answer: `delivered` below 500, `failed` (upstream_5xx) from 500.
+
+    Raises DeliveryOutcomeError when the outcome cannot be stored."""
+    if status_code is not None and status_code < 500:
+        await _write_delivery_outcome(session, settlement_id, DELIVERY_DELIVERED, None, status_code)
+    else:
+        failure = FAILURE_CONNECT_ERROR if status_code is None else FAILURE_UPSTREAM_5XX
+        await _write_delivery_outcome(session, settlement_id, DELIVERY_FAILED, failure, status_code)
+
+
+async def _record_upstream_failure(
+    session: AsyncSession, settlement_id: uuid.UUID, failure: str, status_code: int | None
+) -> None:
+    """No relayable answer (connection error, timeout, oversized body). Raises DeliveryOutcomeError."""
+    await _write_delivery_outcome(session, settlement_id, DELIVERY_FAILED, failure, status_code)
+
+
+async def _alert_unrecorded_outcome(redis: Redis, payload: str) -> None:
+    """Alert path for a delivery outcome the database refused: the dead-letter list (watched like the settlement
+    dead-letter list) plus an ERROR log line. Never raises, so the buyer still gets the upstream's answer."""
+    try:
+        await cast(Awaitable[int], redis.lpush(DELIVERY_OUTCOME_DEAD_LETTER_KEY, payload))
+    except RedisError:
+        logger.error("dead-letter queue unavailable; unrecorded delivery outcome: %s", payload, exc_info=True)
+        return
+    logger.error("unrecorded delivery outcome pushed to %s: %s", DELIVERY_OUTCOME_DEAD_LETTER_KEY, payload)
 
 
 def _settlement_payload(settlement: Settlement, endpoint_slug: str) -> str:
@@ -952,6 +1037,7 @@ def _verification_failure(exc: PaymentVerificationError, required: PaymentRequir
 
 async def _forward_and_record(
     session: AsyncSession,
+    redis: Redis,
     client: httpx.AsyncClient,
     method: str,
     prepared: PreparedUpstream,
@@ -959,19 +1045,46 @@ async def _forward_and_record(
     tx_id: str,
     payment_response: str,
 ) -> Response:
+    """Call the upstream for a settled payment, record the delivery outcome and credit a final failure (v2.14).
+
+    The settlement is already `pending` (written with it, or by the redelivery claim). A credit is only attempted
+    after the `failed` outcome was stored; if the store fails the outcome is dead-lettered and nothing is credited.
+    """
     try:
         result = await _call_upstream(client, method, prepared)
     except UpstreamFailedError as exc:
         logger.warning("upstream failure for settled tx %s: %s", tx_id, exc)
-        await _record_upstream_status(session, settlement_id, None)
-        return _error(
-            502,
-            "upstream_error",
-            "the upstream API did not return a response",
-            headers={HEADER_PAYMENT_RESPONSE: payment_response},
-        )
-    await _record_upstream_status(session, settlement_id, result.status_code)
-    return _relay(result, payment_response)
+        headers = {HEADER_PAYMENT_RESPONSE: payment_response}
+        try:
+            await _record_upstream_failure(session, settlement_id, exc.failure, exc.status_code)
+        except DeliveryOutcomeError as err:
+            await _alert_unrecorded_outcome(redis, err.payload)
+        else:
+            credit = await credit_if_exhausted(session, settlement_id)
+            receipt = None if credit is None else credit.receipt()
+            if receipt is not None:
+                headers[HEADER_FAILED_DELIVERY_CREDIT] = receipt.to_header()
+        if exc.failure == FAILURE_OVERSIZED:
+            return _error(
+                502,
+                "upstream_response_too_large",
+                "the upstream answered with a body larger than the gateway relays",
+                headers=headers,
+            )
+        return _error(502, "upstream_error", "the upstream API did not return a response", headers=headers)
+    recorded = True
+    try:
+        await _record_upstream_status(session, settlement_id, result.status_code)
+    except DeliveryOutcomeError as err:
+        recorded = False
+        await _alert_unrecorded_outcome(redis, err.payload)
+    response = _relay(result, payment_response)
+    if recorded and result.status_code >= 500:
+        credit = await credit_if_exhausted(session, settlement_id)
+        receipt = None if credit is None else credit.receipt()
+        if receipt is not None:
+            response.headers[HEADER_FAILED_DELIVERY_CREDIT] = receipt.to_header()
+    return response
 
 
 def _redelivery_allowed(
@@ -1024,8 +1137,11 @@ def _redelivery_window_open(settings: Settings, settlement: Settlement, endpoint
     )
 
 
-async def _claim_redelivery(session: AsyncSession, settlement_id: uuid.UUID, max_attempts: int) -> bool:
-    """Atomically count one more delivery; False when a concurrent request already used the last attempt."""
+async def _claim_redelivery(
+    session: AsyncSession, settlement_id: uuid.UUID, max_attempts: int, window_seconds: int
+) -> bool:
+    """Atomically count one more delivery and mark it `pending`; False when the attempt cap, the window (checked on
+    the database clock, like the credit sweep) or a credit already closed redelivery."""
     result = await session.execute(
         update(Settlement)
         .where(
@@ -1033,8 +1149,15 @@ async def _claim_redelivery(session: AsyncSession, settlement_id: uuid.UUID, max
             Settlement.status == SettlementStatus.SETTLED,
             Settlement.delivery_attempts < max_attempts,
             or_(Settlement.upstream_status_code.is_(None), Settlement.upstream_status_code >= 500),
+            Settlement.settled_at > func.now() - timedelta(seconds=window_seconds),
+            # A failed delivery that was already credited to prepaid can never be delivered as well. The outcome
+            # check is on the row itself, so it is re-evaluated after a concurrent credit's row lock is released.
+            Settlement.delivery_outcome.is_distinct_from(DELIVERY_CREDITED),
+            ~exists().where(PrepaidLedgerEntry.settlement_id == Settlement.id),
         )
-        .values(delivery_attempts=Settlement.delivery_attempts + 1)
+        .values(
+            delivery_attempts=Settlement.delivery_attempts + 1, delivery_outcome=DELIVERY_PENDING, delivery_failure=None
+        )
         .returning(Settlement.id)
     )
     claimed = result.scalar_one_or_none() is not None
@@ -1054,7 +1177,7 @@ async def _redeliver(
     settings = get_settings()
     tx_id = settlement.tx_id
     try:
-        idle = await redis.set(delivery_lock_key(tx_id), "1", nx=True, ex=DELIVERY_LOCK_TTL_SECONDS)
+        idle = await redis.set(delivery_lock_key(tx_id), "1", nx=True, ex=_delivery_lock_ttl())
     except RedisError:
         logger.exception("delivery marker unavailable")
         return _error(503, "service_unavailable", "payment replay protection is temporarily unavailable")
@@ -1062,7 +1185,9 @@ async def _redeliver(
         return _error(409, "payment_replayed", "this transaction is already being delivered")
     try:
         try:
-            claimed = await _claim_redelivery(session, settlement.id, settings.redelivery_max_attempts)
+            claimed = await _claim_redelivery(
+                session, settlement.id, settings.redelivery_max_attempts, settings.redelivery_window_seconds
+            )
         except SQLAlchemyError:
             await session.rollback()
             logger.exception("redelivery claim failed")
@@ -1072,7 +1197,9 @@ async def _redeliver(
         if payment_response is None:
             usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
             payment_response = _payment_response_header(tx_id, usd)
-        return await _forward_and_record(session, client, method, prepared, settlement.id, tx_id, payment_response)
+        return await _forward_and_record(
+            session, redis, client, method, prepared, settlement.id, tx_id, payment_response
+        )
     finally:
         await _drop_delivery_lock(redis, tx_id)
 
@@ -1128,10 +1255,14 @@ async def _settle_and_deliver(
     tx_id = verified.tx_id
     rate = await _lookup_rate(oracle, terms)
     settlement = _new_settlement(endpoint, merchant_address, terms, verified, rate, request)
+    # CONTRACT v2.14: the delivery is `pending` from the moment the settlement exists, before the upstream call.
+    settlement.delivery_outcome = DELIVERY_PENDING
     settlement_id = settlement.id
     unrecorded_payload = _settlement_payload(settlement, endpoint.slug)
-    session.add(settlement)
     try:
+        # CONTRACT v2.14: stamp the merchant's failed-delivery credit policy as of settle time.
+        settlement.failed_delivery_credit_policy = await credit_policy_for(session, endpoint.merchant_id)
+        session.add(settlement)
         await session.flush()
         # CONTRACT v2.12: the payment.settled outbox event commits with the settlement, in a savepoint that can
         # never fail this transaction (enqueue_event swallows and logs its own errors).
@@ -1164,7 +1295,7 @@ async def _settle_and_deliver(
     else:
         usd = settlement.usd_value_at_settlement if settlement.usd_value_at_settlement is not None else Decimal(0)
         header = _payment_response_header(tx_id, usd)
-    return await _forward_and_record(session, client, method, prepared, settlement_id, tx_id, header)
+    return await _forward_and_record(session, redis, client, method, prepared, settlement_id, tx_id, header)
 
 
 # ---------------------------------------------------------------- the route
@@ -1797,7 +1928,6 @@ PREPAID_DEPOSIT_PREFIX: Final = "kasgate:prepaid:deposit:"
 PREPAID_CHALLENGE_PREFIX: Final = "kasgate:prepaid:challenge:"
 PREPAID_NONCE_LOCK_PREFIX: Final = "kasgate:prepaid:noncelock:"
 PREPAID_REFUND_DEAD_LETTER_KEY: Final = "kasgate:deadletter:prepaid-refunds"
-_P2PK_SCHNORR_SCRIPT: Final = re.compile(r"20([0-9a-f]{64})ac")
 
 
 def prepaid_deposit_key(nonce: str) -> str:
@@ -1810,18 +1940,6 @@ def prepaid_challenge_key(nonce: str) -> str:
 
 def prepaid_nonce_lock_key(nonce: str) -> str:
     return f"{PREPAID_NONCE_LOCK_PREFIX}{nonce}"
-
-
-def payer_public_key(address: str) -> str | None:
-    """The x-only Schnorr key of a P2PK address (script 20 <key> ac), or None for any other address kind."""
-    try:
-        script = pay_to_address_script(Address(address))
-    except Exception:
-        return None
-    if int(script.version) != 0:
-        return None
-    match = _P2PK_SCHNORR_SCRIPT.fullmatch(str(script.script).lower())
-    return match.group(1) if match else None
 
 
 def verify_prepaid_signature(message: str, signature: str, public_key: str) -> bool:
@@ -2010,6 +2128,19 @@ async def _debit_balance(
     already debited, SQLAlchemyError when the store fails; the caller rolls back.
     """
     amount = stored.amount_sompi
+    # CONTRACT v2.14: failed-delivery credit is spent before deposited credit. Lock the row first so the part paid
+    # from credit (recorded on the debit, and given back to credit if the debit is refunded) is exact.
+    credit_before = (
+        await session.execute(
+            select(PrepaidBalance.credit_balance_sompi)
+            .where(
+                PrepaidBalance.merchant_id == endpoint.merchant_id,
+                PrepaidBalance.payer_public_key == stored.payer_public_key,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    from_credit = min(amount, credit_before or 0)
     row = (
         await session.execute(
             update(PrepaidBalance)
@@ -2023,6 +2154,7 @@ async def _debit_balance(
             .values(
                 balance_sompi=PrepaidBalance.balance_sompi - amount,
                 debited_sompi=PrepaidBalance.debited_sompi + amount,
+                credit_balance_sompi=PrepaidBalance.credit_balance_sompi - from_credit,
                 updated_at=func.now(),
             )
             .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
@@ -2043,6 +2175,7 @@ async def _debit_balance(
             nonce=nonce,
             payer_address=stored.payer_address,
             amount_sompi=amount,
+            credit_sompi=from_credit,
             kas_usd_rate=stored.kas_usd_rate,
             usd_value=None if stored.kas_usd_rate is None else usd_value(amount, stored.kas_usd_rate),
             status=PREPAID_DEBIT_DEBITED,
@@ -2088,13 +2221,13 @@ async def refund_prepaid_debit(
                 update(PrepaidDebit)
                 .where(PrepaidDebit.id == debit_id, PrepaidDebit.status == PREPAID_DEBIT_DEBITED)
                 .values(status=PREPAID_DEBIT_REFUNDED, refunded_at=func.now(), upstream_status_code=status_code)
-                .returning(PrepaidDebit.balance_id, PrepaidDebit.amount_sompi)
+                .returning(PrepaidDebit.balance_id, PrepaidDebit.amount_sompi, PrepaidDebit.credit_sompi)
             )
         ).one_or_none()
         if row is None:
             await session.rollback()
             return None
-        balance_id, amount = row
+        balance_id, amount, from_credit = row
         balance = (
             await session.execute(
                 update(PrepaidBalance)
@@ -2102,6 +2235,8 @@ async def refund_prepaid_debit(
                 .values(
                     balance_sompi=PrepaidBalance.balance_sompi + amount,
                     debited_sompi=PrepaidBalance.debited_sompi - amount,
+                    # CONTRACT v2.14: the part paid from failed-delivery credit goes back to credit, never to deposit.
+                    credit_balance_sompi=PrepaidBalance.credit_balance_sompi + from_credit,
                     updated_at=func.now(),
                 )
                 .returning(PrepaidBalance.balance_sompi)

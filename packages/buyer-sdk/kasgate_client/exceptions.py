@@ -110,6 +110,12 @@ class InsufficientPrepaidBalanceError(PaymentRejectedError):
     Nothing was debited; deposit more with `prepaid_deposit` and retry."""
 
 
+class InvalidBalanceSignatureError(PaymentRejectedError):
+    """401 invalid_balance_signature: a buyer-signed read (GET /v1/prepaid/balance or GET /v1/prepaid/refunds/status)
+    was unsigned, had an invalid signature, was outside the ±300 s window, or used the other read's Purpose.
+    Nothing was revealed and nothing was spent."""
+
+
 class PaymentReceiptError(KasGateError):
     """The paid retry succeeded but PAYMENT-RESPONSE is missing, invalid or does not match the tx we signed.
 
