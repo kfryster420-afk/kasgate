@@ -950,6 +950,7 @@ async def _build_directory(session: AsyncSession) -> DirectoryManifest:
             price_usd=None if endpoint.price_usd_micros is None else usd_micros_to_usd(endpoint.price_usd_micros),
             allowed_methods=list(endpoint.allowed_methods),
             proxy_url=f"{settings.public_base_url}{PROXY_PATH_PREFIX}/{endpoint.slug}",
+            prepaid_only=endpoint.prepaid_only,
         )
         for endpoint, display_name, pay_to in rows
     ]

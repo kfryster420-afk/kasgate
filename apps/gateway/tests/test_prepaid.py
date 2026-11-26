@@ -328,6 +328,10 @@ async def test_prepaid_only_402_offers_only_prepaid_terms_and_mints_nothing(
     quote = await client.get("/v1/quote/cheap")
     assert quote.status_code == 402 and quote.json()["accepts"][0]["scheme"] == "kasgate-prepaid-v1"
 
+    directory = await client.get("/v1/directory")
+    flags = {entry["slug"]: entry["prepaid_only"] for entry in directory.json()["endpoints"]}
+    assert flags == {"weather": False, "cheap": True}
+
     # an on-chain header (e.g. for an offer from before the switch) is refused without touching the engine
     for headers in (
         {HEADER_PAYMENT_SIGNATURE: make_signature_header(None, "3" * 32)},

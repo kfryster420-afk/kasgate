@@ -1269,6 +1269,9 @@ class DirectoryEntry(BaseModel):
     price_usd: str | None
     allowed_methods: list[str]
     proxy_url: str
+    prepaid_only: bool = False
+    """CONTRACT v2.11: payable only from a prepaid balance (kasgate-prepaid-v1); the price may be below the
+    0.6 KAS on-chain minimum and the 402 carries no kaspa-exact-v1 terms."""
 
 
 class DirectoryManifest(BaseModel):
