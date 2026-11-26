@@ -77,9 +77,7 @@ async def test_concurrent_deposits_serialize_on_the_balance_row(
     quotes = [await quote_deposit(client) for _ in range(3)]
     stub_engine.delay = 0.2  # each settle holds the row lock long enough for the others to queue on it
 
-    responses = await asyncio.gather(
-        *(post_deposit(client, q, tx_id=f"c{i}" * 32) for i, q in enumerate(quotes))
-    )
+    responses = await asyncio.gather(*(post_deposit(client, q, tx_id=f"c{i}" * 32) for i, q in enumerate(quotes)))
 
     statuses = sorted(r.status_code for r in responses)
     assert statuses == [201, 422, 422], [r.text for r in responses]

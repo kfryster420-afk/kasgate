@@ -126,7 +126,6 @@ def test_signature_round_trip_and_forgeries() -> None:
     assert verify_signature(secret, f"t={now},v1={'0' * 64},v1={compute_signature(secret, now, body)}", body, now=now)
 
 
-
 @pytest.mark.parametrize(
     "timestamp",
     ["\u00b2", "1\u00b2", "\u0661\u0662", "\uff11", "9" * 5000, "+1", " 1", "-1"],
@@ -143,6 +142,7 @@ def test_signature_header_with_a_non_ascii_v1_is_rejected_not_crashed() -> None:
     secret = "whsec_" + "a" * 43
     now = 1_800_000_000
     assert verify_signature(secret, f"t={now},v1=\u00e9\u00e9", b"{}", now=now) is False
+
 
 # ---------------------------------------------------------------- CRUD + secret handling
 
@@ -216,7 +216,7 @@ async def test_rotation_with_no_overlap_signs_with_the_new_secret_only(
 ) -> None:
     override_settings(webhook_secret_overlap_seconds=0)
     created = await create_hook(client, seeded, ["trial.used"])
-    rotated = (await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key)))
+    rotated = await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))
     assert rotated.json()["previous_secret_expires_at"] is None
     await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
     [request] = webhook_receiver.requests
@@ -235,6 +235,7 @@ def test_previous_secret_stops_signing_when_the_overlap_ends() -> None:
     assert signature_header("whsec_new", 5, b"{}", also=["whsec_old"]) == (
         f"t=5,v1={compute_signature('whsec_new', 5, b'{}')},v1={compute_signature('whsec_old', 5, b'{}')}"
     )
+
 
 async def test_webhook_crud_is_merchant_scoped(
     client: httpx.AsyncClient, seeded: Seed, sessionmaker: async_sessionmaker[AsyncSession]
@@ -848,6 +849,7 @@ async def test_test_fire_keeps_only_the_newest_finished_test_events(
         await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
     statuses = sorted(d.status for d in await deliveries(sessionmaker))
     assert statuses == ["pending", "pending", "pending", "succeeded", "succeeded"]
+
 
 async def test_dispatcher_delivers_in_the_background(
     client: httpx.AsyncClient,
