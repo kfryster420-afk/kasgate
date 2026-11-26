@@ -313,6 +313,26 @@ class Upstream:
         )
 
 
+@dataclass
+class WebhookReceiver:
+    """Merchant webhook endpoint double (CONTRACT v2.12): records every delivery; `status` / `handler` shape replies."""
+
+    requests: list[httpx.Request] = field(default_factory=list)
+    status: int = 200
+    handler: Callable[[httpx.Request], httpx.Response] | None = None
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.handler is not None:
+            return self.handler(request)
+        return httpx.Response(self.status, json={"received": True})
+
+
+@pytest.fixture
+def webhook_receiver() -> WebhookReceiver:
+    return WebhookReceiver()
+
+
 @pytest.fixture
 def stub_engine() -> StubEngine:
     return StubEngine()
@@ -342,15 +362,19 @@ async def app(
     stub_engine: StubEngine,
     stub_oracle: StubOracle,
     upstream: Upstream,
+    webhook_receiver: WebhookReceiver,
 ) -> AsyncIterator[FastAPI]:
     application = create_app()
     application.dependency_overrides[get_sessionmaker] = lambda: sessionmaker
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
+    webhook_client = httpx.AsyncClient(transport=httpx.MockTransport(webhook_receiver), follow_redirects=False)
     application.state.redis = redis
     application.state.http_client = http_client
+    application.state.webhook_client = webhook_client
     application.state.engine = stub_engine
     application.state.oracle = stub_oracle
     yield application
+    await webhook_client.aclose()
     await http_client.aclose()
 
 
@@ -394,6 +418,8 @@ async def seed_endpoint(
     price_currency: PriceCurrency = PriceCurrency.KAS,
     price_usd_micros: int | None = None,
     prepaid_only: bool = False,
+    free_trial_calls: int = 0,
+    trial_daily_cap: int = 100,
 ) -> Seed:
     api_key = generate_api_key()
     merchant = Merchant(
@@ -419,6 +445,8 @@ async def seed_endpoint(
             allowed_methods=methods or ["GET", "POST"],
             is_active=active,
             prepaid_only=prepaid_only,
+            free_trial_calls=free_trial_calls,
+            trial_daily_cap=trial_daily_cap,
         )
         session.add(endpoint)
         await session.commit()
