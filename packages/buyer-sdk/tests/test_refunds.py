@@ -275,6 +275,9 @@ def test_paying_and_late_payout_fields_decode() -> None:
             "created_at": now,
             "updated_at": now,
             "claimed_at": now,
+            "first_claimed_at": now,
+            "claim_expires_at": now,
+            "hold_until": None,
             "payout_address": PAYER,
             "payout_payload_hex": "00",
             "late_paid_from": None,
@@ -282,3 +285,4 @@ def test_paying_and_late_payout_fields_decode() -> None:
         }
     )
     assert refund.status == "paying" and refund.claimed_at is not None
+    assert refund.claim_expires_at is not None and refund.first_claimed_at is not None and refund.hold_until is None
