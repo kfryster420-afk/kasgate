@@ -127,6 +127,9 @@ EXPECTED_TOOLS = {
     "inspect_endpoint",
     "call_with_budget",
     "get_budget",
+    "prepaid_deposit",
+    "prepaid_balance",
+    "call_prepaid_endpoint",
 }
 
 

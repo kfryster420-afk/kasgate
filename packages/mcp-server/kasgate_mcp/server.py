@@ -18,7 +18,9 @@ from kasgate_client import (
     KasGateClient,
     KasGateError,
     PaymentReceipt,
+    PrepaidReceipt,
     kas_to_sompi,
+    prepaid_receipt_of,
     receipt_of,
     sompi_to_kas,
 )
@@ -178,6 +180,18 @@ def _describe_receipt(receipt: PaymentReceipt) -> dict[str, Any]:
     }
 
 
+def _describe_prepaid_receipt(receipt: PrepaidReceipt) -> dict[str, Any]:
+    return {
+        "debit_id": str(receipt.debitId),
+        "nonce": receipt.nonce,
+        "status": receipt.status,
+        "debited_kas": sompi_to_kas(int(receipt.amountSompi)),
+        "balance_kas": sompi_to_kas(int(receipt.balanceSompi)),
+        "amount_sompi": int(receipt.amountSompi),
+        "balance_sompi": int(receipt.balanceSompi),
+    }
+
+
 def build_server(
     config: Config | None = None,
     *,
@@ -191,7 +205,9 @@ def build_server(
         instructions=(
             "Browse paid APIs with search_catalog or list_directory, inspect_endpoint for one slug, and "
             "quote_endpoint for a live price. Pay with call_with_budget (session spend cap + per-call max) "
-            "or call_paid_endpoint. Check remaining funds with get_budget. A tighter max_price_kas can only "
+            "or call_paid_endpoint. Check remaining funds with get_budget. For many small calls, fund a prepaid "
+            "balance once with prepaid_deposit (counts against the session budget), then use call_prepaid_endpoint "
+            "(signed debits, no transaction per call) and prepaid_balance. A tighter max_price_kas can only "
             "lower the configured ceiling, never raise it. Keys are never logged."
         ),
     )
@@ -395,7 +411,98 @@ def build_server(
             result["budget"] = budget.snapshot()
         return result
 
-        server.kasgate_config = cfg  # type: ignore[attr-defined]
+    @server.tool()
+    async def prepaid_deposit(slug: str, amount_kas: float | str) -> dict[str, Any]:
+        """Fund a prepaid balance at the merchant behind `slug` with ONE on-chain payment (CONTRACT v2.11).
+
+        `amount_kas` is the deposit total (at least 0.6 KAS): the merchant share (output 0) becomes credit, the
+        platform fee max(1.5 %, 0.2 KAS) goes to the treasury (output 1). The deposit is reserved against the
+        session budget and the per-call maximum before anything is signed, and committed only on success.
+        """
+        slug = validate_slug(slug)
+        amount = _parse_optional_max_price_kas(amount_kas)
+        if amount is None:
+            raise ToolError("amount_kas is required")
+        try:
+            reserved = await budget.reserve(amount)
+        except BudgetError as exc:
+            raise ToolError(str(exc)) from exc
+        try:
+            receipt = await paying_client().prepaid_deposit(cfg.gateway_url, slug, amount)
+        except KasGateError as exc:
+            await budget.release(reserved)
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except BaseException as exc:
+            await budget.release(reserved)
+            if isinstance(exc, httpx.HTTPError):
+                raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+            raise
+        await budget.commit(reserved)
+        return {
+            "deposit_id": str(receipt.deposit_id),
+            "tx_id": receipt.tx_id,
+            "slug": receipt.slug,
+            "merchant_id": str(receipt.merchant_id),
+            "deposit_kas": sompi_to_kas(int(receipt.deposit_sompi)),
+            "platform_fee_kas": sompi_to_kas(int(receipt.fee_sompi)),
+            "credit_kas": sompi_to_kas(int(receipt.credit_sompi)),
+            "balance_kas": sompi_to_kas(int(receipt.balance_sompi)),
+            "balance_sompi": int(receipt.balance_sompi),
+            "budget": budget.snapshot(),
+        }
+
+    @server.tool()
+    async def prepaid_balance(slug: str) -> dict[str, Any]:
+        """Show this buyer key's prepaid balance at the merchant behind `slug` (reads only, signs nothing)."""
+        slug = validate_slug(slug)
+        try:
+            balance = await paying_client().prepaid_balance(cfg.gateway_url, slug)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return {
+            "merchant_id": str(balance.merchant_id),
+            "payer_address": balance.payer_address,
+            "balance_kas": sompi_to_kas(int(balance.balance_sompi)),
+            "balance_sompi": int(balance.balance_sompi),
+            "deposited_sompi": int(balance.deposited_sompi),
+            "debited_sompi": int(balance.debited_sompi),
+        }
+
+    @server.tool()
+    async def call_prepaid_endpoint(
+        slug: str,
+        method: str = "GET",
+        path: str = "",
+        body: Any = None,
+        max_price_kas: float | str | None = None,
+    ) -> dict[str, Any]:
+        """Call an endpoint and pay from the prepaid balance with one signed debit (no on-chain transaction).
+
+        Nothing is signed unless the gateway's debit text matches this exact request (method, path, query, body)
+        and the amount is within max_price_kas (or the server's ceiling, whichever is lower). The deposit already
+        counted against the session budget, so debits do not draw it down again. If the upstream fails (no response
+        or 5xx) the gateway refunds the debit and `prepaid.status` is "refunded".
+        """
+        slug, _, url = _paid_url(slug, path)
+        method = (method or "GET").upper()
+        if method not in ALLOWED_METHODS:
+            raise ToolError(f"method must be one of {sorted(ALLOWED_METHODS)}")
+        _parse_optional_max_price_kas(max_price_kas)
+        kwargs = _request_kwargs(method, body)
+        try:
+            response = await paying_client().prepaid_request(method, url, max_price_kas=max_price_kas, **kwargs)
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        result = _describe_response(response)
+        receipt = prepaid_receipt_of(response)
+        result["prepaid"] = _describe_prepaid_receipt(receipt) if receipt else None
+        return result
+
+    server.kasgate_config = cfg  # type: ignore[attr-defined]
     return server
 
 

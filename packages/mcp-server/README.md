@@ -11,6 +11,9 @@ Stdio MCP server for KasGate. Tools:
 | `get_budget` | session cap, per-call maximum, spent, reserved, and remaining, in sompi. |
 | `call_with_budget(slug, method, path, body, max_price_kas)` | pays a 402 under the session spend cap: the catalog price is reserved before signing, released on failure, and never exceeds the per-call max or the remaining cap. |
 | `call_paid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` and pays the 402 challenge, refusing anything above the cap. Does not draw down the session cap. |
+| `prepaid_deposit(slug, amount_kas)` | CONTRACT v2.11: funds a prepaid balance at the endpoint's merchant with one on-chain payment (>= 0.6 KAS; merchant share = credit, fee max(1.5 %, 0.2 KAS) to the treasury). Reserved against the session cap and per-call max before signing, committed on success. |
+| `prepaid_balance(slug)` | this key's prepaid balance at that merchant (read only). |
+| `call_prepaid_endpoint(slug, method, path, body, max_price_kas)` | calls `/p/{slug}/{path}` paid by one signed debit from the prepaid balance (no transaction). Refuses to sign unless the debit text matches the request and the amount is within the cap; returns the debit receipt (`debited` or `refunded`). Does not draw the session cap again. |
 
 ## Environment
 
