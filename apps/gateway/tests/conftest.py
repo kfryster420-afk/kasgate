@@ -193,6 +193,8 @@ class StubEngine:
         self.payout_sightings: list[PayoutSighting] = []
         self.payout_scans: list[tuple[str, int, uuid.UUID]] = []
         self.payout_scan_error: Exception | None = None
+        self.virtual_daa_score_value = 1_000_000
+        self.virtual_daa_error: Exception | None = None
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
         return VerifiedPayment(
@@ -298,8 +300,14 @@ class StubEngine:
     def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
         return self.payout_tx_id_value
 
+    async def virtual_daa_score(self) -> int:
+        self.events.append("virtual_daa_score")
+        if self.virtual_daa_error is not None:
+            raise self.virtual_daa_error
+        return self.virtual_daa_score_value
+
     async def find_refund_payouts(
-        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, min_daa_score: int = 0
     ) -> list[PayoutSighting]:
         self.payout_scans.append((to_address, amount_sompi, refund_id))
         self.events.append("find_refund_payouts")

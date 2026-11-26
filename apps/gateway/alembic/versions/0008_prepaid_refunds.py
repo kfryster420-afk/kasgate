@@ -91,6 +91,7 @@ def upgrade() -> None:
         sa.Column("tx_id", sa.String(length=64), nullable=True),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("first_claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("first_claimed_daa_score", sa.BigInteger(), nullable=True),
         sa.Column("hold_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("late_paid_from", sa.String(length=16), nullable=True),
         sa.Column("shortfall_sompi", sa.BigInteger(), server_default="0", nullable=False),
@@ -122,6 +123,10 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "hold_until IS NULL OR status = 'cancelled'", name=op.f("ck_prepaid_refunds_hold_until_only_cancelled")
+        ),
+        sa.CheckConstraint(
+            "first_claimed_daa_score IS NULL OR (first_claimed_at IS NOT NULL AND first_claimed_daa_score >= 0)",
+            name=op.f("ck_prepaid_refunds_claimed_daa_after_first_claim"),
         ),
         sa.CheckConstraint(
             "status IN ('requested', 'paying', 'payout_submitted', 'paid', 'rejected', 'cancelled')",

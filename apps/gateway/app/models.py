@@ -462,6 +462,9 @@ class PrepaidRefund(TimestampMixin, Base):
     # The first claim: claims cannot be renewed past first_claimed_at + prepaid_refund_claim_max_seconds. Kept after
     # the claim ends, so a cancel knows the merchant may have broadcast a payout.
     first_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Virtual DAA at the first claim: the pre-cancel UTXO scan ignores outputs with blockDaaScore <= this (older
+    # than the claim). Null only when the node could not be asked at claim time (the scan then does not filter).
+    first_claimed_daa_score: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # A cancelled refund the merchant had claimed keeps its amount in the balance's refund hold until this time.
     hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Set when a payout was confirmed after the refund had been cancelled or rejected.
@@ -497,6 +500,10 @@ class PrepaidRefund(TimestampMixin, Base):
             name="claimed_has_first_claim",
         ),
         CheckConstraint("hold_until IS NULL OR status = 'cancelled'", name="hold_until_only_cancelled"),
+        CheckConstraint(
+            "first_claimed_daa_score IS NULL OR (first_claimed_at IS NOT NULL AND first_claimed_daa_score >= 0)",
+            name="claimed_daa_after_first_claim",
+        ),
         CheckConstraint(f"status IN ({_sql_list(PREPAID_REFUND_STATUSES)})", name="status_known"),
         CheckConstraint("tx_id ~ '^[0-9a-f]{64}$'", name="tx_id_hex64"),
         CheckConstraint("request_nonce ~ '^[0-9a-f]{32}$'", name="request_nonce_hex32"),
