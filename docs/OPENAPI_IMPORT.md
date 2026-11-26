@@ -16,27 +16,32 @@ mode:                "preview" | "create"
 spec_text:           str | null      OpenAPI 3.0.x / 3.1.x document, JSON or YAML (detected: JSON when it starts with { or [)
 spec_url:            HttpUrl | null  public http(s) URL fetched server-side            (exactly one of spec_text / spec_url)
 upstream_base_url:   HttpUrl         same _reject_private_host rule as EndpointCreate.upstream_url
-default_price_sompi: Sompi           int, 1..MAX_SOMPI (18 digits), compute_fee_split() must pass (>= 3*F = 60_000_000)
+default_price_currency: PriceCurrency  default KAS
+default_price_sompi: Sompi | null    required for KAS imports; int, 1..MAX_SOMPI (18 digits), compute_fee_split() must pass (>= 3*F = 60_000_000); must be omitted when currency is USD
+default_price_usd_micros: UsdMicros | null  required for USD imports (1 USD = 1_000_000 micros, 1..MAX_USD_MICROS); must be omitted when currency is KAS
 upstream_headers:    dict[str,str]   default {}; same validate_upstream_headers + Fernet encryption as POST /v1/endpoints, stored on every created endpoint
 category:            str | null      <= 60; when null each endpoint gets its operation's first tag (truncated to 60)
 is_public_listed:    bool            default true
 selections:          list[OpenApiImportSelection] | null   1..500; required for create, forbidden for preview; unique (method, path)
 OpenApiImportSelection: {method: GET|POST|PUT|PATCH|DELETE (case-insensitive), path: str 1..512 exactly as in the document,
-                         price_sompi: Sompi | null  (override; same fee-split check)}
+                         price_sompi: Sompi | null  (KAS override; same fee-split check; omit in a USD import),
+                         price_usd_micros: UsdMicros | null  (USD override; omit in a KAS import)}
 ```
 
 ## Responses
 ```
 OpenApiImportPreview {mode:"preview", openapi_version, title|null, api_version|null, servers: [str] (<=5, from the document),
-  operation_count, importable_count, default_price_sompi:int, min_price_sompi:int, operations: [OpenApiOperationPreview]}
+  operation_count, importable_count, default_price_currency, default_price_sompi:int|null, default_price_usd_micros:int|null,
+  min_price_sompi:int, operations: [OpenApiOperationPreview]}
 OpenApiOperationPreview {key:"<METHOD> <path>", method, path, operation_id|null, summary|null (<=200 chars), path_params:[str],
-  importable:bool, skip_reason|null, slug|null, upstream_url|null, proxy_path|null ("/p/<slug>/{petId}"), proxy_url|null, price_sompi:int}
-OpenApiImportCreated {mode:"create", created_count:int, created:[EndpointRead]}   (EndpointRead incl. price_kas and proxy_url)
+  importable:bool, skip_reason|null, slug|null, upstream_url|null, proxy_path|null ("/p/<slug>/{petId}"), proxy_url|null,
+  price_currency, price_sompi:int|null, price_usd_micros:int|null}
+OpenApiImportCreated {mode:"create", created_count:int, created:[EndpointRead]}   (EndpointRead incl. price_currency, price_kas, price_usd and proxy_url)
 ```
-Sompi fields are JSON integers (CONTRACT v2.5 CRUD convention).
+Sompi and micro-dollar fields are JSON integers (CONTRACT v2.5 CRUD convention). Preview and created rows set the price field that matches price_currency and leave the other null (ck_endpoints_price_matches_currency).
 
 ## Mapping an operation onto a KasGate endpoint
-- One endpoint per operation: `allowed_methods=[METHOD]`, `price_sompi` = override or default, name = summary or operationId or "METHOD path" (<=120),
+- One endpoint per operation: `allowed_methods=[METHOD]`, price from the override or default in `default_price_currency` (KAS: `price_sompi`; USD: `price_usd_micros`, `price_sompi` null), name = summary or operationId or "METHOD path" (<=120),
   description = description or summary (<=2000). Each row is validated by constructing an `EndpointCreate`, so imported rows meet exactly the hand-made rules.
 - Path parameters use the existing proxy suffix routing (`/p/{slug}/{path:path}` appends the suffix to the upstream URL); no new routing.
   `upstream_url = upstream_base_url + <path up to the first segment containing {…}>`; the buyer appends the rest:
@@ -68,6 +73,7 @@ Sompi fields are JSON integers (CONTRACT v2.5 CRUD convention).
 401  missing/invalid bearer (same dependency as the endpoint CRUD)
 409  a proposed slug was taken concurrently between the check and the commit; transaction rolled back, nothing created
 413  request body or document too large
-422  FastAPI validation list for request fields: per-row loc ["body","selections",<i>,"price_sompi"] for prices,
+422  FastAPI validation list for request fields: per-row loc ["body","selections",<i>,"price_sompi"] or
+     ["body","selections",<i>,"price_usd_micros"] for a price in the wrong currency or an invalid amount,
      ["body","selections",<i>] for selections that are not in the document or are skipped; plain string for document errors
 ```
