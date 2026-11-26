@@ -53,6 +53,7 @@ import json
 import logging
 import random
 import re
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -92,6 +93,7 @@ from app.schemas import (
     k402_network_label,
     payer_proof_message,
     payment_payload,
+    refund_payout_payload,
 )
 from app.x402_v2 import ExactV2PaymentPayload, ExactV2Requirements
 
@@ -677,19 +679,46 @@ class KaspaEngine:
                 "wrong_network", f"the payout address must use the '{prefix}:' prefix on {self._settings.kaspa_network}"
             )
 
-    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None:
-        """Check that the merchant's own transaction ``tx_id`` pays ``to_address`` exactly ``amount_sompi`` on-chain.
+    @staticmethod
+    def _mempool_payload(response: object, tx_id: str) -> str | None:
+        """The lower-case payload hex of ``tx_id`` in a mempool reply ("" when it carries none), None if absent."""
+        for by_address in _as_list(_as_dict(response).get("entries")):
+            for mempool_entry in _as_list(_as_dict(by_address).get("receiving")):
+                transaction = _as_dict(_as_dict(mempool_entry).get("transaction"))
+                entry_id = _as_dict(transaction.get("verboseData")).get("transactionId")
+                if not isinstance(entry_id, str) or entry_id.lower() != tx_id:
+                    continue
+                payload = transaction.get("payload")
+                if payload is None:
+                    return ""
+                if not isinstance(payload, str):
+                    raise PaymentVerificationError(
+                        "invalid_payment_header", f"the payload of {tx_id} is malformed in the node's reply"
+                    )
+                return payload.lower()
+        return None
 
-        Same lookup order as ``verify_k402`` (nothing is submitted): in ``accepted`` mode the sink hash is read first;
-        a mempool entry received by ``to_address`` gives the whole transaction, then the virtual chain is polled until
-        it accepts ``tx_id`` (falling back to the UTXO index once); otherwise the UTXO index (accepted outputs only).
-        Raises ``payment_not_found`` while the payout is not visible or not accepted yet, ``invalid_payout`` when it
-        does not pay the exact amount, ``RpcUnavailableError`` when the node cannot answer.
+    async def verify_payout(
+        self, tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None:
+        """Check that ``tx_id`` is THIS refund's payout: an output paying ``to_address`` exactly ``amount_sompi``,
+        the payload ``kasgate:v1:refund:<refund_id hex>``, and accepted by the virtual chain.
+
+        Nothing is submitted. The sink hash is read first; then the mempool entries received by ``to_address`` give
+        the whole transaction (outputs AND payload), and the virtual chain is polled until it accepts ``tx_id``
+        (UTXO index once as a fallback). Acceptance is required in every ``settlement_mode``: a refund is marked paid
+        only once its payout is accepted. When the transaction is only in the UTXO index (accepted, left the mempool)
+        its payload cannot be read there, so it counts only if ``payload_checked`` (the payload was seen earlier).
+
+        Raises ``invalid_payout`` (wrong amount, wrong or missing payload: never this refund's payout),
+        ``payout_unconfirmed`` (right outputs and payload, not accepted yet), ``payload_unverified`` (accepted, payload
+        never seen: post the signed transaction JSON), ``payment_not_found`` (not visible), ``wrong_network``, a
+        malformed-reply ``invalid_payment_header``, or ``RpcUnavailableError``.
         """
         self._check_payout_address(to_address)
-        accepted_mode = self._settings.settlement_mode == "accepted"
+        expected_payload = refund_payout_payload(refund_id)
         addresses = [to_address.lower()]
-        start_hash = await self._sink_hash() if accepted_mode else ""
+        start_hash = await self._sink_hash()
         mempool_response = await self._rpc(
             "get_mempool_entries_by_addresses",
             lambda client: client.get_mempool_entries_by_addresses(
@@ -699,14 +728,18 @@ class KaspaEngine:
         in_mempool = self._k402_mempool_outputs(mempool_response, tx_id)
         if in_mempool is not None:
             check_payout_outputs(tx_id, in_mempool, to_address, amount_sompi)
-            if accepted_mode:
-                try:
-                    await self._wait_for_acceptance(tx_id, start_hash)
-                except RpcUnavailableError as exc:
-                    if not await self._k402_utxo_outputs(addresses, tx_id):
-                        raise PaymentVerificationError(
-                            "payment_not_found", f"payout {tx_id} is not accepted yet; check again shortly"
-                        ) from exc
+            if self._mempool_payload(mempool_response, tx_id) != expected_payload.hex():
+                raise PaymentVerificationError(
+                    "invalid_payout",
+                    f"payout {tx_id} does not carry the payload {expected_payload.decode('ascii')!r} of this refund",
+                )
+            try:
+                await self._wait_for_acceptance(tx_id, start_hash)
+            except RpcUnavailableError as exc:
+                if not await self._k402_utxo_outputs(addresses, tx_id):
+                    raise PaymentVerificationError(
+                        "payout_unconfirmed", f"payout {tx_id} is valid but not accepted yet; check again shortly"
+                    ) from exc
             return
         accepted_outputs = await self._k402_utxo_outputs(addresses, tx_id)
         if not accepted_outputs:
@@ -714,19 +747,17 @@ class KaspaEngine:
                 "payment_not_found", f"payout {tx_id} does not pay the buyer on this node yet; check again shortly"
             )
         check_payout_outputs(tx_id, accepted_outputs, to_address, amount_sompi)
+        if not payload_checked:
+            raise PaymentVerificationError(
+                "payload_unverified",
+                f"payout {tx_id} is accepted but its payload was never seen by the gateway; post the signed "
+                "transaction JSON (KasWare sendKaspa returns it) as `transaction` to prove it is this refund's payout",
+            )
 
-    async def submit_payout(
+    def _parse_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
-    ) -> tuple[str, bool]:
-        """Broadcast a merchant-signed refund payout and wait for finality per ``settlement_mode``.
-
-        Returns ``(tx_id, accepted)``: ``accepted`` is False when the node took the transaction but did not accept it
-        within ``settlement_timeout_seconds`` (the caller records it as submitted and re-checks later).
-
-        The transaction must carry ``payload`` (``kasgate:v1:refund:<refund id hex>``) and pay ``to_address`` exactly
-        ``amount_sompi``; the node checks the merchant's inputs and signatures. Raises ``invalid_payout``,
-        ``tx_rejected`` (node refused it) or ``RpcUnavailableError``.
-        """
+    ) -> tuple[Transaction, str]:
+        """Parse and check a merchant-signed payout locally (no network): payload, exact output, native subnetwork."""
         self._check_payout_address(to_address)
         try:
             raw = json.loads(transaction)
@@ -757,10 +788,33 @@ class KaspaEngine:
             outputs[index] = (int(output.value), script)
         tx_id = str(tx.id)
         check_payout_outputs(tx_id, outputs, to_address, amount_sompi)
-        accepted_mode = self._settings.settlement_mode == "accepted"
-        start_hash = await self._sink_hash() if accepted_mode else ""
+        return tx, tx_id
+
+    def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
+        """The id of a merchant-signed payout after the same local checks as ``submit_payout``; nothing is sent.
+
+        The gateway records this id (refund -> ``payout_submitted``) BEFORE broadcasting, so a buyer cancel can never
+        slip in between the broadcast and the record.
+        """
+        return self._parse_payout(transaction, payload, to_address, amount_sompi)[1]
+
+    async def submit_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[str, bool]:
+        """Broadcast a merchant-signed refund payout and wait for virtual-chain acceptance.
+
+        Returns ``(tx_id, accepted)``: ``accepted`` is False when the node took the transaction but did not accept it
+        within ``settlement_timeout_seconds`` (the caller keeps it submitted and re-checks later). Acceptance is
+        required in every ``settlement_mode``.
+
+        The transaction must carry ``payload`` (``kasgate:v1:refund:<refund id hex>``) and pay ``to_address`` exactly
+        ``amount_sompi``; the node checks the merchant's inputs and signatures. Raises ``invalid_payout``,
+        ``tx_rejected`` (node refused it) or ``RpcUnavailableError``.
+        """
+        tx, tx_id = self._parse_payout(transaction, payload, to_address, amount_sompi)
+        start_hash = await self._sink_hash()
         already_accepted = await self._submit(tx, tx_id)
-        if accepted_mode and not already_accepted:
+        if not already_accepted:
             try:
                 await self._wait_for_acceptance(tx_id, start_hash)
             except RpcUnavailableError as exc:

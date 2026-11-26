@@ -85,9 +85,11 @@ async def test_hole_cancel_during_tx_id_payout_verification_double_refunds(
     real_verify = stub_engine.verify_payout
     cancelled: list[int] = []
 
-    async def verify_while_buyer_cancels(tx_id: str, to_address: str, amount_sompi: int) -> None:
+    async def verify_while_buyer_cancels(
+        tx_id: str, to_address: str, amount_sompi: int, refund_id: uuid.UUID, *, payload_checked: bool = False
+    ) -> None:
         cancelled.append((await cancel(client, cancel_challenge, refund.id)).status_code)
-        await real_verify(tx_id, to_address, amount_sompi)
+        await real_verify(tx_id, to_address, amount_sompi, refund_id, payload_checked=payload_checked)
 
     stub_engine.verify_payout = verify_while_buyer_cancels  # type: ignore[method-assign]
     response = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
@@ -200,7 +202,7 @@ async def test_hole_buyers_own_self_transfer_verifies_as_a_merchant_payout() -> 
     self_transfer = payout_tx([(PAYER_ADDRESS, AMOUNT)], key=PAYER_KEY)
     node.add_full(self_transfer)
     with pytest.raises(PaymentVerificationError) as info:
-        await make_engine(node).verify_payout(self_transfer.id, PAYER_ADDRESS, AMOUNT)
+        await make_engine(node).verify_payout(self_transfer.id, PAYER_ADDRESS, AMOUNT, REFUND_ID)
     assert info.value.code == "invalid_payout"
 
 
@@ -258,12 +260,13 @@ async def test_held_cancel_nonce_is_single_use_and_bound_to_its_refund(client: h
     cancel_challenge = await challenge_of(client, action="cancel", refund_id=refund.id)
     wrong_refund = await client.post(f"/v1/prepaid/refunds/{uuid.uuid4()}/cancel", json=signed(cancel_challenge))
     assert wrong_refund.status_code == 400
-    # wrong_refund claimed the nonce lock: the nonce is spent even though nothing was cancelled.
+    # The refund binding is checked before the nonce lock (low finding): a wrong-refund call does not burn it.
     again = await cancel(client, cancel_challenge, refund.id)
-    assert again.status_code == 409 and again.json()["error"] == "challenge_replayed"
-    fresh = await challenge_of(client, action="cancel", refund_id=refund.id)
-    assert (await cancel(client, fresh, refund.id)).status_code == 200
-    assert (await cancel(client, fresh, refund.id)).status_code == 410
+    assert again.status_code == 200
+    # Still single use: the same signed challenge never cancels twice.
+    assert (await cancel(client, cancel_challenge, refund.id)).status_code == 410
+    stale = await refund_challenge(client, action="cancel", refund_id=refund.id)
+    assert stale.status_code == 404  # nothing open to cancel any more
 
 
 async def test_held_another_key_cannot_cancel_or_refund_my_balance(client: httpx.AsyncClient, shop: Seed) -> None:
