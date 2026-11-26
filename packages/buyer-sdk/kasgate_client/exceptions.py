@@ -105,6 +105,11 @@ class PaymentExpiredError(PaymentRejectedError):
     raising this, and a transaction is never broadcast for an expired nonce."""
 
 
+class InsufficientPrepaidBalanceError(PaymentRejectedError):
+    """402 insufficient_balance (CONTRACT v2.11): the prepaid balance at this merchant does not cover the call.
+    Nothing was debited; deposit more with `prepaid_deposit` and retry."""
+
+
 class PaymentReceiptError(KasGateError):
     """The paid retry succeeded but PAYMENT-RESPONSE is missing, invalid or does not match the tx we signed.
 

@@ -15,6 +15,7 @@ import httpx
 
 from .catalog import DiscoverResult
 from .client import KasGateClient
+from .prepaid import PrepaidBalance, PrepaidDepositReceipt
 
 T = TypeVar("T")
 
@@ -77,6 +78,17 @@ class KasGateSyncClient:
 
     def discover(self, gateway_url: str | httpx.URL, **kwargs: Any) -> DiscoverResult:
         return self._call(self._client.discover(gateway_url, **kwargs))
+
+    def prepaid_deposit(
+        self, gateway_url: str | httpx.URL, slug: str, amount_sompi: int, **kwargs: Any
+    ) -> PrepaidDepositReceipt:
+        return self._call(self._client.prepaid_deposit(gateway_url, slug, amount_sompi, **kwargs))
+
+    def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
+        return self._call(self._client.prepaid_balance(gateway_url, slug))
+
+    def prepaid_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+        return self._call(self._client.prepaid_request(method, url, **kwargs))
 
     def close(self) -> None:
         if self._closed:

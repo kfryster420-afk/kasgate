@@ -48,3 +48,27 @@ async with KasGateClient(PRIVATE_KEY_HEX, max_price_sompi=100_000_000) as client
     for item in found.payable:
         print(item.slug, item.price_sompi, item.paid_url)
 ```
+
+## Prepaid credit (CONTRACT v2.11)
+
+Deposit once on-chain, then pay each call with one signed, single-use debit: no transaction, no UTXO per call, and
+prices below the 0.6 KAS on-chain minimum become possible.
+
+```python
+async with KasGateClient(PRIVATE_KEY_HEX, max_price_kas="0.01") as client:
+    receipt = await client.prepaid_deposit("https://gw.example", "weather", 100_000_000)  # 1 KAS total
+    # credit = merchant share (output 0); fee = max(1.5 %, 0.2 KAS) to the treasury (output 1)
+    response = await client.prepaid_request("GET", "https://gw.example/p/weather/today?city=hanoi")
+    print(prepaid_receipt_of(response))   # debitId, nonce, amountSompi, balanceSompi, status
+    print(await client.prepaid_balance("https://gw.example", "weather"))
+```
+
+- `prepaid_deposit` validates the quote exactly like a per-call challenge (outputs, fee floor, pinned fee_to,
+  `expected_pay_to`, expiry); `amount_sompi` is the cap for that one payment and must be at least 0.6 KAS.
+- `prepaid_request` asks `POST /v1/prepaid/challenge`, rebuilds the message from its own request (domain, payer,
+  method, path + query, SHA-256 of the body, amount, nonce, expiry) and refuses to sign unless the server text matches
+  byte for byte and the amount is within the cap. Nothing is retried automatically: a refunded failure (no upstream
+  response or 5xx) comes back with a `refunded` receipt.
+- Errors: `InsufficientPrepaidBalanceError` (402 insufficient_balance, nothing debited), `PaymentReplayedError`
+  (409, nonce already used), `InvalidChallengeError` / `PriceCapExceededError` (nothing signed).
+- The balance belongs to the depositing key at that merchant; use the same key for deposits and debits.

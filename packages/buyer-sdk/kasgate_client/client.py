@@ -12,8 +12,8 @@ from typing import Any
 import httpx
 import kaspa
 
-from .challenge import decode_challenge, validate_challenge
 from .catalog import CatalogPage, DiscoverResult
+from .challenge import decode_challenge, validate_challenge
 from .constants import (
     CATALOG_DEFAULT_LIMIT,
     CATALOG_MAX_LIMIT,
@@ -39,6 +39,8 @@ from .constants import (
 )
 from .exceptions import (
     ConfigurationError,
+    InsufficientPrepaidBalanceError,
+    InvalidChallengeError,
     PaymentExpiredError,
     PaymentReceiptError,
     PaymentRejectedError,
@@ -47,11 +49,30 @@ from .exceptions import (
     TransactionBuildError,
     error_details,
 )
+from .prepaid import (
+    BALANCE_PATH,
+    CHALLENGE_PATH,
+    DEPOSIT_PATH,
+    DEPOSIT_QUOTE_PATH,
+    HEADER_PREPAID_DEBIT,
+    HEADER_PREPAID_RECEIPT,
+    PREPAID_RECEIPT_EXTENSION,
+    PrepaidBalance,
+    PrepaidChallenge,
+    PrepaidDebitHeader,
+    PrepaidDepositQuote,
+    PrepaidDepositReceipt,
+    PrepaidReceipt,
+    prepaid_body_hash,
+    slug_of,
+    validate_debit_challenge,
+)
 from .protocol import (
     PaymentRequired,
     PaymentResponse,
     PaymentSignature,
     kas_to_sompi,
+    min_price_sompi,
     payer_proof_message,
     payment_payload,
 )
@@ -77,6 +98,12 @@ class PaymentReceipt:
     fee_sompi: int
     network_fee_sompi: int
     usd_value_at_settlement: Decimal
+
+
+def prepaid_receipt_of(response: httpx.Response) -> PrepaidReceipt | None:
+    """The CONTRACT v2.11 debit receipt attached by `KasGateClient.prepaid_request`, if any."""
+    receipt = response.extensions.get(PREPAID_RECEIPT_EXTENSION)
+    return receipt if isinstance(receipt, PrepaidReceipt) else None
 
 
 def receipt_of(response: httpx.Response) -> PaymentReceipt | None:
@@ -359,6 +386,201 @@ class KasGateClient:
         else:
             page = last_page
         return DiscoverResult(catalog=page, max_price_sompi=self.max_price_sompi)
+
+    # ------------------------------------------------------------------ prepaid credit (CONTRACT v2.11)
+
+    @staticmethod
+    def _origin(url: httpx.URL) -> str:
+        return f"{url.scheme}://{url.netloc.decode('ascii')}"
+
+    def _absolute(self, url: str | httpx.URL) -> httpx.URL:
+        return self._http.build_request("GET", url).url
+
+    async def prepaid_deposit(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        amount_sompi: int,
+        *,
+        expected_pay_to: str | None = None,
+    ) -> PrepaidDepositReceipt:
+        """Deposit `amount_sompi` (the TOTAL, >= 0.6 KAS) to the merchant behind `slug` and return the receipt.
+
+        The deposit is a kaspa-exact-v1 split payment checked exactly like a per-call payment (exact merchant and
+        treasury outputs, fee floor, pinned fee_to, expiry). The credit is the merchant share only. `amount_sompi`
+        is the explicit ceiling for this one payment; `max_price_sompi` does not apply to deposits.
+        """
+        if not isinstance(amount_sompi, int) or isinstance(amount_sompi, bool) or amount_sompi <= 0:
+            raise ConfigurationError("amount_sompi must be a positive integer")
+        origin = self._origin(self._absolute(gateway_url))
+        floor = await self._resolve_min_output(origin)
+        if amount_sompi < min_price_sompi(floor):
+            raise ConfigurationError(f"a deposit must be at least {min_price_sompi(floor)} sompi")
+        quoted = await self._http.post(
+            origin + DEPOSIT_QUOTE_PATH,
+            json={"slug": slug, "payer_address": self.address, "amount_sompi": amount_sompi},
+        )
+        if quoted.status_code != 201:
+            code, message = error_details(quoted)
+            raise PaymentRejectedError(quoted.status_code, code, message, quoted)
+        try:
+            quote = PrepaidDepositQuote.model_validate(quoted.json())
+        except ValueError as exc:
+            raise InvalidChallengeError(f"deposit quote cannot be decoded: {exc}") from exc
+        challenge = quote.required
+        merchant, fee = validate_challenge(
+            challenge,
+            network=self.network,
+            cap_sompi=amount_sompi,
+            min_output_sompi=floor,
+            pinned_fee_to=self.pinned_fee_to,
+            expected_pay_to=expected_pay_to,
+        )
+        if (
+            quote.slug != slug
+            or quote.payer_address != self.address
+            or challenge.total_sompi != amount_sompi
+            or int(quote.credit_sompi) != merchant
+            or int(quote.fee_sompi) != fee
+        ):
+            raise InvalidChallengeError("deposit quote does not match the requested deposit")
+        async with self._pay_lock:
+            confirmed = await self._utxo_provider(self.address)
+            entries = self._ledger.available(confirmed)
+            built = self._build(challenge, entries, merchant, fee, floor)
+            header = self._signature_header(built, challenge.nonce)
+            try:
+                paid = await self._http.post(origin + DEPOSIT_PATH, headers={HEADER_PAYMENT_SIGNATURE: header})
+                if self._is_node_unavailable(paid):
+                    await asyncio.sleep(self._retry_delay(paid))
+                    paid = await self._http.post(origin + DEPOSIT_PATH, headers={HEADER_PAYMENT_SIGNATURE: header})
+            except BaseException:
+                self._ledger.quarantine(built)
+                raise
+            return self._finish_deposit(paid, built, merchant)
+
+    def _finish_deposit(self, response: httpx.Response, built: BuiltPayment, credit: int) -> PrepaidDepositReceipt:
+        status = response.status_code
+        if status not in (200, 201):
+            code, message = error_details(response)
+            if status == 409:
+                self._ledger.quarantine(built)
+                raise PaymentReplayedError(status, code, message, response)
+            if status == 402 and code == "payment_expired":
+                raise PaymentExpiredError(status, code, message, response)
+            if status != 402 or code == "tx_rejected":
+                self._ledger.quarantine(built)
+            raise PaymentRejectedError(status, code, message, response)
+        raw_receipt = response.headers.get(HEADER_PAYMENT_RESPONSE)
+        try:
+            if raw_receipt is None:
+                raise ValueError("no PAYMENT-RESPONSE header")
+            parsed = PaymentResponse.from_header(raw_receipt)
+            receipt = PrepaidDepositReceipt.model_validate(response.json())
+        except ValueError as exc:
+            self._ledger.quarantine(built)
+            raise PaymentReceiptError(f"deposit receipt cannot be decoded: {exc}", response, built.tx_id) from exc
+        if (
+            parsed.txId != built.tx_id
+            or parsed.network != self.network
+            or receipt.tx_id != built.tx_id
+            or int(receipt.credit_sompi) != credit
+        ):
+            self._ledger.quarantine(built)
+            raise PaymentReceiptError(
+                "deposit receipt does not match the transaction we signed", response, built.tx_id
+            )
+        self._ledger.mark_spent(built)
+        return receipt
+
+    async def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
+        """This key's prepaid balance at the merchant behind `slug` (public read; never signs)."""
+        origin = self._origin(self._absolute(gateway_url))
+        response = await self._http.get(
+            origin + BALANCE_PATH, params={"slug": slug, "payer_address": self.address}
+        )
+        if response.status_code != 200:
+            code, message = error_details(response)
+            raise PaymentRejectedError(response.status_code, code, message, response)
+        return PrepaidBalance.model_validate(response.json())
+
+    async def prepaid_request(
+        self,
+        method: str,
+        url: str | httpx.URL,
+        *,
+        max_price_kas: Decimal | str | float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Call a /p/{slug} endpoint paid from the prepaid balance: one signed, single-use debit, no transaction.
+
+        The SDK asks for the debit challenge, rebuilds its text from this very request (domain, payer, method,
+        path + query, body hash) and the price cap, and only then signs it. The response carries the
+        X-KasGate-Prepaid-Receipt, also available as `prepaid_receipt_of(response)`; a failed upstream (no response
+        or 5xx) is refunded by the gateway and the receipt says `refunded`. Nothing is retried automatically.
+        """
+        cap = self._effective_cap(max_price_kas)
+        self._require_replayable(kwargs)
+        request = self._http.build_request(method, url, **kwargs)
+        body = request.read()
+        path = request.url.raw_path.decode("ascii")
+        origin = self._origin(request.url)
+        method = request.method.upper()
+        challenged = await self._http.post(
+            origin + CHALLENGE_PATH,
+            json={
+                "slug": slug_of(path),
+                "payer_address": self.address,
+                "method": method,
+                "path": path,
+                "body_hash": prepaid_body_hash(body),
+            },
+        )
+        if challenged.status_code != 201:
+            code, message = error_details(challenged)
+            if code == "insufficient_balance":
+                raise InsufficientPrepaidBalanceError(challenged.status_code, code, message, challenged)
+            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+        try:
+            challenge = PrepaidChallenge.model_validate(challenged.json())
+        except ValueError as exc:
+            raise InvalidChallengeError(f"prepaid challenge cannot be decoded: {exc}") from exc
+        validate_debit_challenge(
+            challenge,
+            domain=request.url.netloc.decode("ascii").lower(),
+            address=self.address,
+            method=method,
+            path=path,
+            body_hash=prepaid_body_hash(body),
+            cap_sompi=cap,
+        )
+        signature = kaspa.sign_message(challenge.message, self._private_key)
+        request.headers[HEADER_PREPAID_DEBIT] = PrepaidDebitHeader(
+            nonce=challenge.nonce, signature=signature
+        ).to_header()
+        response = await self._http.send(request)
+        raw_receipt = response.headers.get(HEADER_PREPAID_RECEIPT)
+        if raw_receipt is None:
+            code, message = error_details(response)
+            if response.status_code == 409:
+                raise PaymentReplayedError(409, code, message, response)
+            if response.status_code == 402 and code == "insufficient_balance":
+                raise InsufficientPrepaidBalanceError(402, code, message, response)
+            if response.status_code == 402 and code == "payment_expired":
+                raise PaymentExpiredError(402, code, message, response)
+            if response.status_code in (402, 503):
+                raise PaymentRejectedError(response.status_code, code, message, response)
+            if 200 <= response.status_code < 300:
+                raise PaymentReceiptError("prepaid call succeeded without a debit receipt", response)
+            return response
+        try:
+            receipt = PrepaidReceipt.from_header(raw_receipt)
+        except ValueError as exc:
+            raise PaymentReceiptError(f"prepaid receipt cannot be decoded: {exc}", response) from exc
+        if receipt.nonce != challenge.nonce or receipt.amountSompi != challenge.amount_sompi:
+            raise PaymentReceiptError("prepaid receipt does not match the signed debit", response)
+        response.extensions[PREPAID_RECEIPT_EXTENSION] = receipt
+        return response
 
     # ------------------------------------------------------------------ internals
 
