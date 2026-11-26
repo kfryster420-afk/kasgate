@@ -42,8 +42,9 @@ X-KasGate-Prepaid: Base64(JSON{nonce, signature}). Balance: GET /v1/prepaid/bala
 Refunds of unused credit: POST /v1/prepaid/refunds/challenge {slug, payer_address, action: "request",
 amount_sompi?} (omit the amount for all spendable credit, at least 0.2 KAS), sign the message (Purpose
 kasgate:v1:prepaid-refund) with the depositing key, POST /v1/prepaid/refunds {nonce, signature}. The merchant
-pays it back on-chain to the depositing address with no platform fee; follow it with
-GET /v1/prepaid/refunds/status?slug=&payer_address=. Credit may expire if the merchant set an expiry (see
+pays it back on-chain to the depositing address with no platform fee (payload kasgate:v1:refund:<id hex>);
+follow it with GET /v1/prepaid/refunds/status?slug=&payer_address= (public, no reasons) or a signed "status"
+challenge and POST /v1/prepaid/refunds/status {nonce, signature} (with the merchant's reasons). Credit may expire if the merchant set an expiry (see
 expires_at and spendable_sompi on the balance).
 
 ## Free trial calls (kasgate-trial-v1)
@@ -63,7 +64,7 @@ lists kasgate-trial-v1. On the gateway host:
 
 Merchants can register HTTPS webhooks for payment.settled, prepaid.deposit, prepaid.debit, trial.used,
 endpoint.created, endpoint.updated, prepaid.refund.requested, prepaid.refund.paid, prepaid.refund.rejected,
-prepaid.refund.cancelled and prepaid.credit.expired. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
+prepaid.refund.cancelled, prepaid.refund.payout_reverted and prepaid.credit.expired. Each delivery is signed: X-KasGate-Signature: t=<unix>,v1=<hex
 HMAC-SHA256(secret, "<t>.<raw body>")>; reject timestamps older than 5 minutes and dedupe on X-KasGate-Event-Id.
 
 ## Catalog
