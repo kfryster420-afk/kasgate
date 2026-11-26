@@ -81,8 +81,9 @@ def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None
     """CONTRACT v2.14: what a refund request may take: spendable sompi minus unspent failed-delivery credit.
 
     Spendable already excludes the refund hold and a cancel cooldown hold (both live in `refund_hold_sompi` until
-    the ledger worker releases the cooldown). Failed-delivery credit is call-only: a refund never pays it out
-    on-chain. The result is never negative.
+    the ledger worker releases the cooldown, including after `hold_until` while a payout attempt is still
+    pending). Failed-delivery credit is call-only: a refund never pays it out on-chain. The result is never
+    negative.
     """
     if balance is None:
         return 0

@@ -11,11 +11,12 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ledger import expire_due_balances, refundable_sompi, run_ledger_pass, spendable_sompi
-from app.models import PrepaidBalance, PrepaidDebit, PrepaidLedgerEntry
+from app.models import PrepaidBalance, PrepaidDebit, PrepaidLedgerEntry, PrepaidRefundPayout
+from app.payments import PaymentVerificationError
 from app.schemas import CREDIT_STATUS_ACTION, BuyerCreditStatus, PrepaidCreditStatusChallenge, compute_fee_split
 from tests.conftest import (
     OTHER_KEY,
@@ -378,3 +379,64 @@ async def test_a_cooldown_hold_blocks_another_refund_while_credit_still_pays_cal
     assert spendable_sompi(after) == CREDIT_SOMPI + SPLIT.merchant_sompi - CHEAP_SOMPI
     assert refundable_sompi(after) == CREDIT_SOMPI
     _identity(after)
+
+
+async def test_a_cooldown_hold_outlasts_hold_until_while_a_payout_is_pending_and_credit_still_pays_calls(
+    client: httpx.AsyncClient,
+    shop: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    stub_engine: StubEngine,
+) -> None:
+    """A payout posted inside the cooldown keeps refund_hold_sompi after hold_until until the attempt is resolved.
+
+    refundable stays 0 (deposit is still held, credit is call-only). Spendable still includes the unspent
+    failed-delivery credit, so calls go through. credits/status.refundable_sompi follows the same hold.
+    """
+    await fund(client)
+    await _credit_weather(client, upstream)
+    refund = await open_refund(client)
+    assert (await claim(client, shop, refund.id)).status_code == 200
+    await age(sessionmaker, refund.id, claimed_at=datetime.now(UTC) - LAPSED)
+    assert (await cancel(client, refund.id)).status_code == 200
+    stub_engine.payout_error = PaymentVerificationError("payload_unverified", "accepted, payload not seen yet")
+    assert (await payout(client, shop, refund.id, tx_id=PAYOUT_TX)).status_code == 202
+    await age(sessionmaker, refund.id, hold_until=datetime.now(UTC) - timedelta(seconds=1))
+    await run_ledger_pass(sessionmaker, stub_engine)
+    held = await _balance(sessionmaker, shop.merchant_id)
+    assert held.refund_hold_sompi == CREDIT_SOMPI
+    assert spendable_sompi(held) == SPLIT.merchant_sompi
+    assert refundable_sompi(held) == 0
+    _identity(held)
+    refused = await refund_challenge(client, amount=MIN_REFUND)
+    assert refused.status_code == 409 and refused.json()["error"] == "insufficient_balance"
+    assert (await prepaid_call(client)).status_code == 200
+    spent = await _balance(sessionmaker, shop.merchant_id)
+    assert spent.credit_balance_sompi == SPLIT.merchant_sompi - CHEAP_SOMPI
+    assert spent.refund_hold_sompi == CREDIT_SOMPI
+    assert refundable_sompi(spent) == 0 and spendable_sompi(spent) == SPLIT.merchant_sompi - CHEAP_SOMPI
+    _identity(spent)
+    challenge = await _credit_status_challenge(client)
+    status = BuyerCreditStatus.model_validate(
+        (await client.post("/v1/prepaid/credits/status", json=signed(challenge))).json()
+    )
+    assert status.refundable_sompi == "0"
+    assert status.credit_balance_sompi == str(SPLIT.merchant_sompi - CHEAP_SOMPI)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(PrepaidRefundPayout)
+            .where(PrepaidRefundPayout.refund_id == refund.id)
+            .values(created_at=datetime.now(UTC) - timedelta(days=30), next_check_at=datetime.now(UTC))
+        )
+        await session.commit()
+    await run_ledger_pass(sessionmaker, stub_engine)
+    after = await _balance(sessionmaker, shop.merchant_id)
+    assert after.refund_hold_sompi == 0
+    assert spendable_sompi(after) == CREDIT_SOMPI + SPLIT.merchant_sompi - CHEAP_SOMPI
+    assert refundable_sompi(after) == CREDIT_SOMPI
+    _identity(after)
+    released = await _credit_status_challenge(client)
+    done = BuyerCreditStatus.model_validate(
+        (await client.post("/v1/prepaid/credits/status", json=signed(released))).json()
+    )
+    assert done.refundable_sompi == str(CREDIT_SOMPI)

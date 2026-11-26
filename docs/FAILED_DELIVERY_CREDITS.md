@@ -77,9 +77,12 @@ refund_hold_sompi)`):
 * **Calls spend credit first**, then deposited sompi. `prepaid_debits.credit_sompi` is the part of each debit paid
   from credit; a debit restored after an upstream failure gives that part back to the credit.
 * **Refunds take deposited, unspent sompi only**: `refundable = max(0, balance - refund_hold - credit_balance)`
-  (`refund_hold` includes an open refund and a cancel cooldown). The refund
+  (`refund_hold` includes an open refund and a cancel cooldown, including after `hold_until` while a payout
+  attempt for that refund is still pending). Spendable for calls follows v2.13: `max(0, balance - refund_hold)`
+  (0 if expired), so credit still pays calls during that hold. The refund
   challenge's default amount is `refundable_sompi`; asking for more is `409 insufficient_balance`. So the refund
-  hold never covers credit, and credit keeps paying calls while a refund is open.
+  hold never covers credit, and credit keeps paying calls while a refund is open. Signed
+  `POST /v1/prepaid/credits/status` reports the same `refundable_sompi`.
 * A **late payout** of a cancelled or rejected refund re-debits deposited sompi first, then credit (the coins
   already reached the buyer, so the same sompi never stays spendable too).
 * **Expiry** drops the unspent credit with the rest of the spendable balance.
