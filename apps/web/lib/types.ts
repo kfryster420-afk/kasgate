@@ -173,6 +173,12 @@ export interface PrepaidBalanceRead {
   spendable_sompi: Sompi;
   /** CONTRACT v2.13: when the credit expires (null = never). */
   expires_at: IsoDateTime | null;
+  /** CONTRACT v2.14: merchant shares of failed paid calls ever credited onto this balance. */
+  credited_sompi: Sompi;
+  /** CONTRACT v2.14: unspent failed-delivery credit inside the balance; spent first by calls, never refundable. */
+  credit_balance_sompi: Sompi;
+  /** CONTRACT v2.14: what a refund request may take now (spendable minus unspent failed-delivery credit). */
+  refundable_sompi: Sompi;
 }
 
 export interface PrepaidDepositRead {
@@ -248,6 +254,8 @@ export interface PrepaidRefundChallenge {
   refund_id: Uuid | null;
   spendable_sompi: Sompi;
   expires_at: IsoDateTime;
+  /** CONTRACT v2.14: the most a refund may take (failed-delivery credit excluded). */
+  refundable_sompi: Sompi;
 }
 
 /** POST /v1/prepaid/refunds, /v1/prepaid/refunds/{id}/cancel and /v1/prepaid/refunds/status (signed). */
@@ -312,9 +320,11 @@ export interface PrepaidRefundReject {
   reason: string;
 }
 
-export type PrepaidLedgerEntryKind = "refund" | "expiry";
+export type PrepaidLedgerEntryKind = "refund" | "expiry" | "failed_delivery_credit";
+export type FailedDeliveryCreditReason = "attempts_exhausted" | "window_expired";
+export type DeliveryFailure = "upstream_5xx" | "connect_error" | "timeout" | "oversized";
 
-/** GET /v1/prepaid/ledger [Bearer]: refund payouts and expiries, newest first. */
+/** GET /v1/prepaid/ledger [Bearer]: refund payouts, expiries and failed-delivery credits, newest first. */
 export interface PrepaidLedgerEntryRead {
   id: Uuid;
   payer_address: string;
@@ -326,6 +336,84 @@ export interface PrepaidLedgerEntryRead {
   refund_id: Uuid | null;
   note: string | null;
   created_at: IsoDateTime;
+  /** failed_delivery_credit rows only (null / "0" otherwise). */
+  settlement_id: Uuid | null;
+  slug: string | null;
+  credit_reason: FailedDeliveryCreditReason | null;
+  /** Part of the merchant share not credited because the balance reached PREPAID_MAX_BALANCE_SOMPI. */
+  shortfall_sompi: Sompi;
+}
+
+/* ------------------------------------------------------------------ failed-delivery auto-credit (CONTRACT v2.14) */
+
+export type PaymentScheme = "kaspa-exact-v1" | "k402-kaspa-utxo" | "kaspa-exact-v2";
+
+/** GET /v1/prepaid/credits [Bearer]: one failed-delivery credit joined with the paid call it credits. */
+export interface PrepaidCreditRead {
+  id: Uuid;
+  kind: "failed_delivery_credit";
+  tx_id: string;
+  settlement_id: Uuid;
+  endpoint_id: Uuid;
+  slug: string;
+  payer_address: string;
+  payment_scheme: PaymentScheme;
+  /** What the buyer paid on-chain for the call. */
+  amount_sompi: Sompi;
+  /** Platform fee (output 1): already paid to the treasury and NOT reversed. */
+  fee_sompi: Sompi;
+  /** The merchant share credited to the buyer's prepaid balance (call-only, never refunded on-chain). */
+  credit_sompi: Sompi;
+  shortfall_sompi: Sompi;
+  balance_after_sompi: Sompi;
+  reason: FailedDeliveryCreditReason;
+  delivery_failure: DeliveryFailure;
+  /** >= 500, or null for a connection error / timeout. */
+  upstream_status_code: number | null;
+  delivery_attempts: number;
+  settled_at: IsoDateTime | null;
+  created_at: IsoDateTime;
+}
+
+/** GET/PUT /v1/prepaid/failed-delivery-policy [Bearer]. The policy in force when a call settles is stamped on it. */
+export interface FailedDeliveryPolicyRead {
+  enabled: boolean;
+  credit_timeouts: boolean;
+  enabled_at: IsoDateTime;
+  disabled_at: IsoDateTime | null;
+}
+
+/** PUT body: omitted fields keep their value; at least one must be given. */
+export interface FailedDeliveryPolicyUpdate {
+  enabled?: boolean;
+  credit_timeouts?: boolean;
+}
+
+/** One credit in the buyer's summary (newest first). */
+export interface BuyerCreditItem {
+  txId: string;
+  slug: string;
+  creditSompi: Sompi;
+  shortfallSompi: Sompi;
+  reason: FailedDeliveryCreditReason;
+  createdAt: IsoDateTime;
+}
+
+/** X-KasGate-Credit-Summary (Base64 JSON) on the signed POST /v1/prepaid/refunds/status reply. */
+export interface BuyerCreditSummary {
+  merchantId: Uuid;
+  creditedSompi: Sompi;
+  creditBalanceSompi: Sompi;
+  refundableSompi: Sompi;
+  creditCount: number;
+  /** The newest credits, at most 10. */
+  credits: BuyerCreditItem[];
+}
+
+/** This app's POST /api/prepaid/refunds/status reply: the gateway body plus its decoded credit-summary header. */
+export interface SignedRefundStatus {
+  refunds: PrepaidRefundRead[];
+  credit_summary: BuyerCreditSummary | null;
 }
 
 /* ------------------------------------------------------------------ fee split */
@@ -592,7 +680,7 @@ export interface SettlementRead {
   /** "k402-kaspa-utxo" payments carry the same treasury output but prove no payer, so payer_address is null.
    *  "kaspa-exact-v2" (community kaspa-x402 `exact`, CONTRACT v2.10) pays the merchant the full price: no platform
    *  fee during the beta, so fee_amount_sompi is 0 and treasury_address / payment_nonce are null. */
-  payment_scheme: "kaspa-exact-v1" | "k402-kaspa-utxo" | "kaspa-exact-v2";
+  payment_scheme: PaymentScheme;
   payer_address: string | null;
   merchant_address: string;
   treasury_address: string | null;
@@ -783,6 +871,8 @@ export const WEBHOOK_EVENT_TYPES = [
   "prepaid.refund.cancelled",
   "prepaid.refund.payout_reverted",
   "prepaid.credit.expired",
+  "prepaid.credit.failed_delivery",
+  "prepaid.credit.failed_delivery_shortfall",
 ] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 export type WebhookDeliveryStatus = "pending" | "delivering" | "succeeded" | "dead";

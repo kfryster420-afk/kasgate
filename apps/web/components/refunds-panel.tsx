@@ -5,7 +5,9 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { IS_TESTNET, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { formatDateTime, shortAddress, shortHash } from "@/lib/format";
+import { CREDIT_REASON_LABEL, LEDGER_KIND_LABEL, LEDGER_KIND_TONE } from "@/lib/credit-labels";
 import { refundErrorMessage } from "@/lib/refund-errors";
+import { formatKas } from "@/lib/sompi";
 import { claimExpiresAt, forgetPayout, recordedPayout, rememberPayout, sendRefundPayout, UNKNOWN_TXID, type RecordedPayout } from "@/lib/refund-payout";
 import {
   PREPAID_REFUND_REASON_MAX_LENGTH,
@@ -597,10 +599,18 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                     {shortAddress(entry.payer_address)}
                   </td>
                   <td className="td">
-                    <span className={`badge ${entry.kind === "refund" ? "border-sky-800 bg-sky-950/50 text-sky-300" : "border-zinc-700 bg-zinc-900 text-zinc-300"}`}>
-                      {entry.kind === "refund" ? "refund payout" : "credit expired"}
-                    </span>
+                    <span className={`badge ${LEDGER_KIND_TONE[entry.kind]}`}>{LEDGER_KIND_LABEL[entry.kind]}</span>
                     <div className="mt-1 font-mono text-[11px] text-zinc-600">{entry.direction}</div>
+                    {entry.kind === "failed_delivery_credit" ? (
+                      <div className="mt-1 text-[11px] text-zinc-400" data-ledger-credit>
+                        {entry.slug ? <span className="font-mono">{entry.slug}</span> : null}
+                        {entry.credit_reason ? ` · ${CREDIT_REASON_LABEL[entry.credit_reason]}` : null}
+                        <div className="text-zinc-500">Call-only: never refunded on-chain.</div>
+                        {BigInt(entry.shortfall_sompi) > 0n ? (
+                          <div className="text-amber-300/90">Not credited (balance cap): {formatKas(BigInt(entry.shortfall_sompi))} KAS</div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </td>
                   <td className="td">
                     <KasAmount sompi={entry.amount_sompi} tone={entry.direction === "debit" ? "text-amber-300" : "text-emerald-300"} />
@@ -638,7 +648,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
         )}
         {!loading && rowsShown === 0 ? (
           <div className="td py-8 text-center text-zinc-500">
-            {tab === "ledger" ? "No refund payouts or expiries yet." : tab === "open" ? "No open refund requests." : "No refunds in this view."}
+            {tab === "ledger" ? "No refund payouts, expiries or failed-call credits yet." : tab === "open" ? "No open refund requests." : "No refunds in this view."}
           </div>
         ) : null}
         {loading ? (

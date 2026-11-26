@@ -24,6 +24,8 @@ const EVENT_LABELS: Record<WebhookEventType, string> = {
   "prepaid.refund.cancelled": "Prepaid refund cancelled",
   "prepaid.refund.payout_reverted": "Prepaid refund payout reverted",
   "prepaid.credit.expired": "Prepaid credit expired",
+  "prepaid.credit.failed_delivery": "Failed call credited to prepaid",
+  "prepaid.credit.failed_delivery_shortfall": "Failed-call credit capped (shortfall)",
 };
 
 const STATUS_TONE: Record<WebhookDeliveryStatus, string> = {
