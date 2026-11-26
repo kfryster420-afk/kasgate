@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     prepaid_payout_backoff_max_seconds: float = Field(default=1800.0, gt=0, le=86_400)
     # A merchant's claim (`paying`) blocks the buyer's cancel for this long before a payout must be posted.
     prepaid_refund_claim_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    # Total time a refund can stay claimed, counted from its FIRST claim (`first_claimed_at`): no renewals past it.
+    prepaid_refund_claim_max_seconds: int = Field(default=3600, ge=60, le=604_800)
+    # After the buyer cancels a refund the merchant had claimed, its amount stays held this long before it becomes
+    # spendable again (a payout broadcast just before the claim lapsed can still land and be recorded).
+    prepaid_refund_cancel_cooldown_seconds: int = Field(default=1800, ge=0, le=604_800)
+    # Pending (unconfirmed) payout attempts allowed per refund; more are refused with 409 `too_many_attempts`.
+    prepaid_payout_max_pending_attempts: int = Field(default=3, ge=1, le=20)
+    # Unseen attempts are re-checked after (attempt age x this fraction), capped by the backoff maximum.
+    prepaid_payout_unseen_backoff_fraction: float = Field(default=0.1, gt=0, le=1)
+    # POST /v1/prepaid/refunds/{id}/payout per merchant per minute.
+    rl_refund_payout_per_merchant_per_minute: int = Field(default=20, ge=1)
     # Signed buyer refund writes (POST /v1/prepaid/refunds, /cancel, /status) per client IP per minute.
     rl_prepaid_refund_per_minute: int = Field(default=30, ge=1)
     # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate

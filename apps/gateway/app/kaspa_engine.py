@@ -83,7 +83,9 @@ from app.config import (
     get_settings,
 )
 from app.exact_v2 import ExactV2Verification, verify_exact_v2
+from app.kaspa_types import TX_ID_RE
 from app.payments import PaymentVerificationError as PaymentVerificationError
+from app.payments import PayoutSighting
 from app.payments import RpcUnavailableError as RpcUnavailableError
 from app.payments import VerifiedPayment as VerifiedPayment
 from app.schemas import (
@@ -753,6 +755,52 @@ class KaspaEngine:
                 f"payout {tx_id} is accepted but its payload was never seen by the gateway; post the signed "
                 "transaction JSON (KasWare sendKaspa returns it) as `transaction` to prove it is this refund's payout",
             )
+
+    async def find_refund_payouts(
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+    ) -> list[PayoutSighting]:
+        """Every transaction the node shows that may be this refund's payout, before a buyer cancel of a refund the
+        merchant had claimed. Nothing is submitted.
+
+        * Mempool (entries received by ``to_address``): any transaction carrying the payload
+          ``kasgate:v1:refund:<refund_id hex>``, whatever it pays (``payload_seen=True``).
+        * UTXO index (accepted, payload not readable there): any non-coinbase output paying ``to_address`` exactly
+          ``amount_sompi`` (``payload_seen=False``; the caller skips transactions it already knows).
+
+        Raises ``wrong_network``, a malformed-reply ``invalid_payment_header`` or ``RpcUnavailableError`` (the caller
+        must then refuse the cancel: it cannot rule out a payout in flight).
+        """
+        self._check_payout_address(to_address)
+        expected_payload = refund_payout_payload(refund_id).hex()
+        addresses = [to_address.lower()]
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        found: dict[str, PayoutSighting] = {}
+        for by_address in _as_list(_as_dict(mempool_response).get("entries")):
+            for mempool_entry in _as_list(_as_dict(by_address).get("receiving")):
+                transaction = _as_dict(_as_dict(mempool_entry).get("transaction"))
+                entry_id = _as_dict(transaction.get("verboseData")).get("transactionId")
+                payload = transaction.get("payload")
+                if isinstance(entry_id, str) and isinstance(payload, str) and payload.lower() == expected_payload:
+                    found[entry_id.lower()] = PayoutSighting(entry_id.lower(), payload_seen=True)
+        utxo_response = await self._rpc(
+            "get_utxos_by_addresses", lambda client: client.get_utxos_by_addresses({"addresses": addresses})
+        )
+        for entry in _as_list(_as_dict(utxo_response).get("entries")):
+            entry_dict = _as_dict(entry)
+            entry_tx = _as_dict(entry_dict.get("outpoint")).get("transactionId")
+            utxo = _as_dict(entry_dict.get("utxoEntry"))
+            amount = utxo.get("amount")
+            if not isinstance(entry_tx, str) or not TX_ID_RE.fullmatch(entry_tx.lower()):
+                raise PaymentVerificationError("invalid_payment_header", "a UTXO is malformed in the node's reply")
+            if utxo.get("isCoinbase") is True or isinstance(amount, bool) or amount != amount_sompi:
+                continue
+            found.setdefault(entry_tx.lower(), PayoutSighting(entry_tx.lower(), payload_seen=False))
+        return list(found.values())
 
     def _parse_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int

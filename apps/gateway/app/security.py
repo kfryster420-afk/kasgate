@@ -595,6 +595,8 @@ RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hou
 
 
 RATE_LIMIT_PREPAID_REFUND = RateLimit("prepaid_refund", "rl_prepaid_refund_per_minute", 60)
+# Per merchant (not per IP): POST /v1/prepaid/refunds/{id}/payout.
+RATE_LIMIT_REFUND_PAYOUT = RateLimit("refund_payout", "rl_refund_payout_per_merchant_per_minute", 60)
 
 
 def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:

@@ -855,7 +855,8 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         attempt_of(tx=tx, status="confirmed", confirmed="now()", resolved="now()", of="paid"),
         attempt_of(),  # a pending attempt of the requested refund (e.g. after a revert)
         "UPDATE prepaid_refunds SET late_paid_from = 'cancelled', shortfall_sompi = 4 WHERE status = 'paid'",
-        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now() WHERE status = 'requested'",
+        "UPDATE prepaid_refunds SET status = 'paying', claimed_at = now(), first_claimed_at = now() "
+        "WHERE status = 'requested'",
     )
     # A late payout that found nothing left to debit is recorded with a 0 sompi refund ledger row.
     await _execute(
@@ -907,6 +908,8 @@ async def test_0008_refund_expiry_constraints_and_guarded_downgrade(pg_server: P
         "UPDATE prepaid_refunds SET late_paid_from = 'cancelled' WHERE status = 'paying'",  # only when paid
         "UPDATE prepaid_refunds SET late_paid_from = NULL WHERE status = 'paid'",  # shortfall_only_when_late
         "UPDATE prepaid_refunds SET claimed_at = NULL WHERE status = 'paying'",  # paying_is_claimed
+        "UPDATE prepaid_refunds SET first_claimed_at = NULL WHERE status = 'paying'",  # claimed_has_first_claim
+        "UPDATE prepaid_refunds SET hold_until = now() WHERE status = 'paying'",  # hold_until_only_cancelled
         attempt_of(of="paying"),  # ix_prepaid_refund_payouts_tx_id: one refund per tx_id
         attempt_of(tx=f"'{'f' * 64}'", status="lost", of="paying"),  # status_known
         attempt_of(tx=f"'{'f' * 64}'", method="wallet", of="paying"),  # method_known

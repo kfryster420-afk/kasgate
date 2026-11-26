@@ -79,7 +79,8 @@ async def test_hole_claim_lapse_lets_the_buyer_cancel_and_spend_a_payout_already
     refund = await open_refund(client)
     assert (await claim(client, shop, refund.id)).status_code == 200
     public = await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
-    assert public.json()[0]["status"] == "paying" and public.json()[0]["claimed_at"]  # the buyer can time the lapse
+    # The public view no longer shows the claim (`paying` reads as `requested`, no claim times): no lapse to time.
+    assert public.json()[0]["status"] == "requested" and public.json()[0]["claimed_at"] is None
     await age(sessionmaker, refund.id, claimed_at=datetime.now(UTC) - LAPSED)
     # The payload-bound payout is already visible to the node (the stub engine verifies it).
     await cancel(client, refund.id)
@@ -179,13 +180,20 @@ async def test_hole_a_database_at_the_first_0008_never_gets_the_revised_schema(
     pg_server: PgServer, tmp_path: Path
 ) -> None:
     """A testnet DB migrated with 15d7bd4 is stamped 0008_prepaid_refunds. The revised 0008 keeps the same revision
-    id, so `alembic upgrade head` is a no-op: no prepaid_refund_payouts, no `paying`, no late-payout columns."""
+    id, so `alembic upgrade head` is a no-op: no prepaid_refund_payouts, no `paying`, no late-payout columns.
+
+    Fix chosen by the owner: keep 0008 in place, but `upgrade head` must REFUSE such a database with a clear message
+    (never silently leave the old schema), and the revised `downgrade()` must work from the old shape, so
+    `downgrade 0007_trials_webhooks` + `upgrade head` gives the revised schema."""
     url = pg_server.make_url("kasgate_old0008")
     pg_server.create_database("kasgate_old0008")
     old = alembic_config(url)
     old.set_main_option("script_location", str(_old_0008_script_dir(tmp_path)))
     await asyncio.to_thread(command.upgrade, old, "head")
-    await asyncio.to_thread(command.upgrade, alembic_config(url), "head")  # the revised scripts
+    with pytest.raises(RuntimeError, match="earlier draft of revision 0008_prepaid_refunds"):
+        await asyncio.to_thread(command.upgrade, alembic_config(url), "head")  # the revised scripts
+    await asyncio.to_thread(command.downgrade, alembic_config(url), "0007_trials_webhooks")
+    await asyncio.to_thread(command.upgrade, alembic_config(url), "head")
     engine = create_async_engine(url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
