@@ -154,13 +154,20 @@ async def test_held_scan_mempool_sightings_precede_utxo_ones_so_a_real_payout_is
     assert sightings[0] == PayoutSighting(real.id, payload_seen=True) and len(sightings) == 4
 
 
-async def test_info_scan_window_is_unbounded_an_old_exact_amount_utxo_counts() -> None:
-    """Any unspent, non-coinbase output of exactly the amount counts, however old (blockDaaScore 1 here): a buyer
-    whose wallet already holds such a UTXO blocks their own cancel of a claimed refund for up to 7 days."""
+async def test_info_scan_ignores_utxo_outputs_older_than_the_first_claim() -> None:
+    """The UTXO-index branch ignores outputs whose blockDaaScore is at or below the virtual DAA stored at the
+    first claim, so a buyer UTXO that was already there cannot block the cancel. Mempool (payload-bound) sightings
+    are not filtered. Without a claim-time score (`min_daa_score=0`) every exact-amount UTXO still counts."""
     node = FakeNode()
-    node.utxos[tx_of(9)] = [(0, AMOUNT, _script_hex(PAYER_ADDRESS))]
-    sightings = await make_engine(node).find_refund_payouts(PAYER_ADDRESS, AMOUNT, REFUND_ID)
-    assert [s.tx_id for s in sightings] == [tx_of(9)]
+    old, fresh = tx_of(9), tx_of(10)
+    node.utxos[old] = [(0, AMOUNT, _script_hex(PAYER_ADDRESS))]
+    node.utxos[fresh] = [(0, AMOUNT, _script_hex(PAYER_ADDRESS))]
+    node.utxo_daa[old] = 50
+    node.utxo_daa[fresh] = 200
+    unfiltered = await make_engine(node).find_refund_payouts(PAYER_ADDRESS, AMOUNT, REFUND_ID)
+    assert {s.tx_id for s in unfiltered} == {old, fresh}
+    found = await make_engine(node).find_refund_payouts(PAYER_ADDRESS, AMOUNT, REFUND_ID, min_daa_score=100)
+    assert [s.tx_id for s in found] == [fresh]
 
 
 async def test_info_claim_state_is_still_observable_without_a_signature(
