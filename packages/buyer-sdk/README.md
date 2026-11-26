@@ -72,3 +72,35 @@ async with KasGateClient(PRIVATE_KEY_HEX, max_price_kas="0.01") as client:
 - Errors: `InsufficientPrepaidBalanceError` (402 insufficient_balance, nothing debited), `PaymentReplayedError`
   (409, nonce already used), `InvalidChallengeError` / `PriceCapExceededError` (nothing signed).
 - The balance belongs to the depositing key at that merchant; use the same key for deposits and debits.
+
+## Free trial calls (CONTRACT v2.12)
+
+Merchants can give every buyer key N free calls per endpoint. `request()` uses them automatically before paying:
+a 402 that carries `X-KasGate-Trial-Offer` is answered with ONE signed trial call; when the trial is used up the
+gateway's normal 402 comes back and is paid as usual.
+
+```python
+async with KasGateClient(PRIVATE_KEY_HEX) as client:              # use_free_trials=True is the default
+    response = await client.get("https://gw.example/p/weather")    # free while the trial lasts, then paid
+    print(trial_receipt_of(response))   # trialCallId, nonce, limit, remaining, status (used | refunded)
+    print(await client.trial_status("https://gw.example", "weather"))
+    response = await client.trial_request("GET", "https://gw.example/p/weather")  # trial only, never pays
+```
+
+- The SDK asks `POST /v1/trials/challenge`, rebuilds the text from its own request (domain, payer, endpoint, method,
+  path + query, body hash, nonce, expiry) and refuses to sign unless it matches byte for byte. The text carries no
+  amount and its Purpose (`kasgate:v1:trial-call`) differs from every payment signature, so it can never move coins.
+- A failed upstream (no response or 5xx) gives the trial call back (`refunded` receipt); nothing is retried.
+- `trial_request` raises `PaymentRejectedError` with code `trial_exhausted` when no trial call is left.
+- Pass `use_free_trials=False` to always pay.
+
+## Verifying merchant webhooks (CONTRACT v2.12)
+
+```python
+from kasgate_client import verify_webhook_signature
+
+ok = verify_webhook_signature(WEBHOOK_SECRET, request.headers["X-KasGate-Signature"], raw_body_bytes)
+```
+
+The header is `t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>`; deliveries older than 300 s are refused.
+Verify the RAW body before parsing JSON and dedupe on `X-KasGate-Event-Id`.

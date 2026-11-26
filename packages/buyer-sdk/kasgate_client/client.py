@@ -77,6 +77,19 @@ from .protocol import (
     payment_payload,
 )
 from .transaction import BuiltPayment, build_payment_transaction
+from .trials import (
+    HEADER_TRIAL_CALL,
+    HEADER_TRIAL_OFFER,
+    HEADER_TRIAL_RECEIPT,
+    TRIAL_CHALLENGE_PATH,
+    TRIAL_RECEIPT_EXTENSION,
+    TRIAL_STATUS_PATH,
+    TrialCallHeader,
+    TrialChallenge,
+    TrialReceipt,
+    TrialStatus,
+    validate_trial_challenge,
+)
 from .utxo import RpcUtxoProvider, UtxoLedger, UtxoProvider
 
 RECEIPT_EXTENSION = "kasgate_receipt"
@@ -106,6 +119,12 @@ def prepaid_receipt_of(response: httpx.Response) -> PrepaidReceipt | None:
     return receipt if isinstance(receipt, PrepaidReceipt) else None
 
 
+def trial_receipt_of(response: httpx.Response) -> TrialReceipt | None:
+    """The CONTRACT v2.12 free-trial receipt of a call answered from a trial (automatic or `trial_request`)."""
+    receipt = response.extensions.get(TRIAL_RECEIPT_EXTENSION)
+    return receipt if isinstance(receipt, TrialReceipt) else None
+
+
 def receipt_of(response: httpx.Response) -> PaymentReceipt | None:
     return response.extensions.get(RECEIPT_EXTENSION)
 
@@ -127,6 +146,10 @@ class KasGateClient:
         nonce never reached the node, so nothing was spent).
       * Redelivery: a settled payment whose upstream failed (5xx) is re-presented with the same signature up to
         `max_redeliveries` times, for idempotent methods only.
+      * CONTRACT v2.12 free trials: with `use_free_trials` (default on) a 402 that offers a free trial is answered
+        with ONE signed trial call before anything is paid. The signed text is rebuilt locally from this request and
+        carries no amount, so a trial signature can never move coins. When the trial is used up (or refused) the
+        gateway's normal 402 is paid as usual.
     """
 
     def __init__(
@@ -145,6 +168,7 @@ class KasGateClient:
         utxo_provider: UtxoProvider | None = None,
         utxo_quarantine_seconds: float = DEFAULT_UTXO_QUARANTINE_SECONDS,
         http_client: httpx.AsyncClient | None = None,
+        use_free_trials: bool = True,
         **httpx_kwargs: Any,
     ) -> None:
         if network not in NETWORK_ADDRESS_PREFIX:
@@ -188,6 +212,7 @@ class KasGateClient:
         self.max_network_fee_sompi = max_network_fee_sompi
         self.min_output_sompi = min_output_sompi  # None = read DirectoryManifest.min_output_sompi per gateway
         self.max_redeliveries = max_redeliveries
+        self.use_free_trials = bool(use_free_trials)
         self._manifest_floors: dict[str, int] = {}
         self.unavailable_retry_delay = unavailable_retry_delay
         self.max_signature_header_bytes = max_signature_header_bytes
@@ -240,6 +265,21 @@ class KasGateClient:
         self._require_replayable(kwargs)
 
         response = await self._http.request(method, url, **kwargs)
+        if (
+            response.status_code == 402
+            and self.use_free_trials
+            and HEADER_TRIAL_OFFER in response.headers
+        ):
+            tried = await self._trial_call(method, url, kwargs, strict=False)
+            if tried is not None:
+                await response.aclose()
+                if trial_receipt_of(tried) is not None or tried.status_code < 400:
+                    return tried  # answered from the free trial (a refunded 5xx included); nothing paid
+                if tried.status_code == 402:
+                    response = tried  # trial used up or refused: the gateway's normal 402, paid below
+                else:
+                    await tried.aclose()  # e.g. 429 trial rate limit or 409: pay instead
+                    response = await self._http.request(method, url, **kwargs)
         for attempt in range(2):
             if response.status_code != 402:
                 return response
@@ -580,6 +620,103 @@ class KasGateClient:
         if receipt.nonce != challenge.nonce or receipt.amountSompi != challenge.amount_sompi:
             raise PaymentReceiptError("prepaid receipt does not match the signed debit", response)
         response.extensions[PREPAID_RECEIPT_EXTENSION] = receipt
+        return response
+
+    # ------------------------------------------------------------------ free trial calls (CONTRACT v2.12)
+
+    async def trial_status(self, gateway_url: str | httpx.URL, slug: str) -> TrialStatus:
+        """How many free trial calls this key has left on `slug` (public read; never signs)."""
+        origin = self._origin(self._absolute(gateway_url))
+        response = await self._http.get(
+            origin + TRIAL_STATUS_PATH, params={"slug": slug, "payer_address": self.address}
+        )
+        if response.status_code != 200:
+            code, message = error_details(response)
+            raise PaymentRejectedError(response.status_code, code, message, response)
+        return TrialStatus.model_validate(response.json())
+
+    async def trial_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+        """Make ONE /p/{slug} call from this key's free trial and never pay: raises PaymentRejectedError (code
+        `trial_exhausted`) when no trial call is left. The receipt is `trial_receipt_of(response)`; a failed upstream
+        (no response or 5xx) gives the trial call back and the receipt says `refunded`."""
+        self._require_replayable(kwargs)
+        response = await self._trial_call(method, url, kwargs, strict=True)
+        assert response is not None  # strict mode raises instead of returning None
+        return response
+
+    async def _trial_call(
+        self, method: str, url: str | httpx.URL, kwargs: dict[str, Any], *, strict: bool
+    ) -> httpx.Response | None:
+        """Ask for a trial challenge, verify it against this exact request, sign it, send the call.
+
+        Returns None (not strict) when the gateway refuses the challenge, e.g. the trial is used up: the caller then
+        pays. A challenge that does not match the request is never signed (InvalidChallengeError).
+        """
+        request = self._http.build_request(method, url, **kwargs)
+        body = request.read()
+        path = request.url.raw_path.decode("ascii")
+        try:
+            slug = slug_of(path)
+        except InvalidChallengeError:
+            if strict:
+                raise
+            return None
+        origin = self._origin(request.url)
+        method = request.method.upper()
+        body_hash = prepaid_body_hash(body)
+        challenged = await self._http.post(
+            origin + TRIAL_CHALLENGE_PATH,
+            json={
+                "slug": slug,
+                "payer_address": self.address,
+                "method": method,
+                "path": path,
+                "body_hash": body_hash,
+            },
+        )
+        if challenged.status_code != 201:
+            if not strict:
+                return None
+            code, message = error_details(challenged)
+            raise PaymentRejectedError(challenged.status_code, code, message, challenged)
+        try:
+            challenge = TrialChallenge.model_validate(challenged.json())
+        except ValueError as exc:
+            raise InvalidChallengeError(f"trial challenge cannot be decoded: {exc}") from exc
+        validate_trial_challenge(
+            challenge,
+            domain=request.url.netloc.decode("ascii").lower(),
+            address=self.address,
+            slug=slug,
+            method=method,
+            path=path,
+            body_hash=body_hash,
+        )
+        signature = kaspa.sign_message(challenge.message, self._private_key)
+        request.headers[HEADER_TRIAL_CALL] = TrialCallHeader(
+            nonce=challenge.nonce, signature=signature
+        ).to_header()
+        response = await self._http.send(request)
+        raw_receipt = response.headers.get(HEADER_TRIAL_RECEIPT)
+        if raw_receipt is None:
+            if strict:
+                code, message = error_details(response)
+                if response.status_code == 409:
+                    raise PaymentReplayedError(409, code, message, response)
+                if response.status_code == 402 and code == "payment_expired":
+                    raise PaymentExpiredError(402, code, message, response)
+                if response.status_code in (402, 429, 503):
+                    raise PaymentRejectedError(response.status_code, code, message, response)
+                if 200 <= response.status_code < 300:
+                    raise PaymentReceiptError("trial call succeeded without a trial receipt", response)
+            return response
+        try:
+            receipt = TrialReceipt.from_header(raw_receipt)
+        except ValueError as exc:
+            raise PaymentReceiptError(f"trial receipt cannot be decoded: {exc}", response) from exc
+        if receipt.nonce != challenge.nonce:
+            raise PaymentReceiptError("trial receipt does not match the signed trial call", response)
+        response.extensions[TRIAL_RECEIPT_EXTENSION] = receipt
         return response
 
     # ------------------------------------------------------------------ internals

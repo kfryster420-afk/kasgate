@@ -16,6 +16,7 @@ import httpx
 from .catalog import DiscoverResult
 from .client import KasGateClient
 from .prepaid import PrepaidBalance, PrepaidDepositReceipt
+from .trials import TrialStatus
 
 T = TypeVar("T")
 
@@ -89,6 +90,12 @@ class KasGateSyncClient:
 
     def prepaid_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self._call(self._client.prepaid_request(method, url, **kwargs))
+
+    def trial_status(self, gateway_url: str | httpx.URL, slug: str) -> TrialStatus:
+        return self._call(self._client.trial_status(gateway_url, slug))
+
+    def trial_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+        return self._call(self._client.trial_request(method, url, **kwargs))
 
     def close(self) -> None:
         if self._closed:
