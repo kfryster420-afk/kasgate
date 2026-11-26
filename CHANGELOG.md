@@ -15,6 +15,8 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 - Explicit `settlements.delivery_outcome` (`pending` before the upstream call, then `delivered`, `failed` +
   `delivery_failure`, or `credited`). Only `failed` is credited; NULL/`pending` never. A failed outcome write is
   logged at ERROR and dead-lettered to `kasgate:deadletter:delivery-outcomes`.
+- A settlement still `pending` after the redelivery window plus grace is logged at ERROR once (ledger-worker
+  sweep; deduped by `pending_alerted_at`) and is not credited. Alert on that line in the runbook.
 - Never credited: oversized responses, any status below 500, k402 `kaspa-utxo` payments, non-P2PK payers, prepaid
   deposits.
 - The merchant policy in force at settle time is stamped on the settlement (`failed_delivery_credit_policy`), so a

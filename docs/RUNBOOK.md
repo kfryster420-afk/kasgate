@@ -511,6 +511,12 @@ Do not go to mainnet until every box is ticked.
 - [ ] Alert on gateway log lines at `ERROR`, in particular:
   - `was accepted by the node but its settlement could not be stored` followed by `unrecorded settlement pushed to kasgate:deadletter:settlements`: money moved on-chain but the database row is missing. The payload is in the Redis list; reconcile it by hand. Check the list length: `docker compose exec redis sh -c 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning LLEN kasgate:deadletter:settlements'` (should be 0).
   - `dead-letter queue unavailable` (the payload is only in the log line).
+  - `delivery outcome still pending after the redelivery window`: a settlement is still `pending` after the
+    redelivery window plus grace (the process died mid-call, or the outcome write never landed). It will not be
+    credited. Reconcile `delivery_outcome`/`delivery_failure` from `kasgate:deadletter:delivery-outcomes` or the
+    process log, then the credit sweep can take it if it is a creditable failure. Deduped by
+    `settlements.pending_alerted_at` (one ERROR per settlement). Query:
+    `SELECT tx_id, merchant_id, settled_at, pending_alerted_at FROM settlements WHERE delivery_outcome = 'pending' AND pending_alerted_at IS NOT NULL ORDER BY pending_alerted_at DESC LIMIT 50;`.
 - [ ] Track the rate of `503 rpc_unavailable` and `429 rate_limited` at the proxy.
 - [ ] **Redelivery.** KasGate settles on-chain first and calls the upstream second. If the upstream then fails (5xx or connection error), the buyer gets `502 upstream_error` **with** a `PAYMENT-RESPONSE`, the settlement stays `settled`, and **the payment is not refunded**. The buyer retries with the same `PAYMENT-SIGNATURE`: within `REDELIVERY_WINDOW_SECONDS` (600) and at most `REDELIVERY_MAX_ATTEMPTS` (3) deliveries, the gateway forwards the same request again without charging again (bound to the same payer, method and path). After the window or the limit, the answer is 409. If the last delivery failed, the merchant share is then credited to the buyer's prepaid balance at that merchant (failed-delivery auto-credit, below) unless the merchant opted out; otherwise the money is spent. The SDK re-presents automatically for idempotent methods, `max_redeliveries` times. Non-idempotent calls (POST) are not retried automatically. Query the backlog of paid-but-undelivered calls:
 
@@ -527,13 +533,14 @@ SQL
 Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows and contact the affected merchant about their upstream. Tell merchants this behaviour in your terms.
 - [ ] **Failed-delivery auto-credit.** Every settlement records `delivery_outcome` (`pending` before the upstream call, then `delivered`, `failed` with `delivery_failure`, or `credited`). When redelivery is closed and the last delivery `failed` with a creditable failure (`upstream_5xx`, `connect_error`, or `timeout` unless the merchant set `credit_timeouts=false` before the call settled; never `oversized`), the merchant share (output 0) becomes call-only prepaid credit for that buyer at that merchant, capped at `PREPAID_MAX_BALANCE_SOMPI`: inline on the last allowed attempt (`reason=attempts_exhausted`, header `X-KasGate-Credit`) or by the ledger worker after `REDELIVERY_WINDOW_SECONDS + ceil(UPSTREAM_TIMEOUT_SECONDS) + FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (`reason=window_expired`). Nothing moves on-chain and the platform fee is not reversed. The credit is never refundable: refunds take `refundable_sompi` (deposited and unspent) only. Each credit is a `prepaid_ledger_entries` row of kind `failed_delivery_credit` (unique per `tx_id` and per settlement) and a signed `prepaid.credit.failed_delivery` webhook; a capped credit also records `shortfall_sompi` and fires `prepaid.credit.failed_delivery_shortfall`. Merchants set the policy with `PUT /v1/prepaid/failed-delivery-policy {"enabled"?, "credit_timeouts"?}` (stamped on each settlement at settle time, never retroactive) and list credits with `GET /v1/prepaid/credits`. Details in [FAILED_DELIVERY_CREDITS.md](FAILED_DELIVERY_CREDITS.md). Keep `LEDGER_WORKER_ENABLED=true` on at least one replica, or only `attempts_exhausted` credits happen.
 
-  **Alert on `kasgate:deadletter:delivery-outcomes`** (Redis list, like `kasgate:deadletter:settlements`): each entry is a delivery outcome the database refused. That settlement stays `pending` and is never credited until you reconcile it (set `delivery_outcome`/`delivery_failure` from the entry, then the sweep decides). Paid calls that are failed or stuck `pending` and were **not** credited:
+  **Alert on `kasgate:deadletter:delivery-outcomes`** (Redis list, like `kasgate:deadletter:settlements`): each entry is a delivery outcome the database refused. That settlement stays `pending` and is never credited until you reconcile it (set `delivery_outcome`/`delivery_failure` from the entry, then the sweep decides). Also alert on the ERROR `delivery outcome still pending after the redelivery window` (stamped once on `pending_alerted_at`): the process died mid-call or the write never landed, so there may be no dead-letter entry. Paid calls that are failed or stuck `pending` and were **not** credited:
 
 ```bash
 cd infra
 docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
 SELECT s.tx_id, s.merchant_id, s.payment_scheme, s.delivery_outcome, s.delivery_failure,
-       s.failed_delivery_credit_policy, s.upstream_status_code, s.delivery_attempts, s.settled_at
+       s.failed_delivery_credit_policy, s.upstream_status_code, s.delivery_attempts,
+       s.settled_at, s.pending_alerted_at
 FROM settlements s
 WHERE s.status = 'settled' AND s.delivery_outcome IN ('pending', 'failed')
   AND s.settled_at < now() - interval '15 minutes'

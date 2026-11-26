@@ -1091,6 +1091,7 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
     await asyncio.to_thread(command.upgrade, config, "head")
     # Settlements from before the upgrade have no outcome and no stamped policy, so they are never credited.
     assert await _scalar(url, "SELECT count(*) FROM settlements WHERE delivery_outcome IS NULL") == 1
+    assert await _scalar(url, "SELECT count(*) FROM settlements WHERE pending_alerted_at IS NULL") == 1
     assert await _scalar(url, "SELECT count(*) FROM settlements WHERE failed_delivery_credit_policy IS NULL") == 1
     assert await _scalar(url, "SELECT bool_and(failed_delivery_credit_timeouts) FROM merchants") is True
     assert await _scalar(url, "SELECT credit_balance_sompi FROM prepaid_balances") == 0
@@ -1205,7 +1206,8 @@ async def test_0009_delivery_outcome_call_only_credit_and_shortfall_constraints(
             url,
             "SELECT count(*) FROM information_schema.columns WHERE column_name IN ('delivery_outcome', "
             "'delivery_failure', 'failed_delivery_credit_policy', 'credit_balance_sompi', "
-            "'failed_delivery_credit_timeouts') OR (table_name = 'prepaid_debits' AND column_name = 'credit_sompi') "
+            "'failed_delivery_credit_timeouts', 'pending_alerted_at') "
+            "OR (table_name = 'prepaid_debits' AND column_name = 'credit_sompi') "
             "OR (table_name = 'prepaid_ledger_entries' AND column_name = 'shortfall_sompi')",
         )
         == 0

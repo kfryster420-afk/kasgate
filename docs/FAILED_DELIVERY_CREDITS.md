@@ -25,6 +25,12 @@ Only `failed` can be credited. NULL (settled before migration 0009) and `pending
 process died during the call) are never credited. If the outcome cannot be stored, KasGate logs at ERROR and pushes
 the outcome JSON to the Redis list `kasgate:deadletter:delivery-outcomes`; the buyer still gets the upstream's answer.
 
+If a settlement is still `pending` after the redelivery window plus grace (the same wait as a `window_expired`
+credit, on the database clock, inside the lookback), the ledger worker logs ERROR once (`delivery outcome still
+pending after the redelivery window`) and sets `pending_alerted_at`. That is the alert (operators already alert on
+ERROR lines). The row is not credited; reconcile `delivery_outcome` by hand from the dead-letter list or the
+process log.
+
 ## When a call is credited
 
 A settlement is credited at most once when all of these hold:
@@ -120,8 +126,9 @@ Signed like every KasGate webhook (`X-KasGate-Signature`), with deterministic ev
 * `merchants`: `failed_delivery_credit_enabled_at` (NOT NULL, default now()), `failed_delivery_credit_disabled_at`,
   `failed_delivery_credit_timeouts` (default true).
 * `settlements`: `delivery_outcome`, `delivery_failure` (set iff failed/credited), `failed_delivery_credit_policy`
-  (`errors|errors_and_timeouts`, NULL = opted out), with CHECKs; partial index `ix_settlements_undelivered`.
-  Existing settlements keep NULL and are never credited.
+  (`errors|errors_and_timeouts`, NULL = opted out), `pending_alerted_at`, with CHECKs; partial indexes
+  `ix_settlements_undelivered` and `ix_settlements_stale_pending`. Existing settlements keep NULL and are never
+  credited.
 * `prepaid_balances`: `credited_sompi`, `credit_balance_sompi`; the identity CHECK includes `credited_sompi`.
 * `prepaid_debits.credit_sompi` (`BETWEEN 0 AND amount_sompi`).
 * `prepaid_ledger_entries`: kind `failed_delivery_credit`; `settlement_id` (FK RESTRICT, unique), `slug`,

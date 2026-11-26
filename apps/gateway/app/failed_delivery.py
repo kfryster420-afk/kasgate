@@ -45,6 +45,7 @@ from app.models import (
     CREDIT_REASON_WINDOW_EXPIRED,
     DELIVERY_CREDITED,
     DELIVERY_FAILED,
+    DELIVERY_PENDING,
     FAILURE_CONNECT_ERROR,
     FAILURE_TIMEOUT,
     FAILURE_UPSTREAM_5XX,
@@ -433,9 +434,71 @@ async def sweep_failed_deliveries(maker: async_sessionmaker[AsyncSession], *, li
         cursor = (last_settled, last_id)
 
 
+STALE_PENDING_ALERT: Final = (
+    "delivery outcome still pending after the redelivery window: settlement %s (tx %s) settled at %s; "
+    "it will not be credited. Reconcile delivery_outcome from kasgate:deadletter:delivery-outcomes or "
+    "the process log, then set delivery_outcome/delivery_failure by hand."
+)
+
+
+async def alert_stale_pending_deliveries(maker: async_sessionmaker[AsyncSession], *, limit: int) -> int:
+    """Ledger-worker pass: log ERROR once for each settlement still `pending` after the redelivery window plus
+    grace (a crash mid-call, or an outcome write that never landed). Never credits them.
+
+    Deduped by `settlements.pending_alerted_at` (FOR UPDATE SKIP LOCKED, so replicas share the work). Times use
+    the database clock and the same window, grace and lookback as the credit sweep. Returns how many were newly
+    alerted.
+    """
+    settings = get_settings()
+    closed_after = timedelta(seconds=settings.redelivery_window_seconds + settings.failed_delivery_credit_wait_seconds)
+    lookback = timedelta(seconds=settings.failed_delivery_credit_lookback_seconds)
+    alerted = 0
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while True:
+        query = (
+            select(Settlement.id, Settlement.settled_at, Settlement.tx_id)
+            .where(
+                Settlement.status == SettlementStatus.SETTLED,
+                Settlement.delivery_outcome == DELIVERY_PENDING,
+                Settlement.pending_alerted_at.is_(None),
+                Settlement.settled_at.is_not(None),
+                Settlement.settled_at >= func.now() - lookback,
+                Settlement.settled_at <= func.now() - closed_after,
+            )
+            .order_by(Settlement.settled_at, Settlement.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        if cursor is not None:
+            query = query.where(
+                tuple_(Settlement.settled_at, Settlement.id) > tuple_(literal(cursor[0]), literal(cursor[1]))
+            )
+        async with maker() as session:
+            rows = list((await session.execute(query)).all())
+            if not rows:
+                return alerted
+            ids = [row[0] for row in rows]
+            await session.execute(
+                update(Settlement)
+                .where(Settlement.id.in_(ids), Settlement.pending_alerted_at.is_(None))
+                .values(pending_alerted_at=func.now())
+            )
+            await session.commit()
+        for settlement_id, settled_at, tx_id in rows:
+            logger.error(STALE_PENDING_ALERT, settlement_id, tx_id, settled_at)
+            alerted += 1
+        if len(rows) < limit:
+            return alerted
+        last = rows[-1]
+        if last[1] is None:
+            return alerted
+        cursor = (last[1], last[0])
+
+
 async def sweep_pass(maker: async_sessionmaker[AsyncSession], limit: int) -> int:
-    """`LedgerPass` adapter so the ledger worker runs the sweep on its timer."""
-    return await sweep_failed_deliveries(maker, limit=limit)
+    """`LedgerPass` adapter so the ledger worker runs the credit sweep and the stale-pending alert on its timer."""
+    credited = await sweep_failed_deliveries(maker, limit=limit)
+    return credited + await alert_stale_pending_deliveries(maker, limit=limit)
 
 
 # ---------------------------------------------------------------- merchant routes
