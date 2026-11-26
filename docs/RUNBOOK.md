@@ -87,7 +87,8 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"                   
 | `PREPAID_REFUND_CLAIM_TTL_SECONDS` | `900` | How long a merchant's claim (`paying`) blocks the buyer's cancel without a posted payout. |
 | `RL_PREPAID_REFUND_PER_MINUTE` | `30` | Signed refund writes per client IP per minute (`POST /v1/prepaid/refunds`, `/cancel`, `/status`). |
 | `TRUSTED_PROXY_IPS` | `[]` | JSON list of IPs/CIDRs of your reverse proxies (e.g. `["10.0.0.0/8"]` for the dashboard's Next.js server). Only from these peers is `X-Forwarded-For` used for per-IP rate limits (right-most hop that is not a trusted proxy). Empty = off: behind a proxy every buyer then shares the proxy's bucket. Never list a range that untrusted clients can connect from. |
-| `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` | `60` | Failed-delivery auto-credit: wait this long after `REDELIVERY_WINDOW_SECONDS` before the ledger worker credits a paid call whose upstream never answered (31 to 3600; must exceed one upstream attempt). |
+| `UPSTREAM_TIMEOUT_SECONDS` | `30` | One upstream attempt (max 120). Also sizes the in-flight delivery lock and the failed-delivery sweep wait. |
+| `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` | `30` | Failed-delivery auto-credit: the ledger worker credits a failed call once `REDELIVERY_WINDOW_SECONDS + ceil(UPSTREAM_TIMEOUT_SECONDS) +` this have passed (1 to 3600), by the database clock. |
 | `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS` | `604800` | The failed-delivery sweep only considers settlements this recent (1 h to 90 days). |
 
 ### Web variables
@@ -524,21 +525,23 @@ SQL
 ```
 
 Rows older than the redelivery window that still show no 2xx result are payments a buyer paid for and never got. Alert when their count grows and contact the affected merchant about their upstream. Tell merchants this behaviour in your terms.
-- [ ] **Failed-delivery auto-credit.** When redelivery is closed and the last delivery failed (5xx or no response), the merchant share (output 0) becomes prepaid credit for that buyer at that merchant: inline on the last allowed attempt (`reason=attempts_exhausted`, response header `X-KasGate-Credit`) or by the ledger worker once `REDELIVERY_WINDOW_SECONDS + FAILED_DELIVERY_CREDIT_GRACE_SECONDS` have passed (`reason=window_expired`). Nothing moves on-chain and the platform fee is not reversed. Each credit is a `prepaid_ledger_entries` row of kind `failed_delivery_credit` (unique per `tx_id` and per settlement, so it can never be paid twice) and a signed `prepaid.credit.failed_delivery` webhook. k402 `kaspa-utxo` payments, non-P2PK payers and prepaid deposits are never credited. Merchants opt out with `PUT /v1/prepaid/failed-delivery-policy {"enabled": false}` (never retroactive) and list credits with `GET /v1/prepaid/credits`. Details in [FAILED_DELIVERY_CREDITS.md](FAILED_DELIVERY_CREDITS.md). Keep `LEDGER_WORKER_ENABLED=true` on at least one replica, or only `attempts_exhausted` credits happen. Paid-but-undelivered calls that were **not** credited (policy off, no proven payer key, or older than `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`):
+- [ ] **Failed-delivery auto-credit.** Every settlement records `delivery_outcome` (`pending` before the upstream call, then `delivered`, `failed` with `delivery_failure`, or `credited`). When redelivery is closed and the last delivery `failed` with a creditable failure (`upstream_5xx`, `connect_error`, or `timeout` unless the merchant set `credit_timeouts=false` before the call settled; never `oversized`), the merchant share (output 0) becomes call-only prepaid credit for that buyer at that merchant, capped at `PREPAID_MAX_BALANCE_SOMPI`: inline on the last allowed attempt (`reason=attempts_exhausted`, header `X-KasGate-Credit`) or by the ledger worker after `REDELIVERY_WINDOW_SECONDS + ceil(UPSTREAM_TIMEOUT_SECONDS) + FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (`reason=window_expired`). Nothing moves on-chain and the platform fee is not reversed. The credit is never refundable: refunds take `refundable_sompi` (deposited and unspent) only. Each credit is a `prepaid_ledger_entries` row of kind `failed_delivery_credit` (unique per `tx_id` and per settlement) and a signed `prepaid.credit.failed_delivery` webhook; a capped credit also records `shortfall_sompi` and fires `prepaid.credit.failed_delivery_shortfall`. Merchants set the policy with `PUT /v1/prepaid/failed-delivery-policy {"enabled"?, "credit_timeouts"?}` (stamped on each settlement at settle time, never retroactive) and list credits with `GET /v1/prepaid/credits`. Details in [FAILED_DELIVERY_CREDITS.md](FAILED_DELIVERY_CREDITS.md). Keep `LEDGER_WORKER_ENABLED=true` on at least one replica, or only `attempts_exhausted` credits happen.
+
+  **Alert on `kasgate:deadletter:delivery-outcomes`** (Redis list, like `kasgate:deadletter:settlements`): each entry is a delivery outcome the database refused. That settlement stays `pending` and is never credited until you reconcile it (set `delivery_outcome`/`delivery_failure` from the entry, then the sweep decides). Paid calls that are failed or stuck `pending` and were **not** credited:
 
 ```bash
 cd infra
 docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
-SELECT s.tx_id, s.merchant_id, s.payment_scheme, s.upstream_status_code, s.delivery_attempts, s.settled_at
+SELECT s.tx_id, s.merchant_id, s.payment_scheme, s.delivery_outcome, s.delivery_failure,
+       s.failed_delivery_credit_policy, s.upstream_status_code, s.delivery_attempts, s.settled_at
 FROM settlements s
-WHERE s.status = 'settled' AND (s.upstream_status_code IS NULL OR s.upstream_status_code >= 500)
+WHERE s.status = 'settled' AND s.delivery_outcome IN ('pending', 'failed')
   AND s.settled_at < now() - interval '15 minutes'
-  AND NOT EXISTS (SELECT 1 FROM prepaid_ledger_entries e WHERE e.settlement_id = s.id)
 ORDER BY s.settled_at DESC LIMIT 50;
 SQL
 ```
 
-  Credits issued in the last day: `SELECT count(*), sum(amount_sompi) FROM prepaid_ledger_entries WHERE kind = 'failed_delivery_credit' AND created_at > now() - interval '1 day';`. A sudden rise means a merchant upstream is down; contact them. Migration `0009_failed_delivery_credits` runs after `0008_prepaid_refunds`; its downgrade refuses while credits, credited balances or credit webhooks exist.
+  Credits issued in the last day: `SELECT count(*), sum(amount_sompi), sum(shortfall_sompi) FROM prepaid_ledger_entries WHERE kind = 'failed_delivery_credit' AND created_at > now() - interval '1 day';`. A sudden rise means a merchant upstream is down; contact them. Migration `0009_failed_delivery_credits` runs after `0008_prepaid_refunds` (if a test or staging DB ran an earlier 0008, downgrade to 0007 and upgrade again: 0008 was edited in place); its downgrade refuses while credits, credited balances, credit-paid debits or credit webhooks exist.
 - [ ] **Prepaid refunds and expiry (CONTRACT v2.13).** A buyer's refund request only sets credit aside; the merchant claims it (`POST /v1/prepaid/refunds/{id}/claim`), pays it on-chain from their own wallet (exactly `amount_sompi` to `payout_address`, payload `payout_payload`, no platform fee) and posts the txId, or the signed transaction, to `POST /v1/prepaid/refunds/{id}/payout`. The ledger is debited only when that payout is accepted on-chain. Watch for refunds stuck in `payout_submitted`, attempts that stay `pending`, and requests merchants leave open:
 
 ```bash

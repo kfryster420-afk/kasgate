@@ -6,26 +6,42 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 
 ### Added: failed-delivery auto-credit (CONTRACT v2.14, after v2.13 / PR #1)
 
-- When a paid call's upstream answers 5xx or not at all and redelivery is closed (the last allowed delivery failed,
-  or the redelivery window plus `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` passed), the merchant share of the payment is
-  credited to the buyer's prepaid balance at that merchant. Nothing moves on-chain; the platform fee is not reversed.
-  Inline credits come with an `X-KasGate-Credit` response header; window credits are made by the ledger worker.
-  A credited call can no longer be redelivered.
+- When a paid call's last delivery failed for good (upstream 5xx, connection error, or a timeout unless the merchant
+  excluded timeouts) and redelivery is closed (the last allowed delivery failed, or the redelivery window plus
+  `ceil(UPSTREAM_TIMEOUT_SECONDS)` plus `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` passed, by the database clock), the
+  merchant share of the payment is credited to the buyer's prepaid balance at that merchant. Nothing moves on-chain;
+  the platform fee is not reversed. Inline credits come with an `X-KasGate-Credit` response header; window credits
+  are made by the ledger worker. A credited call can no longer be redelivered.
+- Explicit `settlements.delivery_outcome` (`pending` before the upstream call, then `delivered`, `failed` +
+  `delivery_failure`, or `credited`). Only `failed` is credited; NULL/`pending` never. A failed outcome write is
+  logged at ERROR and dead-lettered to `kasgate:deadletter:delivery-outcomes`.
+- Never credited: oversized responses, any status below 500, k402 `kaspa-utxo` payments, non-P2PK payers, prepaid
+  deposits.
+- The merchant policy in force at settle time is stamped on the settlement (`failed_delivery_credit_policy`), so a
+  later opt-out or timeout toggle never drops or adds credit for calls already paid.
+- Merchant policy: `GET`/`PUT /v1/prepaid/failed-delivery-policy` `{enabled, credit_timeouts}` (on by default,
+  timeouts included).
+- Failure credit is call-only and non-refundable: tracked in `credit_balance_sompi`, spent before deposited sompi
+  (`prepaid_debits.credit_sompi`), excluded from refunds and refund holds (`refundable = balance - hold -
+  credit_balance`); a late v2.13 payout re-debits deposited sompi first.
+- Credits are clamped to `PREPAID_MAX_BALANCE_SOMPI`; the cut part is `shortfall_sompi` on the ledger row and a
+  signed `prepaid.credit.failed_delivery_shortfall` webhook.
 - Idempotent per `tx_id`: each credit is one `prepaid_ledger_entries` row of the new kind `failed_delivery_credit`
   (unique partial index on `tx_id`, unique `settlement_id`, index on `slug`).
-- Merchant opt-out: `GET`/`PUT /v1/prepaid/failed-delivery-policy` (on by default, never retroactive).
 - `GET /v1/prepaid/credits` lists credits (filters `slug`, `payer_address`, `tx_id`); `/v1/prepaid/ledger` shows them.
-- Balances report `credited_sompi`; the balance identity is now
-  `balance = deposited + credited - debited - refunded - expired`.
-- Signed webhook event `prepaid.credit.failed_delivery`, one per credit.
-- k402 `kaspa-utxo` payments, non-P2PK payers and prepaid deposits are never credited.
-- Alembic migration `0009_failed_delivery_credits` (down_revision `0008_prepaid_refunds`, guarded downgrade).
-- Settings: `FAILED_DELIVERY_CREDIT_GRACE_SECONDS`, `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
+- Balances and the refund challenge report `credited_sompi`, `credit_balance_sompi`, `refundable_sompi`; the balance
+  identity is now `balance = deposited + credited - debited - refunded - expired`.
+- The signed `POST /v1/prepaid/refunds/status` reply adds an `X-KasGate-Credit-Summary` header (the buyer's credit
+  totals and newest credits); its body is unchanged.
+- Signed webhook events `prepaid.credit.failed_delivery` and `prepaid.credit.failed_delivery_shortfall`.
 - A credit extends `expires_at` like a deposit: `max(current expires_at, now + policy at credit time)`, never
   shortens a later expiry, never retroactive.
-- A credit may exceed `PREPAID_MAX_BALANCE_SOMPI` (restitution of an already-paid call); a deposit still may not.
-- Out of scope: no per-endpoint opt-out, no public credit lookup. Buyer-facing credit status will follow #1's
-  buyer-signed status endpoint; SDK/MCP parsing of `X-KasGate-Credit` is a follow-up.
+- Alembic migration `0009_failed_delivery_credits` (down_revision `0008_prepaid_refunds`; its amount CHECK keeps
+  0008's 0-sompi refund rows; guarded downgrade).
+- Settings: `UPSTREAM_TIMEOUT_SECONDS` (was a constant), `FAILED_DELIVERY_CREDIT_GRACE_SECONDS` (now 30 s on top of
+  the upstream timeout), `FAILED_DELIVERY_CREDIT_LOOKBACK_SECONDS`.
+- Out of scope: no per-endpoint policy override, no public credit lookup. SDK/MCP parsing of `X-KasGate-Credit` and
+  `X-KasGate-Credit-Summary` is a follow-up.
 - Docs: [docs/CONTRACTS.md](docs/CONTRACTS.md) v2.14, [docs/FAILED_DELIVERY_CREDITS.md](docs/FAILED_DELIVERY_CREDITS.md),
   runbook.
 
