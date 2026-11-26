@@ -10,7 +10,13 @@ const TRUSTED_PROXY_HOPS = parseTrustedProxyHops(process.env.TRUSTED_PROXY_HOPS)
 
 export type GatewayResult<T> =
   | { ok: true; status: number; data: T }
-  | { ok: false; status: number; message: string; code?: string };
+  | { ok: false; status: number; message: string; code?: string; retryAfter?: number };
+
+/** Whole seconds from a `Retry-After` header (the gateway sends seconds on 429/503), or undefined. */
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value || !/^\d{1,5}$/.test(value.trim())) return undefined;
+  return Number(value.trim());
+}
 
 interface GatewayRequest {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -118,7 +124,13 @@ export async function gatewayRequest<T>(path: string, req: GatewayRequest = {}):
   }
   const text = await response.text();
   if (!response.ok) {
-    return { ok: false, status: response.status, message: extractErrorMessage(text, response.status), code: extractErrorCode(text) };
+    return {
+      ok: false,
+      status: response.status,
+      message: extractErrorMessage(text, response.status),
+      code: extractErrorCode(text),
+      retryAfter: parseRetryAfter(response.headers.get("retry-after")),
+    };
   }
   if (response.status === 204 || text === "") return { ok: true, status: response.status, data: undefined as T };
   try {

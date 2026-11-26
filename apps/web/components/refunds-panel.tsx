@@ -8,7 +8,7 @@ import { formatDateTime, shortAddress, shortHash } from "@/lib/format";
 import { CREDIT_REASON_LABEL, LEDGER_KIND_LABEL, LEDGER_KIND_TONE } from "@/lib/credit-labels";
 import { refundErrorMessage } from "@/lib/refund-errors";
 import { formatKas } from "@/lib/sompi";
-import { claimExpiresAt, forgetPayout, recordedPayout, rememberPayout, sendRefundPayout, UNKNOWN_TXID, type RecordedPayout } from "@/lib/refund-payout";
+import { claimExpiresAt, claimLeavesTime, forgetPayout, minutesLeft, recordedPayout, rememberPayout, sendRefundPayout, UNKNOWN_TXID, type RecordedPayout } from "@/lib/refund-payout";
 import {
   PREPAID_REFUND_REASON_MAX_LENGTH,
   type MerchantRead,
@@ -58,6 +58,19 @@ function needsSignedTransaction(attempt: PrepaidRefundPayoutRead): boolean {
   return attempt.status === "pending" && !attempt.payload_verified && (attempt.last_error ?? "").startsWith("payload_unverified");
 }
 
+const ATTEMPT_METHOD_LABEL: Record<PrepaidRefundPayoutRead["method"], string> = {
+  tx_id: "txid",
+  transaction: "signed transaction",
+  scan: "found on-chain (scan)",
+};
+
+/** The cooldown of a cancelled refund the merchant had claimed: the amount stays held until `hold_until`. */
+export function holdUntilMs(refund: PrepaidRefundRead): number | null {
+  if (refund.status !== "cancelled" || !refund.hold_until) return null;
+  const at = Date.parse(refund.hold_until);
+  return Number.isNaN(at) ? null : at;
+}
+
 type RowMode = null | "reject" | "txid" | "transaction";
 
 function AttemptsTable({ attempts }: { attempts: PrepaidRefundPayoutRead[] }) {
@@ -80,7 +93,9 @@ function AttemptsTable({ attempts }: { attempts: PrepaidRefundPayoutRead[] }) {
           <tr key={attempt.id} className="align-top text-xs" data-attempt-status={attempt.status}>
             <td className="py-1 pr-3 font-mono whitespace-nowrap">{formatDateTime(attempt.created_at)}</td>
             <td className="py-1 pr-3">{txLink(attempt.tx_id)}</td>
-            <td className="py-1 pr-3 text-zinc-400">{attempt.method === "transaction" ? "signed transaction" : "txid"}</td>
+            <td className="py-1 pr-3 text-zinc-400" data-attempt-method={attempt.method}>
+              {ATTEMPT_METHOD_LABEL[attempt.method]}
+            </td>
             <td className="py-1 pr-3">
               <AttemptStatusBadge status={attempt.status} />
             </td>
@@ -105,6 +120,8 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
   const [recorded, setRecorded] = useState<RecordedPayout | null>(null);
   const [attempts, setAttempts] = useState<PrepaidRefundPayoutRead[] | null>(null);
   const [showAttempts, setShowAttempts] = useState(false);
+  /** Set when a claim came back too short to broadcast safely, or renewing it was refused (claim window used up). */
+  const [claimBlocked, setClaimBlocked] = useState<string | null>(null);
   const open = OPEN_STATUSES.includes(refund.status);
   const lateEligible = refund.status === "cancelled" || refund.status === "rejected";
 
@@ -145,11 +162,15 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
   const unverified = pending.find(needsSignedTransaction) ?? null;
   const claimEnds = claimExpiresAt(refund);
   const claimLive = claimEnds !== null && claimEnds > now;
+  const claimShort = claimLive && !claimLeavesTime(claimEnds, now);
+  const holdEnds = holdUntilMs(refund);
   const recordedTx = recorded && recorded.txId !== UNKNOWN_TXID ? recorded.txId : null;
   const recordedAttempt = recordedTx ? (attempts ?? []).find((attempt) => attempt.tx_id === recordedTx) ?? null : null;
   /** The browser's own broadcast was proven not to pay this refund (invalid) or was abandoned after a revert. */
   const recordedFailed = recordedAttempt !== null && (recordedAttempt.status === "invalid" || recordedAttempt.status === "abandoned");
   const canPay = (refund.status === "requested" || refund.status === "paying") && !hasPending && attempts !== null && (!recorded || recordedFailed);
+  /** Transaction mode: KasGate records the merchant-signed transaction, then broadcasts it; no claim needed. */
+  const canPayWithTransaction = (refund.status === "requested" || refund.status === "paying") && !unverified && attempts !== null && (!recorded || recordedFailed);
   const canReject = (refund.status === "requested" || refund.status === "paying") && !hasPending && attempts !== null && !recorded;
   const rejectBlockedReason = hasPending ? "A payout attempt is still pending, so this refund can't be rejected." : recorded ? "A payout was already sent from this browser." : null;
 
@@ -207,6 +228,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
     setBusy("pay");
     setError(null);
     setNotice(null);
+    let claimRefused = false;
     const outcome = await sendRefundPayout(
       refund,
       merchant.kaspa_address,
@@ -214,11 +236,18 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
       () => apiFetch<PrepaidRefundRead>(`/api/prepaid/refunds/${refund.id}/claim`, { method: "POST" }),
       (e) => {
         if (e instanceof ApiError && e.status === 401) onUnauthorized();
+        claimRefused = e instanceof ApiError && e.code === "refund_not_claimable";
         return refundErrorMessage(e);
       },
     );
     if (outcome.refund) onUpdated(outcome.refund);
+    if (outcome.kind === "claim_too_short") {
+      setClaimBlocked(outcome.message);
+      setBusy(null);
+      return;
+    }
     if (outcome.kind === "error") {
+      if (claimRefused) setClaimBlocked(outcome.message);
       setError(outcome.message);
       setBusy(null);
       return;
@@ -275,24 +304,25 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
 
   function signedTx(event: FormEvent) {
     event.preventDefault();
-    const text = rawInput.trim() || recorded?.transaction || "";
+    const text = rawInput.trim() || storedTransaction || "";
     if (text.length < 2 || text.length > MAX_TRANSACTION_CHARS || !text.startsWith("{")) {
-      setError("Paste the signed transaction JSON KasWare returned for this payout (it starts with “{”).");
+      setError("Paste the signed transaction JSON for this payout (it starts with “{”).");
       return;
     }
     try {
       JSON.parse(text);
     } catch {
-      setError("That is not valid JSON. Paste the signed transaction exactly as KasWare returned it.");
+      setError("That is not valid JSON. Paste the signed transaction exactly as your wallet or SDK produced it.");
       return;
     }
     void submit({ transaction: text }, "transaction");
   }
 
   const storedTransaction = unverified && recorded?.transaction && recorded.txId === unverified.tx_id ? recorded.transaction : null;
+  const payDisabledReason = claimBlocked ? "The claim can't be renewed far enough ahead. Post a signed transaction instead, or reject." : undefined;
   /** Back to `requested` after a payout attempt (prepaid.refund.payout_reverted): an earlier attempt didn't complete. */
   const reverted = refund.status === "requested" && (attempts ?? []).length > 0;
-  const showDetail = mode !== null || error || notice || (recordedTx && (open || lateEligible)) || showAttempts || unverified || hasPending;
+  const showDetail = mode !== null || error || notice || (recordedTx && (open || lateEligible)) || showAttempts || unverified || hasPending || (claimBlocked && canPay);
 
   return (
     <>
@@ -310,8 +340,17 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
           {claimEnds !== null ? (
             <p className={`mt-1 max-w-[280px] text-[11px] ${claimLive ? "text-violet-300" : "text-amber-300"}`} data-claim>
               {claimLive
-                ? `Claimed until ${clockTime(claimEnds)} UTC. Paying again renews the claim.`
+                ? claimShort
+                  ? `Claim: ${minutesLeft(claimEnds, now)} min left (until ${clockTime(claimEnds)} UTC). Too little to broadcast safely: paying renews the claim first, if renewals aren't used up (they stop 1 hour after the first claim).`
+                  : `Claim: ${minutesLeft(claimEnds, now)} min left (until ${clockTime(claimEnds)} UTC). The buyer can't cancel meanwhile.`
                 : `Claim lapsed at ${clockTime(claimEnds)} UTC: the buyer may cancel. Paying re-claims it first.`}
+            </p>
+          ) : null}
+          {holdEnds !== null ? (
+            <p className={`mt-1 max-w-[280px] text-[11px] ${holdEnds > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
+              {holdEnds > now
+                ? `Cooldown: the amount stays held until ${formatDateTime(refund.hold_until ?? "")} because you had claimed it. A payout that lands before then is still recorded and debited in full.`
+                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released.`}
             </p>
           ) : null}
           {reverted ? (
@@ -327,7 +366,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
         <td className="td">
           <div className="flex flex-wrap justify-end gap-2">
             {canPay ? (
-              <button type="button" className="btn-primary px-3 py-1.5 text-xs" onClick={() => void pay()} disabled={busy !== null}>
+              <button type="button" className="btn-primary px-3 py-1.5 text-xs" onClick={() => void pay()} disabled={busy !== null || claimBlocked !== null} title={payDisabledReason} data-pay-kasware>
                 {busy === "pay" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Wallet className="h-3.5 w-3.5" aria-hidden />}
                 {refund.status === "paying" ? "Pay with KasWare" : "Approve & pay with KasWare"}
               </button>
@@ -338,10 +377,16 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
                 Submit sent payout
               </button>
             ) : null}
-            {unverified ? (
-              <button type="button" className="btn-primary px-3 py-1.5 text-xs" onClick={() => setMode(mode === "transaction" ? null : "transaction")} disabled={busy !== null}>
+            {unverified || canPayWithTransaction ? (
+              <button
+                type="button"
+                className={`${unverified || claimBlocked ? "btn-primary" : "btn-secondary"} px-3 py-1.5 text-xs`}
+                onClick={() => setMode(mode === "transaction" ? null : "transaction")}
+                disabled={busy !== null}
+                data-transaction-mode
+              >
                 <FileSignature className="h-3.5 w-3.5" aria-hidden />
-                Post signed transaction
+                {unverified ? "Post signed transaction" : "Pay with signed transaction"}
               </button>
             ) : null}
             {refund.status === "payout_submitted" && refund.tx_id ? (
@@ -401,12 +446,19 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
                   signed transaction to prove it.
                 </p>
               ) : null}
-              {mode === "transaction" && unverified ? (
-                <form onSubmit={signedTx} className="space-y-2">
+              {claimBlocked && canPay ? (
+                <p className="text-xs font-medium text-amber-300" data-claim-blocked>
+                  {claimBlocked}
+                </p>
+              ) : null}
+              {mode === "transaction" && (unverified || canPayWithTransaction) ? (
+                <form onSubmit={signedTx} className="space-y-2" data-transaction-form>
                   <label htmlFor={`raw-${refund.id}`} className="block text-xs text-zinc-400">
-                    {storedTransaction
-                      ? `KasWare's signed transaction for ${shortHash(unverified.tx_id)} is saved in this browser and will be posted. Paste a different one only if you paid from elsewhere.`
-                      : `Paste the signed transaction JSON for ${shortHash(unverified.tx_id)} (KasWare's sendKaspa result). It holds no keys.`}
+                    {unverified
+                      ? storedTransaction
+                        ? `KasWare's signed transaction for ${shortHash(unverified.tx_id)} is saved in this browser and will be posted. Paste a different one only if you paid from elsewhere.`
+                        : `Paste the signed transaction JSON for ${shortHash(unverified.tx_id)} (KasWare's sendKaspa result). It holds no keys.`
+                      : `Paste a signed, not yet broadcast Kaspa transaction (kaspa SDK Transaction JSON) paying exactly ${refund.amount_sompi} sompi to ${refund.payout_address} with payload ${refund.payout_payload} (hex ${refund.payout_payload_hex}). KasGate records it first and then broadcasts it, so no claim is needed and the buyer can't cancel once it is recorded. KasWare's one-click Pay broadcasts as it signs; to use this mode, build and sign the transaction in a wallet or SDK that can export it. It holds no keys.`}
                   </label>
                   <textarea
                     id={`raw-${refund.id}`}
@@ -417,7 +469,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
                     placeholder={storedTransaction ? "Saved transaction will be used" : '{"id": "…", "inputs": […], "outputs": […], "payload": "…"}'}
                     spellCheck={false}
                   />
-                  <button type="submit" className="btn-secondary px-3 py-1.5 text-xs" disabled={busy !== null || (!storedTransaction && rawInput.trim() === "")}>
+                  <button type="submit" className="btn-secondary px-3 py-1.5 text-xs" disabled={busy !== null || (!storedTransaction && rawInput.trim() === "")} data-transaction-submit>
                     {busy === "transaction" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <FileSignature className="h-3.5 w-3.5" aria-hidden />}
                     Submit signed transaction
                   </button>

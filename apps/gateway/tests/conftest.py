@@ -55,6 +55,7 @@ from app.kaspa_engine import PaymentVerificationError, VerifiedPayment  # noqa: 
 from app.main import create_app  # noqa: E402
 from app.models import Endpoint, Merchant, PriceCurrency  # noqa: E402
 from app.oracle import OracleUnavailableError  # noqa: E402
+from app.payments import PayoutSighting  # noqa: E402
 from app.schemas import (  # noqa: E402
     HEADER_PAYMENT_REQUIRED,
     HEADER_PAYMENT_SIGNATURE,
@@ -188,6 +189,10 @@ class StubEngine:
         self.payout_error: Exception | None = None
         self.payout_tx_id_value = "e" * 64
         self.payout_accepted = True
+        # What find_refund_payouts reports (the cancel-time node check), the calls it got, and an error to raise.
+        self.payout_sightings: list[PayoutSighting] = []
+        self.payout_scans: list[tuple[str, int, uuid.UUID]] = []
+        self.payout_scan_error: Exception | None = None
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
         return VerifiedPayment(
@@ -292,6 +297,15 @@ class StubEngine:
 
     def payout_tx_id(self, transaction: str, payload: bytes, to_address: str, amount_sompi: int) -> str:
         return self.payout_tx_id_value
+
+    async def find_refund_payouts(
+        self, to_address: str, amount_sompi: int, refund_id: uuid.UUID
+    ) -> list[PayoutSighting]:
+        self.payout_scans.append((to_address, amount_sompi, refund_id))
+        self.events.append("find_refund_payouts")
+        if self.payout_scan_error is not None:
+            raise self.payout_scan_error
+        return list(self.payout_sightings)
 
     async def submit_payout(
         self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
