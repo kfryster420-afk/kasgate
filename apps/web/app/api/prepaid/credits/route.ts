@@ -1,14 +1,15 @@
 import type { NextRequest } from "next/server";
 import type { NextResponse } from "next/server";
 import { gatewayRequest } from "@/lib/server/gateway";
+import { settlementUsd } from "@/lib/server/settlement-usd";
 import { pageParams } from "@/lib/server/prepaid-input";
 import { fromGatewayFailure, isAuth, jsonError, jsonOk, requireSession } from "@/lib/server/route";
 import { checkKaspaAddress, checkSlug, checkTxId } from "@/lib/validation";
-import type { PrepaidCreditRead } from "@/lib/types";
+import type { PrepaidCreditRead, PrepaidCreditWithUsd } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-/** Merchant [session]: failed-delivery credits (CONTRACT v2.14), newest first; filters slug, payer_address, tx_id. */
+/** Merchant [session]: failed-delivery credits (CONTRACT v2.14), newest first; filters slug, payer_address, tx_id. Each row gains `usd`: the KAS/USD rate its call settled at. */
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const auth = await requireSession(request);
   if (!isAuth(auth)) return auth;
@@ -35,5 +36,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     query.tx_id = checked.value;
   }
   const result = await gatewayRequest<PrepaidCreditRead[]>("/v1/prepaid/credits", { bearer: auth.token, query });
-  return result.ok ? jsonOk(result.data) : fromGatewayFailure(result);
+  if (!result.ok) return fromGatewayFailure(result);
+  const usd = await settlementUsd(auth.token, new Set(result.data.map((row) => row.settlement_id)));
+  const rows: PrepaidCreditWithUsd[] = result.data.map((row) => ({ ...row, usd: usd.get(row.settlement_id) ?? null }));
+  return jsonOk(rows);
 }

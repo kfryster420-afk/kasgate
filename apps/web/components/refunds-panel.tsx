@@ -4,7 +4,8 @@ import { Ban, ChevronLeft, ChevronRight, FileSignature, Hash, ListTree, Loader2,
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { IS_TESTNET, TESTNET_EXPLORER_URL } from "@/lib/config";
-import { formatDateTime, shortAddress, shortHash } from "@/lib/format";
+import { formatDateTime, formatUsd, shortAddress, shortHash } from "@/lib/format";
+import { usdForSompi } from "@/lib/usd-at-settlement";
 import { CREDIT_REASON_LABEL, LEDGER_KIND_LABEL, LEDGER_KIND_TONE } from "@/lib/credit-labels";
 import { refundErrorMessage } from "@/lib/refund-errors";
 import { formatKas } from "@/lib/sompi";
@@ -12,7 +13,7 @@ import { claimExpiresAt, claimLeavesTime, forgetPayout, minutesLeft, recordedPay
 import {
   PREPAID_REFUND_REASON_MAX_LENGTH,
   type MerchantRead,
-  type PrepaidLedgerEntryRead,
+  type PrepaidLedgerEntryWithUsd,
   type PrepaidRefundPayoutRead,
   type PrepaidRefundRead,
   type PrepaidRefundStatus,
@@ -350,7 +351,7 @@ function RefundRow({ refund, merchant, now, onUpdated, onUnauthorized }: { refun
             <p className={`mt-1 max-w-[280px] text-[11px] ${holdEnds > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
               {holdEnds > now
                 ? `Cooldown: the amount stays held until ${formatDateTime(refund.hold_until ?? "")} because you had claimed it. A payout that lands before then is still recorded and debited in full.`
-                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released.`}
+                : `Cooldown ended ${formatDateTime(refund.hold_until ?? "")}: the hold is released once no payout attempt for this refund is still pending.`}
             </p>
           ) : null}
           {reverted ? (
@@ -522,7 +523,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
   const [tab, setTab] = useState<Tab>("open");
   const [page, setPage] = useState(0);
   const [refunds, setRefunds] = useState<PrepaidRefundRead[]>([]);
-  const [ledger, setLedger] = useState<PrepaidLedgerEntryRead[]>([]);
+  const [ledger, setLedger] = useState<PrepaidLedgerEntryWithUsd[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [localReload, setLocalReload] = useState(0);
@@ -542,7 +543,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
     const offset = page * PAGE_SIZE;
     const load = async () => {
       if (tab === "ledger") {
-        const rows = await apiFetch<PrepaidLedgerEntryRead[]>(`/api/prepaid/ledger?limit=${PAGE_SIZE}&offset=${offset}`);
+        const rows = await apiFetch<PrepaidLedgerEntryWithUsd[]>(`/api/prepaid/ledger?limit=${PAGE_SIZE}&offset=${offset}`);
         if (!cancelled) setLedger(rows);
         return;
       }
@@ -640,6 +641,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                 <th className="th">Kind</th>
                 <th className="th text-right">Amount</th>
                 <th className="th text-right">Balance after</th>
+                <th className="th text-right">USD at settlement</th>
                 <th className="th">Tx / note</th>
               </tr>
             </thead>
@@ -669,6 +671,9 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                   </td>
                   <td className="td">
                     <KasAmount sompi={entry.balance_after_sompi} />
+                  </td>
+                  <td className="td text-right" data-ledger-usd>
+                    <LedgerUsd entry={entry} />
                   </td>
                   <td className="td">
                     {entry.tx_id ? txLink(entry.tx_id) : null}
@@ -711,5 +716,29 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
       </div>
       <CreditExpirySettings merchant={merchant} onSaved={onMerchantChange} onUnauthorized={onUnauthorized} />
     </section>
+  );
+}
+
+/** USD at settlement for a ledger row: failed-call credits use the credited call's settlement rate; refunds and expiries have none. */
+function LedgerUsd({ entry }: { entry: PrepaidLedgerEntryWithUsd }) {
+  if (entry.kind !== "failed_delivery_credit") {
+    return (
+      <span className="text-xs text-zinc-500" title="The gateway records no KAS/USD rate for refund payouts and expiries (PrepaidLedgerEntryRead has no USD fields); the deposits these credits came from carry their USD value in Settlements.">
+        not recorded
+      </span>
+    );
+  }
+  const usd = entry.usd ? usdForSompi(entry.amount_sompi, entry.usd.kas_usd_rate) : null;
+  if (usd === null) {
+    return (
+      <span className="text-xs text-zinc-500" title="The credited call's settlement has no KAS/USD rate, or it is older than the newest 1,000 settlements this view looks through.">
+        no rate
+      </span>
+    );
+  }
+  return (
+    <span className="font-mono text-xs text-zinc-200" title={`At the credited call's settlement rate of $${entry.usd?.kas_usd_rate ?? ""} per KAS`}>
+      {formatUsd(usd)}
+    </span>
   );
 }

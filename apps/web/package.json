@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --test lib/server/client-ip.test.mjs"
+    "test:unit": "node --test lib/server/client-ip.test.mjs lib/balance-read.test.mjs lib/credit-status.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

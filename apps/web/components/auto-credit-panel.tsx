@@ -5,8 +5,9 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { IS_TESTNET, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { CREDIT_REASON_LABEL, DELIVERY_FAILURE_LABEL } from "@/lib/credit-labels";
-import { formatDateTime, shortAddress, shortHash } from "@/lib/format";
-import type { FailedDeliveryPolicyRead, FailedDeliveryPolicyUpdate, PrepaidCreditRead } from "@/lib/types";
+import { formatDateTime, formatUsd, shortAddress, shortHash } from "@/lib/format";
+import type { FailedDeliveryPolicyRead, FailedDeliveryPolicyUpdate, PrepaidCreditWithUsd } from "@/lib/types";
+import { usdForSompi } from "@/lib/usd-at-settlement";
 import { checkSlug } from "@/lib/validation";
 import { KasAmount } from "./kas-amount";
 import { ErrorBanner, Spinner, Toggle } from "./ui";
@@ -94,7 +95,7 @@ function FailedDeliveryPolicy({ onUnauthorized }: { onUnauthorized: () => void }
  * call-only prepaid credit for that buyer. The policy switch, and the credits ledger (GET /v1/prepaid/credits).
  */
 export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: number; onUnauthorized: () => void }) {
-  const [credits, setCredits] = useState<PrepaidCreditRead[]>([]);
+  const [credits, setCredits] = useState<PrepaidCreditWithUsd[]>([]);
   const [page, setPage] = useState(0);
   const [slugInput, setSlugInput] = useState("");
   const [slug, setSlug] = useState("");
@@ -105,7 +106,7 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
   const load = useCallback(async () => {
     const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE) });
     if (slug) query.set("slug", slug);
-    return apiFetch<PrepaidCreditRead[]>(`/api/prepaid/credits?${query.toString()}`);
+    return apiFetch<PrepaidCreditWithUsd[]>(`/api/prepaid/credits?${query.toString()}`);
   }, [page, slug]);
 
   useEffect(() => {
@@ -181,7 +182,7 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
       </div>
       <ErrorBanner message={error} />
       <div className="card overflow-x-auto">
-        <table className="w-full min-w-[1180px]">
+        <table className="w-full min-w-[1300px]">
           <thead>
             <tr className="border-b border-zinc-800">
               <th className="th">Credited (UTC)</th>
@@ -191,6 +192,7 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
               <th className="th text-right">Paid on-chain</th>
               <th className="th text-right">Platform fee (kept)</th>
               <th className="th text-right">Credited (call-only)</th>
+              <th className="th text-right" title="Credited KAS at the KAS/USD rate the call settled at">USD at settlement</th>
               <th className="th text-right">Not credited (cap)</th>
               <th className="th text-right">Balance after</th>
             </tr>
@@ -226,6 +228,9 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
                 <td className="td">
                   <KasAmount sompi={credit.credit_sompi} tone="text-violet-300" />
                 </td>
+                <td className="td text-right" data-credit-usd>
+                  <CreditUsdCell credit={credit} />
+                </td>
                 <td className="td">
                   <KasAmount sompi={credit.shortfall_sompi} tone={credit.shortfall_sompi === "0" ? "text-zinc-600" : "text-amber-300"} />
                 </td>
@@ -246,5 +251,23 @@ export function AutoCreditPanel({ reloadKey, onUnauthorized }: { reloadKey: numb
       <p className="text-[11px] text-zinc-600">Amounts in KAS and sompi. KasGate records no USD value for these credits.</p>
       <FailedDeliveryPolicy onUnauthorized={onUnauthorized} />
     </section>
+  );
+}
+
+/** Credited KAS at the KAS/USD rate the credited call settled at (from its settlement), or why there is none. */
+function CreditUsdCell({ credit }: { credit: PrepaidCreditWithUsd }) {
+  const usd = credit.usd ? usdForSompi(credit.credit_sompi, credit.usd.kas_usd_rate) : null;
+  if (usd === null) {
+    return (
+      <span className="text-xs text-zinc-500" title="The call's settlement has no KAS/USD rate, or it is older than the newest 1,000 settlements this view looks through.">
+        no rate
+      </span>
+    );
+  }
+  return (
+    <div className="font-mono text-xs text-zinc-200" title={`Rate $${credit.usd?.kas_usd_rate ?? ""} per KAS at settlement`}>
+      {formatUsd(usd)}
+      {credit.usd?.call_usd ? <div className="text-[11px] text-zinc-500">call {formatUsd(credit.usd.call_usd)}</div> : null}
+    </div>
   );
 }

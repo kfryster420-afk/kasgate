@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import type { NextResponse } from "next/server";
 import { gatewayRequest } from "@/lib/server/gateway";
 import { fromGatewayFailure, isAuth, jsonError, jsonOk, requireSession } from "@/lib/server/route";
-import type { PrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
+import type { MerchantPrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest, context: Context): Promise<NextR
   const limit = intParam(params.get("limit"), 50, 1, 200);
   const offset = intParam(params.get("offset"), 0, 0, 1_000_000);
   if (limit === null || offset === null) return jsonError("limit must be 1–200 and offset a non-negative integer", 422);
-  const result = await gatewayRequest<PrepaidBalanceRead[] | PrepaidDepositRead[] | PrepaidDebitRead[]>(`/v1/prepaid/${kind}`, {
+  const result = await gatewayRequest<MerchantPrepaidBalanceRead[] | PrepaidDepositRead[] | PrepaidDebitRead[]>(`/v1/prepaid/${kind}`, {
     bearer: auth.token,
     query: { limit, offset },
   });

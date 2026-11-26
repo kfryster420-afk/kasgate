@@ -1,18 +1,31 @@
 "use client";
 
-import { Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
+import { ChevronDown, Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch } from "@/lib/api-client";
 import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { formatDateTime, shortHash } from "@/lib/format";
 import { getKasware, isSignatureToken, isWalletRejection, kaswareNetworkRefusal, walletErrorText } from "@/lib/kasware";
+import { balanceReadMessage, normaliseBalanceSignature } from "@/lib/balance-read";
 import { checkRefundChallenge } from "@/lib/refund-challenge";
 import { CREDIT_REASON_LABEL } from "@/lib/credit-labels";
+import { checkCreditChallenge } from "@/lib/credit-challenge";
+import { CREDIT_STATUS_PAGE, parseBuyerCreditStatus } from "@/lib/credit-status";
 import { refundErrorMessage, txIdsInMessage } from "@/lib/refund-errors";
 import { claimExpiresAt } from "@/lib/refund-payout";
 import { formatKas, parseKasToSompi } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
-import type { BuyerCreditSummary, PrepaidBalanceRead, PrepaidRefundChallenge, SignedRefundStatus, PrepaidRefundChallengeRequest, PrepaidRefundRead, PrepaidRefundSigned } from "@/lib/types";
+import type {
+  BuyerCreditStatus,
+  BuyerCreditStatusItem,
+  PrepaidBalanceRead,
+  PrepaidCreditStatusChallenge,
+  PrepaidCreditStatusRequest,
+  PrepaidRefundChallenge,
+  PrepaidRefundChallengeRequest,
+  PrepaidRefundRead,
+  PrepaidRefundSigned,
+} from "@/lib/types";
 import { checkKaspaAddress, checkSlug } from "@/lib/validation";
 import { KasAmount } from "./kas-amount";
 import { LatePayoutNote, REFUND_STATUS_HELP, RefundStatusBadge } from "./refund-status";
@@ -24,8 +37,39 @@ function isP2pkAddress(address: string): boolean {
 }
 
 /** `signed`: the rows came from a signed status read, so they carry the merchant's reasons and payout errors. */
-type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; refunds: PrepaidRefundRead[]; signed: boolean; credits: BuyerCreditSummary | null };
-type Busy = null | "connect" | "lookup" | "request" | "status" | `cancel:${string}`;
+/** `balanceSigned`: the balance came from a buyer-signed read, so its ledger totals (held, deposited, …) are present. */
+/** `credits`: pages read with signed `credits` challenges (CONTRACT v2.14); totals from the newest page read. */
+type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[]; signed: boolean; credits: CreditView | null };
+type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | "credits" | "credits-more" | `cancel:${string}`;
+
+/** Signed POST /v1/prepaid/credits/status pages: totals of the last page read, the rows loaded so far, the next cursor. */
+type CreditView = { totals: BuyerCreditStatus; items: BuyerCreditStatusItem[]; nextCursor: string | null };
+
+type SignedBalance = PrepaidBalanceRead & { deposited_sompi: string; debited_sompi: string; refunded_sompi: string; expired_sompi: string; refund_hold_sompi: string };
+
+const SOMPI_RE = /^(0|[1-9][0-9]{0,17})$/;
+
+/** True when every ledger total is present and a strict decimal sompi string (the signed read). */
+/** A strict decimal sompi string as a bigint, else null. */
+function sompiOrNull(value: string | null | undefined): bigint | null {
+  return typeof value === "string" && SOMPI_RE.test(value) ? BigInt(value) : null;
+}
+
+/**
+ * What a refund may take: the signed credits/status `refundable_sompi` when read, else the balance's v2.14
+ * `refundable_sompi` when the read carried it, else spendable. The gateway enforces the real limit either way.
+ */
+function refundLimit(lookup: Lookup): { refundable: bigint; callOnly: bigint } {
+  if (lookup.credits) return { refundable: BigInt(lookup.credits.totals.refundable_sompi), callOnly: BigInt(lookup.credits.totals.credit_balance_sompi) };
+  return {
+    refundable: sompiOrNull(lookup.balance.refundable_sompi) ?? BigInt(lookup.balance.spendable_sompi),
+    callOnly: sompiOrNull(lookup.balance.credit_balance_sompi) ?? 0n,
+  };
+}
+
+function hasLedgerTotals(balance: PrepaidBalanceRead): balance is SignedBalance {
+  return [balance.deposited_sompi, balance.debited_sompi, balance.refunded_sompi, balance.expired_sompi, balance.refund_hold_sompi].every((v) => typeof v === "string" && SOMPI_RE.test(v));
+}
 
 export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   const pricing = usePricing();
@@ -59,7 +103,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
       apiFetch<PrepaidBalanceRead>(`/api/prepaid/balance?${query}`),
       apiFetch<PrepaidRefundRead[]>(`/api/prepaid/refunds/status?${query}&limit=50`),
     ]);
-    const next = { slug: slugValue, address: addressValue, balance, refunds, signed: false, credits: null };
+    const next: Lookup = { slug: slugValue, address: addressValue, balance, balanceSigned: false, refunds, signed: false, credits: null };
     setLookup(next);
     return next;
   }, []);
@@ -152,7 +196,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     event.preventDefault();
     setNotice(null);
     if (!lookup) return;
-    const refundable = BigInt(lookup.balance.refundable_sompi);
+    const { refundable, callOnly } = refundLimit(lookup);
     let amountSompi: string | undefined;
     if (amount.trim() !== "") {
       const parsed = parseKasToSompi(amount);
@@ -162,7 +206,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
       }
       if (parsed > refundable) {
         setAmountError(
-          BigInt(lookup.balance.credit_balance_sompi) > 0n
+          callOnly > 0n
             ? `You can get back at most ${formatKas(refundable)} KAS. Credit from failed calls only pays for calls and is never refunded.`
             : `You can get back at most ${formatKas(refundable)} KAS (your refundable credit)`,
         );
@@ -226,16 +270,111 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   }
 
   /** Signed `status` read: the same rows with the merchant's reject reasons and payout errors (the public view hides them). */
+  /** CONTRACT v2.12.1 signed balance read: KasWare signs the timestamped balance-read text; no challenge round trip. */
+  async function signBalance() {
+    if (!lookup) return;
+    setNotice(null);
+    setBusy("balance");
+    setError(null);
+    try {
+      const wallet = getKasware();
+      if (!wallet) throw new Error("KasWare was not detected in this browser. The full balance is shown only to the depositing key.");
+      if (!EXPECTED_AUTH_DOMAIN) throw new Error("This app has no gateway URL configured, so it can't build the balance message.");
+      const accounts = await wallet.requestAccounts();
+      if (accounts[0]?.trim().toLowerCase() !== lookup.address) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
+      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+      if (wrongNetwork) throw new Error(wrongNetwork);
+      const timestamp = Math.floor(Date.now() / 1000);
+      const message = balanceReadMessage({ domain: EXPECTED_AUTH_DOMAIN, address: lookup.address, slug: lookup.slug, timestamp });
+      let raw: string;
+      try {
+        raw = await wallet.signMessage(message, { type: "schnorr" });
+      } catch (e) {
+        if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Only spendable credit and expiry are shown.");
+        throw new Error(`KasWare: ${walletErrorText(e)}`);
+      }
+      const signature = normaliseBalanceSignature(raw);
+      if (!signature) throw new Error("KasWare returned a signature in an unexpected format (expected 128 hex characters).");
+      const balance = await apiFetch<PrepaidBalanceRead>("/api/prepaid/balance/signed", {
+        method: "POST",
+        body: { slug: lookup.slug, payer_address: lookup.address, timestamp: String(timestamp), signature },
+      });
+      if (!hasLedgerTotals(balance)) throw new Error("The gateway answered without the ledger totals. Try again.");
+      setLookup({ ...lookup, balance, balanceSigned: true });
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "invalid_balance_signature") {
+        setError("The gateway didn't accept the balance signature: the KasWare account isn't the depositing key, or this device's clock is more than 5 minutes off. Nothing was shown.");
+      } else {
+        setError(refundErrorMessage(e));
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function showReasons() {
     if (!lookup) return;
     setNotice(null);
     setBusy("status");
     setError(null);
     try {
-      const reply = await signAndSend<SignedRefundStatus>({ slug: lookup.slug, payer_address: lookup.address, action: "status" }, "/api/prepaid/refunds/status", {});
-      setLookup({ ...lookup, refunds: reply.refunds, signed: true, credits: reply.credit_summary });
+      const refunds = await signAndSend<PrepaidRefundRead[]>({ slug: lookup.slug, payer_address: lookup.address, action: "status" }, "/api/prepaid/refunds/status", {});
+      setLookup({ ...lookup, refunds, signed: true });
     } catch (e) {
       setError(refundErrorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * CONTRACT v2.14 buyer credits: POST credits/challenge -> line-by-line check -> KasWare signMessage -> POST credits/status.
+   * A challenge is single use, so every page (the newest, then each "older" page via next_cursor) is a new signature.
+   */
+  async function loadCredits(more: boolean) {
+    if (!lookup) return;
+    const before = more ? (lookup.credits?.nextCursor ?? null) : null;
+    if (more && before === null) return;
+    setNotice(null);
+    setBusy(more ? "credits-more" : "credits");
+    setError(null);
+    try {
+      const wallet = getKasware();
+      if (!wallet) throw new Error("KasWare was not detected in this browser. Credits are shown only to the depositing key.");
+      const accounts = await wallet.requestAccounts();
+      if (accounts[0]?.trim().toLowerCase() !== lookup.address) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
+      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+      if (wrongNetwork) throw new Error(wrongNetwork);
+      const challenge = await apiFetch<PrepaidCreditStatusChallenge>("/api/prepaid/credits/challenge", {
+        method: "POST",
+        body: { slug: lookup.slug, payer_address: lookup.address },
+      });
+      const refusal = checkCreditChallenge(challenge, { address: lookup.address, slug: lookup.slug, domain: EXPECTED_AUTH_DOMAIN });
+      if (refusal) throw new Error(refusal);
+      let signature: string;
+      try {
+        signature = await wallet.signMessage(challenge.message, { type: "schnorr" });
+      } catch (e) {
+        if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Nothing was read.");
+        throw new Error(`KasWare: ${walletErrorText(e)}`);
+      }
+      if (!isSignatureToken(signature)) throw new Error("KasWare returned an unexpected signature.");
+      const body: PrepaidCreditStatusRequest = { nonce: challenge.nonce, signature: signature.trim().toLowerCase(), limit: CREDIT_STATUS_PAGE };
+      if (before !== null) body.before = before;
+      const reply = await apiFetch<unknown>("/api/prepaid/credits/status", { method: "POST", body });
+      const totals = parseBuyerCreditStatus(reply, CREDIT_STATUS_PAGE);
+      if (!totals) throw new Error("The gateway's credit status reply did not have the documented shape.");
+      const loaded = more && lookup.credits ? lookup.credits.items : [];
+      const seen = new Set(loaded.map((item) => item.credit_id));
+      const items = [...loaded, ...totals.credits.filter((item) => !seen.has(item.credit_id))];
+      setLookup({ ...lookup, credits: { totals, items, nextCursor: totals.next_cursor } });
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "invalid_cursor") {
+        setLookup({ ...lookup, credits: lookup.credits ? { ...lookup.credits, nextCursor: null } : null });
+        setError("The page marker for older credits was not accepted. Sign again from the newest credits.");
+      } else {
+        setError(refundErrorMessage(e));
+      }
     } finally {
       setBusy(null);
     }
@@ -246,6 +385,9 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   const openRefund = lookup?.refunds.find((r) => r.status === "requested" || r.status === "paying" || r.status === "payout_submitted") ?? null;
   const balance = lookup?.balance ?? null;
   const expired = balance?.expires_at ? Date.parse(balance.expires_at) <= Date.now() : false;
+  const limit = lookup ? refundLimit(lookup) : null;
+  const signedRefundable = balance && sompiOrNull(balance.refundable_sompi) !== null ? (balance.refundable_sompi ?? null) : null;
+  const signedCallOnly = balance && sompiOrNull(balance.credit_balance_sompi) !== null ? (balance.credit_balance_sompi ?? null) : null;
 
   return (
     <div className="mt-8 space-y-6">
@@ -304,49 +446,98 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                 <RefreshCw className="h-3.5 w-3.5" aria-hidden />
               </button>
             </div>
-            <dl className="mt-4 grid gap-4 sm:grid-cols-3 lg:grid-cols-6">
-              <div>
-                <dt className="label">Balance</dt>
-                <dd>
-                  <KasAmount sompi={balance.balance_sompi} align="left" tone="text-zinc-100" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Spendable</dt>
-                <dd>
-                  <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Held by a refund request</dt>
-                <dd>
-                  <KasAmount sompi={balance.refund_hold_sompi} align="left" tone="text-amber-300" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Refundable</dt>
-                <dd>
-                  <KasAmount sompi={balance.refundable_sompi} align="left" tone="text-zinc-100" />
-                </dd>
-              </div>
-              <div>
-                <dt className="label" title="Credit from failed paid calls: spent first by calls, never refunded on-chain">Call-only credit</dt>
-                <dd>
-                  <KasAmount sompi={balance.credit_balance_sompi} align="left" tone={balance.credit_balance_sompi === "0" ? "text-zinc-500" : "text-violet-300"} />
-                </dd>
-              </div>
-              <div>
-                <dt className="label">Expires</dt>
-                <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
-                {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
-              </div>
-            </dl>
-            {BigInt(balance.credited_sompi) > 0n ? (
-              <p className="mt-3 text-xs text-violet-300/90" data-credited>
-                {formatKas(balance.credited_sompi)} KAS has been credited here from paid calls that failed. That credit pays for calls first and is never refunded
-                on-chain.
-              </p>
-            ) : null}
+            {lookup.balanceSigned && hasLedgerTotals(balance) ? (
+              <dl className="mt-4 grid gap-4 sm:grid-cols-4" data-balance-signed>
+                <div>
+                  <dt className="label">Balance</dt>
+                  <dd>
+                    <KasAmount sompi={balance.balance_sompi} align="left" tone="text-zinc-100" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Spendable</dt>
+                  <dd>
+                    <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Held by a refund request</dt>
+                  <dd>
+                    <KasAmount sompi={balance.refund_hold_sompi} align="left" tone="text-amber-300" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Expires</dt>
+                  <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
+                  {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
+                </div>
+                <div>
+                  <dt className="label">Deposited</dt>
+                  <dd>
+                    <KasAmount sompi={balance.deposited_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Spent on calls</dt>
+                  <dd>
+                    <KasAmount sompi={balance.debited_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Refunded</dt>
+                  <dd>
+                    <KasAmount sompi={balance.refunded_sompi} align="left" />
+                  </dd>
+                </div>
+                <div>
+                  <dt className="label">Expired</dt>
+                  <dd>
+                    <KasAmount sompi={balance.expired_sompi} align="left" />
+                  </dd>
+                </div>
+                {signedRefundable !== null ? (
+                  <div>
+                    <dt className="label">Refundable</dt>
+                    <dd>
+                      <KasAmount sompi={signedRefundable} align="left" tone="text-zinc-100" />
+                    </dd>
+                  </div>
+                ) : null}
+                {signedCallOnly !== null ? (
+                  <div>
+                    <dt className="label" title="Credit from failed paid calls: spent first by calls, never refunded on-chain">Call-only credit</dt>
+                    <dd>
+                      <KasAmount sompi={signedCallOnly} align="left" tone={signedCallOnly === "0" ? "text-zinc-500" : "text-violet-300"} />
+                    </dd>
+                  </div>
+                ) : null}
+              </dl>
+            ) : (
+              <>
+                <dl className="mt-4 grid gap-4 sm:grid-cols-4" data-balance-public>
+                  <div>
+                    <dt className="label">Spendable</dt>
+                    <dd>
+                      <KasAmount sompi={balance.spendable_sompi} align="left" tone="text-emerald-300" />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="label">Expires</dt>
+                    <dd className={`font-mono text-xs ${expired ? "text-red-300" : "text-zinc-300"}`}>{balance.expires_at ? formatDateTime(balance.expires_at) : "never"}</dd>
+                    {expired ? <p className="mt-1 text-[11px] text-red-300/80">This credit has expired and can no longer be spent or refunded.</p> : null}
+                  </div>
+                </dl>
+                <div className="mt-3 flex flex-wrap items-center gap-3">
+                  <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void signBalance()} disabled={busy !== null || !canSign} data-sign-balance>
+                    {busy === "balance" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                    Sign to see the full balance
+                  </button>
+                  <p className="text-[11px] text-zinc-500">
+                    Held, deposited, spent, refunded and expired amounts are shown only to the depositing key: KasWare signs a read-only message (it authorises nothing else).
+                  </p>
+                </div>
+              </>
+            )}
           </section>
 
           <section className="card space-y-3 p-5" aria-labelledby="buyer-request-heading">
@@ -362,9 +553,9 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                     label="Amount (KAS)"
                     htmlFor="refund-amount"
                     error={amountError}
-                    hint={`Blank = all refundable credit (${formatKas(balance.refundable_sompi)} KAS). Minimum ${pricing.status === "ready" ? formatKas(pricing.minOutput) : "0.20"} KAS.`}
+                    hint={`Blank = all refundable credit (${formatKas(limit?.refundable ?? 0n)} KAS). Minimum ${pricing.status === "ready" ? formatKas(pricing.minOutput) : "0.20"} KAS.`}
                   >
-                    <input id="refund-amount" className="input font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={formatKas(balance.refundable_sompi)} inputMode="decimal" autoComplete="off" />
+                    <input id="refund-amount" className="input font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={formatKas(limit?.refundable ?? 0n)} inputMode="decimal" autoComplete="off" />
                   </Field>
                 </div>
                 <button type="submit" className="btn-primary sm:mt-6" disabled={busy !== null || !canSign}>
@@ -418,7 +609,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                           <p className={`mt-1 max-w-[280px] text-[11px] ${Date.parse(refund.hold_until) > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
                             {Date.parse(refund.hold_until) > now
                               ? `Cooldown: this amount stays held until ${formatDateTime(refund.hold_until)} because the merchant had started paying it. If their payout lands before then, it is recorded as paid; otherwise the credit is spendable again.`
-                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released.`}
+                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released once no payout of this refund is still being checked.`}
                           </p>
                         ) : null}
                         {payoutFound?.refundId === refund.id ? (
@@ -493,78 +684,105 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
             </p>
           </section>
 
-          {lookup.credits ? (
-            <section className="space-y-2" aria-labelledby="buyer-credits-heading" data-credit-summary>
-              <h2 id="buyer-credits-heading" className="text-sm font-medium text-zinc-100">
-                Credit from failed calls
-              </h2>
-              <div className="card space-y-3 p-4">
-                <dl className="grid gap-4 sm:grid-cols-3">
-                  <div>
-                    <dt className="label">Credited in total</dt>
-                    <dd>
-                      <KasAmount sompi={lookup.credits.creditedSompi} align="left" tone="text-violet-300" />
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="label">Unspent (call-only)</dt>
-                    <dd>
-                      <KasAmount sompi={lookup.credits.creditBalanceSompi} align="left" tone="text-zinc-100" />
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="label">Refundable now</dt>
-                    <dd>
-                      <KasAmount sompi={lookup.credits.refundableSompi} align="left" tone="text-zinc-100" />
-                    </dd>
-                  </div>
-                </dl>
-                {lookup.credits.credits.length > 0 ? (
-                  <table className="w-full min-w-[640px] text-left">
-                    <thead>
-                      <tr className="border-b border-zinc-800">
-                        <th className="th">Credited (UTC)</th>
-                        <th className="th">Endpoint</th>
-                        <th className="th">Why</th>
-                        <th className="th text-right">Credited</th>
-                        <th className="th text-right">Not credited (cap)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-zinc-800/70">
-                      {lookup.credits.credits.map((credit) => (
-                        <tr key={credit.txId} data-buyer-credit={credit.txId}>
-                          <td className="td whitespace-nowrap font-mono text-xs">{formatDateTime(credit.createdAt)}</td>
-                          <td className="td font-mono text-xs">
-                            {credit.slug}
-                            <div className="text-[11px] text-zinc-600" title={credit.txId}>
-                              call {shortHash(credit.txId)}
-                            </div>
-                          </td>
-                          <td className="td text-xs text-zinc-400">{CREDIT_REASON_LABEL[credit.reason]}</td>
-                          <td className="td">
-                            <KasAmount sompi={credit.creditSompi} tone="text-violet-300" />
-                          </td>
-                          <td className="td">
-                            <KasAmount sompi={credit.shortfallSompi} tone={credit.shortfallSompi === "0" ? "text-zinc-600" : "text-amber-300"} />
-                          </td>
+          <section className="space-y-2" aria-labelledby="buyer-credits-heading" data-buyer-credits>
+            <h2 id="buyer-credits-heading" className="text-sm font-medium text-zinc-100">
+              Credit from failed calls
+            </h2>
+            <div className="card space-y-3 p-4">
+              {lookup.credits ? (
+                <>
+                  <dl className="grid gap-4 sm:grid-cols-4" data-credit-totals>
+                    <div>
+                      <dt className="label">Credited in total</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.credited_sompi} align="left" tone="text-violet-300" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label" title="Spent first by calls; never paid back on-chain">Call-only credit (never refundable)</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.credit_balance_sompi} align="left" tone="text-zinc-100" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label">Refundable now</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.refundable_sompi} align="left" tone="text-zinc-100" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label">Credits</dt>
+                      <dd className="font-mono text-sm text-zinc-100" data-credit-count>
+                        {lookup.credits.totals.credit_count}
+                      </dd>
+                    </div>
+                  </dl>
+                  {lookup.credits.items.length > 0 ? (
+                    <table className="w-full min-w-[640px]">
+                      <thead>
+                        <tr className="border-b border-zinc-800">
+                          <th className="th">When</th>
+                          <th className="th">Call</th>
+                          <th className="th">Why</th>
+                          <th className="th text-right">Credited (call-only)</th>
+                          <th className="th text-right">Not credited (cap)</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                ) : (
-                  <p className="text-xs text-zinc-500">No paid call to this merchant has been credited.</p>
-                )}
-                {lookup.credits.creditCount > lookup.credits.credits.length ? (
-                  <p className="text-[11px] text-zinc-500">
-                    Showing the newest {lookup.credits.credits.length} of {lookup.credits.creditCount} credits.
-                  </p>
-                ) : null}
-                <p className="text-[11px] text-zinc-500">
-                  When a paid call fails for good, the merchant&apos;s share comes back to you as credit here. The platform fee is not returned.
-                </p>
-              </div>
-            </section>
-          ) : null}
+                      </thead>
+                      <tbody>
+                        {lookup.credits.items.map((credit) => (
+                          <tr key={credit.credit_id} data-buyer-credit={credit.credit_id}>
+                            <td className="td whitespace-nowrap font-mono text-xs">{formatDateTime(credit.created_at)}</td>
+                            <td className="td font-mono text-xs">
+                              {credit.slug}
+                              <div className="text-[11px] text-zinc-600" title={credit.tx_id}>
+                                call {shortHash(credit.tx_id)}
+                              </div>
+                            </td>
+                            <td className="td text-xs text-zinc-400">{CREDIT_REASON_LABEL[credit.reason]}</td>
+                            <td className="td">
+                              <KasAmount sompi={credit.credit_sompi} tone="text-violet-300" />
+                            </td>
+                            <td className="td">
+                              <KasAmount sompi={credit.shortfall_sompi} tone={credit.shortfall_sompi === "0" ? "text-zinc-600" : "text-amber-300"} />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <p className="text-xs text-zinc-500">No paid call to this merchant has been credited.</p>
+                  )}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <p className="text-[11px] text-zinc-500" data-credit-shown>
+                      Showing {lookup.credits.items.length} of {lookup.credits.totals.credit_count} credits, newest first.
+                    </p>
+                    {lookup.credits.nextCursor !== null ? (
+                      <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void loadCredits(true)} disabled={busy !== null || !canSign} data-more-credits>
+                        {busy === "credits-more" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <ChevronDown className="h-3.5 w-3.5" aria-hidden />}
+                        Sign to load older credits
+                      </button>
+                    ) : null}
+                    <button type="button" className="btn-ghost px-2 py-1 text-xs" onClick={() => void loadCredits(false)} disabled={busy !== null || !canSign} data-reload-credits>
+                      <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+                      Newest
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-wrap items-center gap-3">
+                  <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void loadCredits(false)} disabled={busy !== null || !canSign} data-load-credits>
+                    {busy === "credits" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                    Sign to see credits
+                  </button>
+                  <p className="text-[11px] text-zinc-500">Shown only to the depositing key. Each page is one read-only KasWare signature (it authorises nothing else).</p>
+                </div>
+              )}
+              <p className="text-[11px] text-zinc-500">
+                When a paid call fails for good, the merchant&apos;s share comes back to you as call-only credit: it pays for your next calls first and is never paid back
+                on-chain. The platform fee is not returned.
+              </p>
+            </div>
+          </section>
         </>
       ) : busy === "lookup" ? (
         <Spinner label="Loading…" />

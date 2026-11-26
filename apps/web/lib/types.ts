@@ -161,27 +161,45 @@ export interface PrepaidReceipt {
 export interface PrepaidBalanceRead {
   merchant_id: Uuid;
   payer_address: string;
+  /** Always present (the 402 `balanceUrl` relies on it). Includes credit held by an open refund request. */
   balance_sompi: Sompi;
-  deposited_sompi: Sompi;
-  debited_sompi: Sompi;
+  /** CONTRACT v2.12.1: null on the unsigned public read; merchant reads and buyer-signed reads always fill it. */
+  deposited_sompi: Sompi | null;
+  debited_sompi: Sompi | null;
   updated_at: IsoDateTime | null;
-  /** CONTRACT v2.13: paid back on-chain by refund payouts. */
-  refunded_sompi: Sompi;
-  /** CONTRACT v2.13: swept by the credit-expiry worker. */
-  expired_sompi: Sompi;
-  /** CONTRACT v2.13: set aside by an open refund request; still in the balance but not spendable. */
-  refund_hold_sompi: Sompi;
-  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. */
+  /** CONTRACT v2.13: paid back on-chain by refund payouts. Null on the unsigned public read. */
+  refunded_sompi: Sompi | null;
+  /** CONTRACT v2.13: swept by the credit-expiry worker. Null on the unsigned public read. */
+  expired_sompi: Sompi | null;
+  /** CONTRACT v2.13: set aside by an open refund request (or a cancel cooldown); still in the balance but not spendable. Null on the unsigned public read. */
+  refund_hold_sompi: Sompi | null;
+  /** CONTRACT v2.13: balance - refund hold, or 0 once `expires_at` has passed. Always public. */
   spendable_sompi: Sompi;
   /** CONTRACT v2.13: when the credit expires (null = never). */
   expires_at: IsoDateTime | null;
-  /** CONTRACT v2.14: merchant shares of failed paid calls ever credited onto this balance. */
-  credited_sompi: Sompi;
+  /**
+   * CONTRACT v2.14: merchant shares of failed paid calls ever credited onto this balance. Typed nullable on the public
+   * read: #6 (v2.12.1) nulls the ledger totals there, and the two contracts have not met yet, so the buyer UI reads the
+   * authoritative credit totals from the signed POST /v1/prepaid/credits/status instead.
+   */
+  credited_sompi?: Sompi | null;
   /** CONTRACT v2.14: unspent failed-delivery credit inside the balance; spent first by calls, never refundable. */
-  credit_balance_sompi: Sompi;
+  credit_balance_sompi?: Sompi | null;
   /** CONTRACT v2.14: what a refund request may take now (spendable minus unspent failed-delivery credit). */
-  refundable_sompi: Sompi;
+  refundable_sompi?: Sompi | null;
 }
+
+/** Merchant `GET /v1/prepaid/balances` rows always carry every ledger total. */
+export type MerchantPrepaidBalanceRead = PrepaidBalanceRead & {
+  deposited_sompi: Sompi;
+  debited_sompi: Sompi;
+  refunded_sompi: Sompi;
+  expired_sompi: Sompi;
+  refund_hold_sompi: Sompi;
+  credited_sompi: Sompi;
+  credit_balance_sompi: Sompi;
+  refundable_sompi: Sompi;
+};
 
 export interface PrepaidDepositRead {
   id: Uuid;
@@ -401,32 +419,72 @@ export interface FailedDeliveryPolicyUpdate {
   credit_timeouts?: boolean;
 }
 
-/** One credit in the buyer's summary (newest first). */
-export interface BuyerCreditItem {
-  txId: string;
+/** POST /v1/prepaid/credits/challenge (201): sign `message` (Action: credits) with the depositing key. Single use. */
+export interface PrepaidCreditStatusChallenge {
+  nonce: string;
+  message: string;
+  action: "credits";
   slug: string;
-  creditSompi: Sompi;
-  shortfallSompi: Sompi;
+  merchant_id: Uuid;
+  payer_address: string;
+  amount_sompi: "0";
+  refund_id: null;
+  expires_at: IsoDateTime;
+  /** Informational only (not signed); the signed status body is authoritative. */
+  spendable_sompi?: Sompi;
+  refundable_sompi?: Sompi;
+}
+
+/** POST /v1/prepaid/credits/status body: a signed `credits` challenge plus an optional page. */
+export interface PrepaidCreditStatusRequest {
+  nonce: string;
+  signature: string;
+  /** Opaque `next_cursor` of the previous page; omit for the newest page. */
+  before?: string;
+  /** 1..100, default 10. */
+  limit?: number;
+}
+
+/** One failed-delivery credit in the signed credits/status reply (newest first). */
+export interface BuyerCreditStatusItem {
+  /** prepaid_ledger_entries.id; same value as `creditId` on the X-KasGate-Credit receipt. */
+  credit_id: Uuid;
+  tx_id: string;
+  slug: string;
+  credit_sompi: Sompi;
+  shortfall_sompi: Sompi;
   reason: FailedDeliveryCreditReason;
-  createdAt: IsoDateTime;
+  created_at: IsoDateTime;
 }
 
-/** X-KasGate-Credit-Summary (Base64 JSON) on the signed POST /v1/prepaid/refunds/status reply. */
-export interface BuyerCreditSummary {
-  merchantId: Uuid;
-  creditedSompi: Sompi;
-  creditBalanceSompi: Sompi;
-  refundableSompi: Sompi;
-  creditCount: number;
-  /** The newest credits, at most 10. */
-  credits: BuyerCreditItem[];
+/** schemas.BuyerCreditStatus: signed POST /v1/prepaid/credits/status (CONTRACT v2.14). */
+export interface BuyerCreditStatus {
+  merchant_id: Uuid;
+  /** All failed-delivery credit ever added to this balance. */
+  credited_sompi: Sompi;
+  /** Unspent call-only credit: spent first by calls, never refundable. */
+  credit_balance_sompi: Sompi;
+  /** Deposited and unspent, minus an open refund or cancel-cooldown hold: what a refund may take. */
+  refundable_sompi: Sompi;
+  /** Total credits across all pages. */
+  credit_count: number;
+  credits: BuyerCreditStatusItem[];
+  next_cursor: string | null;
 }
 
-/** This app's POST /api/prepaid/refunds/status reply: the gateway body plus its decoded credit-summary header. */
-export interface SignedRefundStatus {
-  refunds: PrepaidRefundRead[];
-  credit_summary: BuyerCreditSummary | null;
+/** USD at settlement for a failed-delivery credit, from the credited call's settlement (GET /v1/settlements). */
+export interface CreditUsd {
+  /** KAS/USD rate the call settled at; null when the gateway recorded none. */
+  kas_usd_rate: DecimalString | null;
+  /** usd_value_at_settlement of the whole call. */
+  call_usd: DecimalString | null;
 }
+
+/** This app's GET /api/prepaid/credits row: the gateway row plus the USD at settlement of the credited call. */
+export type PrepaidCreditWithUsd = PrepaidCreditRead & { usd: CreditUsd | null };
+
+/** This app's GET /api/prepaid/ledger row: failed-delivery credit rows carry the USD at settlement of the call. */
+export type PrepaidLedgerEntryWithUsd = PrepaidLedgerEntryRead & { usd: CreditUsd | null };
 
 /* ------------------------------------------------------------------ fee split */
 

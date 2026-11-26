@@ -27,6 +27,8 @@ interface GatewayRequest {
   query?: Record<string, string | number | undefined>;
   accept?: string;
   revalidate?: number;
+  /** Extra request headers chosen by the route handler (e.g. the validated buyer balance signature). */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -62,6 +64,7 @@ function buildInit(req: GatewayRequest, clientIp: string | undefined): RequestIn
   if (req.bearer) outbound.Authorization = `Bearer ${req.bearer}`;
   if (req.body !== undefined) outbound["Content-Type"] = "application/json";
   if (clientIp) outbound["X-Forwarded-For"] = clientIp;
+  if (req.headers) Object.assign(outbound, req.headers);
   const init: RequestInit & { next?: { revalidate: number } } = {
     method: req.method ?? "GET",
     headers: outbound,
