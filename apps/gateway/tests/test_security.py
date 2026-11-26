@@ -104,6 +104,12 @@ def test_valid_upstream_headers_pass() -> None:
         ("224.0.0.1", True),
         ("93.184.216.34", False),
         ("2606:4700:4700::1111", False),
+        ("::7f00:1", True),  # IPv4-compatible 127.0.0.1 (::/96, deprecated)
+        ("::a00:1", True),  # IPv4-compatible 10.0.0.1
+        ("::808:808", True),  # IPv4-compatible even of a public v4: the whole ::/96 block is refused
+        ("fec0::1", True),  # site-local (fec0::/10, deprecated)
+        ("feff:ffff::1", True),  # top of fec0::/10
+        ("ff00::1", True),  # multicast, just past fec0::/10
     ],
 )
 def test_forbidden_ip_classification(address: str, forbidden: bool) -> None:

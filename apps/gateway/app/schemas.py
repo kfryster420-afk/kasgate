@@ -1668,6 +1668,39 @@ WebhookDeliveryStatus = Literal["pending", "delivering", "succeeded", "dead"]
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain")
 
 
+NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+IPV4_COMPATIBLE = ipaddress.ip_network("::/96")  # deprecated by RFC 4291; still routed to the v4 host by some stacks
+SITE_LOCAL = ipaddress.ip_network("fec0::/10")  # deprecated by RFC 3879; Python counts it as global
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """IPv4 addresses a v6 address can tunnel to: v4-mapped, 6to4, Teredo (server and client) and NAT64."""
+    found: list[ipaddress.IPv4Address] = []
+    if ip.ipv4_mapped is not None:
+        found.append(ip.ipv4_mapped)
+    if ip.sixtofour is not None:
+        found.append(ip.sixtofour)
+    if ip.teredo is not None:
+        found.extend(ip.teredo)
+    if ip in NAT64_WELL_KNOWN:
+        found.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return found
+
+
+def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True unless `ip` is a public unicast address (and, for IPv6, so is every IPv4 address it tunnels to).
+
+    The whole IPv4-compatible ``::/96`` block and site-local ``fec0::/10`` are refused outright: neither is a real
+    public destination, and both slip past ``is_global``.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip in IPV4_COMPATIBLE or ip in SITE_LOCAL:
+            return True
+        if any(is_forbidden_ip(inner) for inner in _embedded_ipv4(ip)):
+            return True
+    return not ip.is_global or ip.is_multicast
+
+
 def validate_webhook_url(value: str) -> str:
     """HTTPS only, no credentials or fragment, and not a local name or a non-public IP literal.
 
@@ -1696,7 +1729,7 @@ def validate_webhook_url(value: str) -> str:
         if "." not in host:
             raise ValueError("webhook url host must be a public domain name") from None
         return str(parsed)
-    if not ip.is_global or ip.is_multicast:
+    if is_forbidden_ip(ip):
         raise ValueError("webhook url may not target a private, loopback, link-local or reserved IP")
     return str(parsed)
 

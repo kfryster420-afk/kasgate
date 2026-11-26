@@ -47,6 +47,12 @@ from app.schemas import (
     REGISTER_PURPOSE,
     build_auth_challenge,
 )
+from app.schemas import (
+    NAT64_WELL_KNOWN as NAT64_WELL_KNOWN,
+)
+from app.schemas import (
+    is_forbidden_ip as is_forbidden_ip,
+)
 
 logger = logging.getLogger("kasgate.security")
 
@@ -315,30 +321,6 @@ def decrypt_headers(token: bytes | None) -> dict[str, str]:
 
 class UpstreamBlockedError(Exception):
     """Raised when an upstream host resolves to a non-public address."""
-
-
-NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
-
-
-def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
-    """IPv4 addresses a v6 address can tunnel to: v4-mapped, 6to4, Teredo (server and client) and NAT64."""
-    found: list[ipaddress.IPv4Address] = []
-    if ip.ipv4_mapped is not None:
-        found.append(ip.ipv4_mapped)
-    if ip.sixtofour is not None:
-        found.append(ip.sixtofour)
-    if ip.teredo is not None:
-        found.extend(ip.teredo)
-    if ip in NAT64_WELL_KNOWN:
-        found.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
-    return found
-
-
-def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True unless `ip` is a public unicast address (and, for IPv6, so is every IPv4 address it tunnels to)."""
-    if isinstance(ip, ipaddress.IPv6Address) and any(is_forbidden_ip(inner) for inner in _embedded_ipv4(ip)):
-        return True
-    return not ip.is_global or ip.is_multicast
 
 
 async def _getaddrinfo(host: str, port: int) -> list[tuple[Any, Any, Any, Any, tuple[Any, ...]]]:

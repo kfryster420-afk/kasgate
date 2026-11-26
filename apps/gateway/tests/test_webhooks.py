@@ -224,6 +224,11 @@ async def test_webhook_count_is_capped(client: httpx.AsyncClient, seeded: Seed, 
         "https://[fd00::1]/x",
         "https://[fe80::1]/x",
         "https://[::ffff:127.0.0.1]/x",
+        "https://[::7f00:1]/x",  # IPv4-compatible 127.0.0.1
+        "https://[::a9fe:a9fe]/x",  # IPv4-compatible 169.254.169.254 (cloud metadata)
+        "https://[fec0::1]/x",  # site-local
+        "https://[64:ff9b::a00:1]/x",  # NAT64 of 10.0.0.1
+        "https://[2002:7f00:1::]/x",  # 6to4 of 127.0.0.1
         "https://user:pw@hooks.example.com/x",
         "https://hooks.example.com/x#frag",
         "https://hooks.example.com/a b",
