@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
+from app.kaspa_types import validate_kaspa_address
 from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
@@ -77,7 +78,6 @@ from app.schemas import (
     PrepaidDepositReceipt,
     compute_fee_split,
     new_payment_nonce,
-    validate_kaspa_address,
 )
 from app.security import RATE_LIMIT_UNPAID_PROXY, get_current_merchant, limit_by_ip
 
@@ -187,7 +187,7 @@ async def quote_deposit(
     split = compute_fee_split(payload.amount_sompi)
     if current + split.merchant_sompi > settings.prepaid_max_balance_sompi:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=(
                 f"this deposit would take the prepaid balance above the {settings.prepaid_max_balance_sompi} sompi "
                 f"cap (current balance {current} sompi)"
@@ -551,7 +551,7 @@ async def read_balance(
     try:
         address = validate_kaspa_address(payer_address)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     public_key = payer_public_key(address)
     if public_key is None:
         return _not_p2pk()

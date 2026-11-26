@@ -1974,7 +1974,8 @@ async def _debit_balance(
         )
     ).one_or_none()
     if row is None:
-        await session.rollback()
+        # Nothing was written. Commit (not rollback) so the caller's loaded endpoint is not expired.
+        await session.commit()
         return None
     balance_id, balance = row
     debit_id = uuid.uuid4()

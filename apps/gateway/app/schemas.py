@@ -1336,6 +1336,9 @@ class CatalogPage(StrictModel):
 
 # ---------------------------------------------------------------- prepaid credit (CONTRACT v2.11)
 
+# A balance or running total in sompi as a decimal string; unlike SompiStr it may be "0".
+BalanceSompiStr = Annotated[str, Field(pattern=r"^(?:0|[1-9][0-9]{0,17})$")]
+
 
 class PrepaidDepositQuoteRequest(StrictModel):
     """Ask for a nonce-bound kaspa-exact-v1 challenge that funds a prepaid balance at the endpoint's merchant.
@@ -1343,6 +1346,8 @@ class PrepaidDepositQuoteRequest(StrictModel):
     `amount_sompi` is the deposit TOTAL (both outputs). It must pass `compute_fee_split` (>= 0.6 KAS); the credit
     posted to the balance is the merchant share (output 0), never the treasury fee (output 1).
     """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
     slug: Annotated[str, Field(pattern=SLUG_RE)]
     payer_address: str
@@ -1367,7 +1372,7 @@ class PrepaidDepositQuote(BaseModel):
     deposit_sompi: SompiStr
     fee_sompi: SompiStr
     credit_sompi: SompiStr
-    balance_sompi: SompiStr
+    balance_sompi: BalanceSompiStr
     """The payer's balance at this merchant before this deposit."""
     required: PaymentRequired
     """Pay these terms (outputs 0 merchant, 1 treasury, payload kasgate:v1:<nonce>, payerProof) and POST the
@@ -1384,13 +1389,15 @@ class PrepaidDepositReceipt(BaseModel):
     deposit_sompi: SompiStr
     fee_sompi: SompiStr
     credit_sompi: SompiStr
-    balance_sompi: SompiStr
+    balance_sompi: BalanceSompiStr
     created_at: datetime
 
 
 class PrepaidChallengeRequest(StrictModel):
     """Ask for the debit challenge of ONE prepaid call. `path` is the exact proxy path to be called, including the
     query string if any (e.g. "/p/weather/today?city=hanoi"); `body_hash` is prepaid_body_hash(body)."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
     slug: Annotated[str, Field(pattern=SLUG_RE)]
     payer_address: str
@@ -1427,7 +1434,7 @@ class PrepaidChallenge(BaseModel):
     body_hash: str
     amount_sompi: SompiStr
     kas_usd_rate: str | None
-    balance_sompi: SompiStr
+    balance_sompi: BalanceSompiStr
     expires_at: datetime
 
 
@@ -1455,16 +1462,16 @@ class PrepaidReceipt(X402Header):
     debitId: uuid.UUID
     nonce: str
     amountSompi: SompiStr
-    balanceSompi: SompiStr
+    balanceSompi: BalanceSompiStr
     status: Literal["debited", "refunded"]
 
 
 class PrepaidBalanceRead(BaseModel):
     merchant_id: uuid.UUID
     payer_address: str
-    balance_sompi: SompiStr
-    deposited_sompi: SompiStr
-    debited_sompi: SompiStr
+    balance_sompi: BalanceSompiStr
+    deposited_sompi: BalanceSompiStr
+    debited_sompi: BalanceSompiStr
     updated_at: datetime | None
 
 

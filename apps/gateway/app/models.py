@@ -337,4 +337,3 @@ class PrepaidDebit(Base):
         CheckConstraint("status IN ('debited', 'refunded')", name="status_known"),
         CheckConstraint("(status = 'refunded') = (refunded_at IS NOT NULL)", name="refunded_at_iff_refunded"),
     )
-
