@@ -2,12 +2,12 @@
 
 import { Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { apiFetch } from "@/lib/api-client";
+import { ApiError, apiFetch } from "@/lib/api-client";
 import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, TESTNET_EXPLORER_URL } from "@/lib/config";
 import { formatDateTime, shortHash } from "@/lib/format";
 import { getKasware, isSignatureToken, isWalletRejection, kaswareNetworkRefusal, walletErrorText } from "@/lib/kasware";
 import { checkRefundChallenge } from "@/lib/refund-challenge";
-import { refundErrorMessage } from "@/lib/refund-errors";
+import { refundErrorMessage, txIdsInMessage } from "@/lib/refund-errors";
 import { claimExpiresAt } from "@/lib/refund-payout";
 import { formatKas, parseKasToSompi } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
@@ -38,6 +38,8 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** A cancel refused because the gateway found a possible payout on-chain: the refund and the tx ids it named. */
+  const [payoutFound, setPayoutFound] = useState<{ refundId: string; txIds: string[] } | null>(null);
 
   useEffect(() => {
     const detect = () => setHasWallet(getKasware() !== null);
@@ -190,12 +192,29 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     setNotice(null);
     setBusy(`cancel:${refund.id}`);
     setError(null);
+    setPayoutFound(null);
     try {
-      await signAndSend<PrepaidRefundRead>({ slug: lookup.slug, payer_address: lookup.address, action: "cancel", refund_id: refund.id }, `/api/prepaid/refunds/${refund.id}/cancel`, { refundId: refund.id });
+      const cancelled = await signAndSend<PrepaidRefundRead>(
+        { slug: lookup.slug, payer_address: lookup.address, action: "cancel", refund_id: refund.id },
+        `/api/prepaid/refunds/${refund.id}/cancel`,
+        { refundId: refund.id },
+      );
       await load(lookup.slug, lookup.address);
-      setNotice("Refund request withdrawn. The held credit is spendable again.");
+      setNotice(
+        cancelled.hold_until
+          ? `Refund request withdrawn. Because the merchant had started paying it, the amount stays held until ${formatDateTime(cancelled.hold_until)} in case their payout is already on its way; then it is spendable again.`
+          : "Refund request withdrawn. The held credit is spendable again.",
+      );
     } catch (e) {
-      setError(refundErrorMessage(e));
+      const txIds = e instanceof ApiError && e.code === "refund_not_cancellable" ? txIdsInMessage(e.message) : [];
+      if (txIds.length > 0) {
+        setPayoutFound({ refundId: refund.id, txIds });
+        await load(lookup.slug, lookup.address);
+      } else if (e instanceof ApiError && e.status === 503) {
+        setError("The merchant had started paying this refund, and the Kaspa node can't be checked for their payout right now, so it can't be withdrawn yet. Nothing changed. Try again shortly.");
+      } else {
+        setError(refundErrorMessage(e));
+      }
     } finally {
       setBusy(null);
     }
@@ -372,6 +391,32 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                         {refund.status === "rejected" && !lookup.signed ? <p className="mt-1 max-w-[280px] text-[11px] text-zinc-500">Sign to see the merchant&apos;s reason.</p> : null}
                         {refund.last_error && lookup.signed && refund.status !== "paid" ? <p className="mt-1 max-w-[280px] break-all text-[11px] text-amber-300/80">Payout problem: {refund.last_error}</p> : null}
                         <LatePayoutNote refund={refund} />
+                        {refund.status === "cancelled" && refund.hold_until ? (
+                          <p className={`mt-1 max-w-[280px] text-[11px] ${Date.parse(refund.hold_until) > now ? "text-violet-300" : "text-zinc-500"}`} data-hold-until>
+                            {Date.parse(refund.hold_until) > now
+                              ? `Cooldown: this amount stays held until ${formatDateTime(refund.hold_until)} because the merchant had started paying it. If their payout lands before then, it is recorded as paid; otherwise the credit is spendable again.`
+                              : `Cooldown ended ${formatDateTime(refund.hold_until)}: the held amount is released.`}
+                          </p>
+                        ) : null}
+                        {payoutFound?.refundId === refund.id ? (
+                          <div className="mt-2 max-w-[320px] rounded-md border border-sky-500/30 bg-sky-500/10 p-2 text-[11px] text-sky-200" data-cancel-found>
+                            <p className="font-medium">Not withdrawn: a payout of this refund may already be on its way to you.</p>
+                            <ul className="mt-1 space-y-0.5">
+                              {payoutFound.txIds.map((txId) => (
+                                <li key={txId} className="font-mono break-all" data-found-tx={txId}>
+                                  {IS_TESTNET ? (
+                                    <a href={`${TESTNET_EXPLORER_URL}/txs/${txId}`} target="_blank" rel="noreferrer" className="text-kas-300 hover:underline">
+                                      {txId}
+                                    </a>
+                                  ) : (
+                                    txId
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                            <p className="mt-1">KasGate is confirming it. If it is this refund&apos;s payout, the refund is marked paid; if not, you can withdraw again once it is ruled out.</p>
+                          </div>
+                        ) : null}
                       </td>
                       <td className="td">
                         {refund.tx_id ? (
