@@ -470,8 +470,6 @@ def build_server(
             "deposit_kas": sompi_to_kas(int(receipt.deposit_sompi)),
             "platform_fee_kas": sompi_to_kas(int(receipt.fee_sompi)),
             "credit_kas": sompi_to_kas(int(receipt.credit_sompi)),
-            "balance_kas": sompi_to_kas(int(receipt.balance_sompi)),
-            "balance_sompi": int(receipt.balance_sompi),
             "budget": budget.snapshot(),
         }
 

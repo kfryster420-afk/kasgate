@@ -179,20 +179,24 @@ async def _lock_balance_row(
     return row[0], int(row[1])
 
 
-def _cap_exceeded(cap: int, current: int) -> JSONResponse:
-    return _error(
-        422,
-        "prepaid_cap_exceeded",
-        f"this deposit would take the prepaid balance above the {cap} sompi cap (current balance {current} sompi); "
-        "the transaction was not submitted",
-    )
+CAP_EXCEEDED_MESSAGE: Final = "deposit would exceed the prepaid balance cap; use a signed balance read for details"
+
+
+def would_exceed_cap(*, balance: int, in_flight: int, credit: int, cap: int) -> bool:
+    """The one cap rule for a deposit (quote and deposit alike): balance + in-flight debits + new credit > cap."""
+    return balance + in_flight + credit > cap
+
+
+def _cap_exceeded() -> JSONResponse:
+    """422 without the balance, the cap or the credit: an unsigned caller must learn nothing beyond "over the cap"."""
+    return _error(422, "prepaid_cap_exceeded", CAP_EXCEEDED_MESSAGE)
 
 
 def _store_unavailable() -> JSONResponse:
     return _error(503, "service_unavailable", "prepaid store is temporarily unavailable")
 
 
-def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDepositReceipt:
+def _receipt(deposit: PrepaidDeposit, slug: str) -> PrepaidDepositReceipt:
     return PrepaidDepositReceipt(
         deposit_id=deposit.id,
         tx_id=deposit.tx_id,
@@ -202,7 +206,6 @@ def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDeposit
         deposit_sompi=str(deposit.deposit_sompi),
         fee_sompi=str(deposit.fee_sompi),
         credit_sompi=str(deposit.credit_sompi),
-        balance_sompi=str(balance),
         created_at=deposit.created_at,
     )
 
@@ -290,9 +293,7 @@ def buyer_read_signed(
         )
     timestamp = int(stamp)
     if abs(int(time.time()) - timestamp) > PREPAID_BALANCE_READ_TOLERANCE_SECONDS:
-        return _error(
-            401, "invalid_balance_signature", f"{kind} signature timestamp is outside the allowed window"
-        )
+        return _error(401, "invalid_balance_signature", f"{kind} signature timestamp is outside the allowed window")
     message = build_message(domain=auth_domain(), address=address, slug=slug, timestamp=timestamp)
     if not verify_prepaid_signature(message, signature.lower(), public_key):
         return _error(401, "invalid_balance_signature", f"{kind} signature does not verify for payer_address")
@@ -341,14 +342,16 @@ async def quote_deposit(
         return _store_unavailable()
     current = 0 if balance is None else balance.balance_sompi
     split = compute_fee_split(payload.amount_sompi)
-    if current + split.merchant_sompi > settings.prepaid_max_balance_sompi:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"this deposit would take the prepaid balance above the {settings.prepaid_max_balance_sompi} sompi "
-                f"cap (current balance {current} sompi)"
-            ),
-        )
+    try:
+        # Same rule as deposit(): debits whose upstream call is still in flight count against the cap.
+        in_flight = 0 if balance is None else await in_flight_debit_sompi(session, balance.id)
+    except SQLAlchemyError:
+        logger.exception("prepaid in-flight lookup failed")
+        return _store_unavailable()
+    if would_exceed_cap(
+        balance=current, in_flight=in_flight, credit=split.merchant_sompi, cap=settings.prepaid_max_balance_sompi
+    ):
+        return _cap_exceeded()
     expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=settings.payment_max_age_seconds)
     required = PaymentRequired.for_endpoint(payload.amount_sompi, merchant_address, new_payment_nonce(), expires_at)
     record = json.dumps(
@@ -371,7 +374,6 @@ async def quote_deposit(
         deposit_sompi=str(split.total_sompi),
         fee_sompi=str(split.fee_sompi),
         credit_sompi=str(split.merchant_sompi),
-        balance_sompi=str(current),
         required=required,
         deposit_url=f"{settings.public_base_url}{DEPOSIT_PATH}",
     )
@@ -418,14 +420,11 @@ async def _existing_deposit_response(
         or deposit.payer_address != signature.payerAddress
     ):
         return _error(409, "payment_replayed", "this transaction or payment nonce was already used")
-    balance = (
-        await session.execute(select(PrepaidBalance.balance_sompi).where(PrepaidBalance.id == deposit.balance_id))
-    ).scalar_one()
     slug = (await session.execute(select(Endpoint.slug).where(Endpoint.id == existing.endpoint_id))).scalar_one()
     usd = existing.usd_value_at_settlement
     return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content=_receipt(deposit, slug, int(balance)).model_dump(mode="json"),
+        content=_receipt(deposit, slug).model_dump(mode="json"),
         headers={
             HEADER_PAYMENT_RESPONSE: _payment_response_header(existing.tx_id, usd if usd is not None else Decimal(0))
         },
@@ -524,9 +523,7 @@ async def deposit(
     # subtracted from the balance, still refundable if the upstream fails) are reserved so a later 5xx refund cannot
     # land the balance past the cap.
     try:
-        balance_id, current = await _lock_balance_row(
-            session, endpoint.merchant_id, signature.payerAddress, public_key
-        )
+        balance_id, current = await _lock_balance_row(session, endpoint.merchant_id, signature.payerAddress, public_key)
         # Paid refunds and expiry lower balance_sompi (a refund hold stays in the balance until payout). Expire
         # overdue credit under this same row lock so the cap sees the post-expiry balance.
         await expire_balance_for(session, endpoint.merchant_id, public_key)
@@ -547,10 +544,10 @@ async def deposit(
         await _release_payment_locks(redis, tx_id, nonce)
         logger.exception("prepaid balance lock failed")
         return _store_unavailable()
-    if current + in_flight + required.merchant_amount_sompi > cap:
+    if would_exceed_cap(balance=current, in_flight=in_flight, credit=required.merchant_amount_sompi, cap=cap):
         await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
-        return _cap_exceeded(cap, current)
+        return _cap_exceeded()
 
     try:
         await engine.resolve_inputs(signature, tx)
@@ -586,8 +583,7 @@ async def deposit(
                 .where(
                     PrepaidBalance.merchant_id == endpoint.merchant_id,
                     PrepaidBalance.payer_public_key == public_key,
-                    PrepaidBalance.balance_sompi + credit + in_flight
-                    <= get_settings().prepaid_max_balance_sompi,
+                    PrepaidBalance.balance_sompi + credit + in_flight <= get_settings().prepaid_max_balance_sompi,
                 )
                 .values(
                     balance_sompi=PrepaidBalance.balance_sompi + credit,
@@ -661,7 +657,7 @@ async def deposit(
     usd = settlement.usd_value_at_settlement
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
-        content=_receipt(record, endpoint.slug, int(balance)).model_dump(mode="json"),
+        content=_receipt(record, endpoint.slug).model_dump(mode="json"),
         headers={
             HEADER_PAYMENT_RESPONSE: _payment_response_header(verified.tx_id, usd if usd is not None else Decimal(0))
         },

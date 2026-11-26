@@ -61,7 +61,6 @@ class Gateway:
                     "deposit_sompi": str(body.amount_sompi),
                     "fee_sompi": str(fee),
                     "credit_sompi": str(merchant),
-                    "balance_sompi": str(self.balance),
                     "required": json.loads(challenge(body.amount_sompi).model_dump_json()),
                     "deposit_url": "http://gateway.test/v1/prepaid/deposits",
                 },
@@ -87,7 +86,6 @@ class Gateway:
                     "deposit_sompi": str(credit + fee),
                     "fee_sompi": str(fee),
                     "credit_sompi": str(credit),
-                    "balance_sompi": str(self.balance),
                     "created_at": datetime.now(UTC).isoformat(),
                 },
             )

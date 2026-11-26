@@ -906,6 +906,7 @@ class X402ErrorBody(StrictModel):
         "challenge_expired",
         "challenge_replayed",
         "refund_too_small",
+        "refund_amount_required",
         "refund_already_open",
         "refund_not_found",
         "refund_not_cancellable",
@@ -1573,8 +1574,6 @@ class PrepaidDepositQuote(BaseModel):
     deposit_sompi: SompiStr
     fee_sompi: SompiStr
     credit_sompi: SompiStr
-    balance_sompi: BalanceSompiStr
-    """The payer's balance at this merchant before this deposit."""
     required: PaymentRequired
     """Pay these terms (outputs 0 merchant, 1 treasury, payload kasgate:v1:<nonce>, payerProof) and POST the
     PAYMENT-SIGNATURE to deposit_url. Valid until required.expiresAt."""
@@ -1590,7 +1589,6 @@ class PrepaidDepositReceipt(BaseModel):
     deposit_sompi: SompiStr
     fee_sompi: SompiStr
     credit_sompi: SompiStr
-    balance_sompi: BalanceSompiStr
     created_at: datetime
 
 

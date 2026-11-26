@@ -240,6 +240,7 @@ class KasGateClient:
             utxo_provider = self._rpc_provider
         self._utxo_provider: UtxoProvider = utxo_provider
         self._ledger = UtxoLedger(utxo_quarantine_seconds)
+        self._last_refunds_read_timestamp = 0
         self._pay_lock = asyncio.Lock()
         self._owns_http = http_client is None
         self._http = (
@@ -684,7 +685,9 @@ class KasGateClient:
         else:
             url = self._absolute(gateway_url)
             origin = self._origin(url)
-            timestamp = int(time.time())
+            # The gateway accepts each refunds-status signature once: never reuse a timestamp within this client.
+            timestamp = max(int(time.time()), self._last_refunds_read_timestamp + 1)
+            self._last_refunds_read_timestamp = timestamp
             message = build_prepaid_refunds_read_message(
                 domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
             )
@@ -747,7 +750,19 @@ class KasGateClient:
             body["amount_sompi"] = amount_sompi
         if refund_id is not None:
             body["refund_id"] = str(refund_id)
-        challenged = await self._http.post(origin + REFUND_CHALLENGE_PATH, json=body)
+        headers: dict[str, str] = {}
+        if action == "request" and amount_sompi is None:
+            # "Refund everything refundable": the gateway derives that amount only for a buyer-signed balance read,
+            # because the unsigned challenge never reveals (or acts on) the balance.
+            timestamp = int(time.time())
+            message = build_prepaid_balance_read_message(
+                domain=url.netloc.decode("ascii").lower(), address=self.address, slug=slug, timestamp=timestamp
+            )
+            headers = {
+                HEADER_BALANCE_TIMESTAMP: str(timestamp),
+                HEADER_BALANCE_SIGNATURE: kaspa.sign_message(message, self._private_key),
+            }
+        challenged = await self._http.post(origin + REFUND_CHALLENGE_PATH, json=body, headers=headers)
         if challenged.status_code != 201:
             code, message = error_details(challenged)
             if code == "insufficient_balance":

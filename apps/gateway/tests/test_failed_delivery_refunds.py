@@ -82,6 +82,12 @@ def _identity(row: PrepaidBalance) -> None:
     assert 0 <= row.credit_balance_sompi <= min(row.credited_sompi, row.balance_sompi - row.refund_hold_sompi)
 
 
+async def _refused_at_submit(client: httpx.AsyncClient, amount: int) -> httpx.Response:
+    """The unsigned challenge only checks the public spendable total, so the refundable cap bites on the signed POST."""
+    challenge = await challenge_of(client, amount=amount)
+    return await client.post("/v1/prepaid/refunds", json=signed(challenge))
+
+
 async def test_a_refund_takes_only_deposited_unspent_credit_and_its_hold_never_covers_credit(
     client: httpx.AsyncClient, shop: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -95,7 +101,7 @@ async def test_a_refund_takes_only_deposited_unspent_credit_and_its_hold_never_c
     assert challenge.amount_sompi == str(CREDIT_SOMPI)  # the default amount is the refundable part only
     dumped = challenge.model_dump()
     assert "spendable_sompi" not in dumped and "refundable_sompi" not in dumped
-    too_much = await refund_challenge(client, amount=CREDIT_SOMPI + 1)
+    too_much = await _refused_at_submit(client, CREDIT_SOMPI + 1)
     assert too_much.status_code == 409 and too_much.json()["error"] == "insufficient_balance"
 
     refund = await open_refund(client)
@@ -129,7 +135,7 @@ async def test_a_credit_only_balance_cannot_be_refunded(
     assert (row.deposited_sompi, row.balance_sompi, refundable_sompi(row)) == (0, SPLIT.merchant_sompi, 0)
     default = await refund_challenge(client)
     assert default.status_code == 422 and default.json()["error"] == "refund_too_small"
-    explicit = await refund_challenge(client, amount=MIN_REFUND)
+    explicit = await _refused_at_submit(client, MIN_REFUND)
     assert explicit.status_code == 409 and explicit.json()["error"] == "insufficient_balance"
     assert "calls only" in explicit.json()["message"]
 
@@ -517,7 +523,7 @@ async def test_a_cooldown_hold_blocks_another_refund_while_credit_still_pays_cal
     assert spendable_sompi(held) == SPLIT.merchant_sompi
     assert refundable_sompi(held) == 0
     _identity(held)
-    refused = await refund_challenge(client, amount=MIN_REFUND)
+    refused = await _refused_at_submit(client, MIN_REFUND)
     assert refused.status_code == 409 and refused.json()["error"] == "insufficient_balance"
     assert (await prepaid_call(client)).status_code == 200
     spent = await _balance(sessionmaker, shop.merchant_id)
@@ -563,7 +569,7 @@ async def test_a_cooldown_hold_outlasts_hold_until_while_a_payout_is_pending_and
     assert spendable_sompi(held) == SPLIT.merchant_sompi
     assert refundable_sompi(held) == 0
     _identity(held)
-    refused = await refund_challenge(client, amount=MIN_REFUND)
+    refused = await _refused_at_submit(client, MIN_REFUND)
     assert refused.status_code == 409 and refused.json()["error"] == "insufficient_balance"
     assert (await prepaid_call(client)).status_code == 200
     spent = await _balance(sessionmaker, shop.merchant_id)

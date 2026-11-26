@@ -76,7 +76,9 @@ async def refund_challenge(
         body["amount_sompi"] = amount
     if refund_id is not None:
         body["refund_id"] = str(refund_id)
-    return await client.post("/v1/prepaid/refunds/challenge", json=body)
+    # Without an amount the gateway derives "all refundable credit" only for a buyer-signed balance read.
+    headers = signed_headers(slug=slug) if action == "request" and amount is None and payer == PAYER_ADDRESS else {}
+    return await client.post("/v1/prepaid/refunds/challenge", json=body, headers=headers)
 
 
 async def challenge_of(client: httpx.AsyncClient, **kwargs: Any) -> PrepaidRefundChallenge:
@@ -609,7 +611,7 @@ async def test_merchant_expiry_policy_and_endpoint_override(
     assert created.json()["prepaid_expiry_days"] == 7
     before = datetime.now(UTC)
     receipt = await fund(client, slug="short-lived")
-    assert receipt.balance_sompi == str(CREDIT_SOMPI)
+    assert "balance_sompi" not in receipt.model_dump()
     row = await balance_of(sessionmaker, shop.merchant_id)
     assert row.expires_at is not None
     assert before + timedelta(days=7) - timedelta(minutes=1) <= row.expires_at <= datetime.now(UTC) + timedelta(days=7)
@@ -697,8 +699,9 @@ async def test_a_deposit_expires_overdue_credit_before_adding_new_credit(
     await fund(client)
     await set_expiry(sessionmaker, shop.merchant_id, datetime.now(UTC) - timedelta(seconds=1))
     receipt = await fund(client)
-    assert receipt.balance_sompi == str(CREDIT_SOMPI)  # the old credit expired, only the new deposit counts
+    assert "balance_sompi" not in receipt.model_dump()
     row = await balance_of(sessionmaker, shop.merchant_id)
+    assert row.balance_sompi == CREDIT_SOMPI  # the old credit expired, only the new deposit counts
     assert (row.expired_sompi, row.deposited_sompi) == (CREDIT_SOMPI, 2 * CREDIT_SOMPI)
     assert row.expires_at is not None and row.expires_at > datetime.now(UTC)
     assert_identity(row)

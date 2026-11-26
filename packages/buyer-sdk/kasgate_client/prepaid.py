@@ -58,7 +58,8 @@ class PrepaidDepositQuote(_Model):
     deposit_sompi: PositiveSompiStr
     fee_sompi: PositiveSompiStr
     credit_sompi: PositiveSompiStr
-    balance_sompi: BalanceStr
+    balance_sompi: BalanceStr | None = None
+    """Older gateways returned the balance on this unsigned response; current ones never do (read it signed)."""
     required: PaymentRequired
     deposit_url: str
 
@@ -72,7 +73,8 @@ class PrepaidDepositReceipt(_Model):
     deposit_sompi: PositiveSompiStr
     fee_sompi: PositiveSompiStr
     credit_sompi: PositiveSompiStr
-    balance_sompi: BalanceStr
+    balance_sompi: BalanceStr | None = None
+    """Older gateways returned the balance on this unsigned response; current ones never do (read it signed)."""
     created_at: datetime
 
 

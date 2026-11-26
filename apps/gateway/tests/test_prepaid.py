@@ -364,7 +364,7 @@ async def test_deposit_quote_uses_the_v1_split_and_its_own_namespace(
     assert quote.required.payTo == MERCHANT_ADDRESS
     assert quote.required.platformFee.feeTo == get_settings().kasgate_treasury_address
     assert quote.required.platformFee.feeAmount == "20000000"
-    assert quote.balance_sompi == "0"
+    assert "balance_sompi" not in quote.model_dump()  # an unsigned quote never shows the balance
     assert await redis.get(prepaid_deposit_key(quote.required.nonce)) is not None
     assert await redis.get(f"kasgate:nonce:{quote.required.nonce}") is None
 
@@ -408,7 +408,8 @@ async def test_deposit_quote_enforces_the_balance_cap(
         "/v1/prepaid/deposits/quote",
         json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": DEPOSIT_SOMPI},
     )
-    assert refused.status_code == 422 and "cap" in refused.json()["detail"]
+    assert refused.status_code == 422
+    assert refused.json()["error"] == "prepaid_cap_exceeded" and "cap" in refused.json()["message"]
 
 
 async def test_deposit_credits_the_merchant_share_and_records_the_split(
@@ -425,7 +426,7 @@ async def test_deposit_credits_the_merchant_share_and_records_the_split(
     receipt = PrepaidDepositReceipt.model_validate(response.json())
     assert receipt.tx_id == tx_id
     assert (receipt.deposit_sompi, receipt.fee_sompi, receipt.credit_sompi) == ("60000000", "20000000", "40000000")
-    assert receipt.balance_sompi == "40000000"
+    assert "balance_sompi" not in receipt.model_dump()  # nor does an unsigned receipt
     assert PaymentResponse.from_header(response.headers[HEADER_PAYMENT_RESPONSE]).txId == tx_id
     assert stub_engine.events == ["verify", "resolve_inputs", "settle"]
     assert await redis.get(prepaid_deposit_key(quote.required.nonce)) is None  # consumed

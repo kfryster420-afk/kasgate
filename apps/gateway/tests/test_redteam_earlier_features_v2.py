@@ -189,9 +189,11 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
     same FOR UPDATE lock. A deposit that would pass only by ignoring a hanging debit is 422; the later 5xx refund
     cannot land the balance past the cap."""
     cap = 60_000_000
-    override_settings(prepaid_max_balance_sompi=cap)
     await add_endpoint(sessionmaker, shop.merchant_id, "half", price_sompi=20_000_000)
+    override_settings(prepaid_max_balance_sompi=100_000_000)
     await fund(client)  # balance 40_000_000
+    stale_quote = await quote_deposit(client)  # fits while nothing is in flight: 40M + 40M <= 100M
+    override_settings(prepaid_max_balance_sompi=cap)
     release = asyncio.Event()
     reached = asyncio.Event()
 
@@ -206,10 +208,16 @@ async def test_hole_a_5xx_debit_refund_lands_past_the_prepaid_cap(
         challenge = await get_debit_challenge(client, slug="half")
         call = asyncio.create_task(client.get("/p/half", headers={HEADER_PREPAID_DEBIT: debit_header(challenge)}))
         await asyncio.wait_for(reached.wait(), 5)  # debited: balance 20_000_000 while the upstream hangs
-        deposited = await post_deposit(client, await quote_deposit(client), tx_id="5e" * 32)
+        deposited = await post_deposit(client, stale_quote, tx_id="5e" * 32)
         # 20M balance + 20M in-flight + 40M credit > 60M cap
         assert deposited.status_code == 422, deposited.text
         assert deposited.json()["error"] == "prepaid_cap_exceeded"
+        # A new quote now gives the same answer (the shared helper counts the in-flight debit), without figures.
+        requote = await client.post(
+            "/v1/prepaid/deposits/quote",
+            json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": DEPOSIT_SOMPI},
+        )
+        assert requote.status_code == 422 and requote.json() == deposited.json(), requote.text
         release.set()
         failed = await call
         assert failed.status_code == 503
