@@ -181,6 +181,12 @@ class StubEngine:
         self.on_verify: Callable[[PaymentSignature], None] | None = None
         self.before_resolve: Callable[[PaymentSignature], Awaitable[None]] | None = None
         self.before_submit: Callable[[PaymentSignature], Awaitable[None]] | None = None
+        # CONTRACT v2.13 refund payouts: (tx_id, to_address, amount) seen by verify_payout / submit_payout.
+        self.payout_checks: list[tuple[str, str, int]] = []
+        self.payout_submits: list[tuple[str, bytes, str, int]] = []
+        self.payout_error: Exception | None = None
+        self.payout_tx_id = "e" * 64
+        self.payout_accepted = True
 
     def _verified(self, signature: PaymentSignature, required: PaymentRequired) -> VerifiedPayment:
         return VerifiedPayment(
@@ -273,6 +279,21 @@ class StubEngine:
         if self.error is not None:
             raise self.error
         return verification.payment
+
+    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None:
+        self.payout_checks.append((tx_id, to_address, amount_sompi))
+        self.events.append("verify_payout")
+        if self.payout_error is not None:
+            raise self.payout_error
+
+    async def submit_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[str, bool]:
+        self.payout_submits.append((transaction, payload, to_address, amount_sompi))
+        self.events.append("submit_payout")
+        if self.payout_error is not None:
+            raise self.payout_error
+        return self.payout_tx_id, self.payout_accepted
 
     def fail(self, code: str, message: str = "rejected") -> None:
         """Make the submission step (`settle`) fail with a verification error."""

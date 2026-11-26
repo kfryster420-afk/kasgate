@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.models import Base
 from tests.conftest import PgServer, alembic_config
 
-HEAD_REVISION = "0007_trials_webhooks"
+HEAD_REVISION = "0008_prepaid_refunds"
 
 
 def _diff(connection: Connection) -> list[Any]:

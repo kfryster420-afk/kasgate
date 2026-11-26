@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     webhook_backoff_max_seconds: float = Field(default=3600.0, gt=0, le=86_400)
     webhook_lease_seconds: int = Field(default=60, ge=15, le=600)
     webhook_max_per_merchant: int = Field(default=10, ge=1, le=100)
+    # CONTRACT v2.13 prepaid ledger worker: credit expiry and re-checks of submitted refund payouts.
+    ledger_worker_enabled: bool = True
+    ledger_poll_interval_seconds: float = Field(default=30.0, gt=0, le=3600)
+    ledger_batch_size: int = Field(default=100, ge=1, le=1000)
+    # A submitted refund payout that the node still cannot see after this long goes back to `requested`.
+    prepaid_payout_pending_max_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
 
     @property
     def address_prefix(self) -> str:

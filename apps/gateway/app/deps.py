@@ -62,6 +62,13 @@ class PaymentVerifier(Protocol):
 
     async def settle_exact_v2(self, verification: ExactV2Verification) -> VerifiedPaymentLike: ...
 
+    # CONTRACT v2.13 prepaid refund payouts (merchant -> buyer, no platform fee)
+    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None: ...
+
+    async def submit_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[str, bool]: ...
+
 
 class RateProvider(Protocol):
     """Structural type of `app.oracle.KasUsdOracle` as used by the proxy."""

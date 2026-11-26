@@ -302,6 +302,27 @@ def check_k402_outputs(tx_id: str, outputs: OutputMap, offer: K402UtxoOffer, min
     )
 
 
+def check_payout_outputs(tx_id: str, outputs: OutputMap, to_address: str, amount_sompi: int) -> int:
+    """CONTRACT v2.13: a refund payout must have an output paying ``to_address`` EXACTLY ``amount_sompi``.
+
+    ``outputs`` maps output index -> ``(value, script)`` (the whole transaction, or only its unspent outputs to
+    ``to_address``). A refund payout is an ordinary merchant -> buyer payment: no treasury output, no platform fee.
+    The exact amount is what ties a txid to one refund request (a merchant cannot pass off an unrelated payment that
+    happens to reach the same address). Returns the matching output index.
+    """
+    script = _script_key(to_address, what="payout address", code="invalid_payout")
+    paying = sorted(index for index, (_, out_script) in outputs.items() if out_script == script)
+    if not paying:
+        raise PaymentVerificationError("invalid_payout", f"transaction {tx_id} has no output to the buyer's address")
+    for index in paying:
+        if outputs[index][0] == amount_sompi:
+            return index
+    values = ", ".join(str(outputs[index][0]) for index in paying)
+    raise PaymentVerificationError(
+        "invalid_payout", f"no output of {tx_id} pays the buyer exactly {amount_sompi} sompi (found {values})"
+    )
+
+
 def _as_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -646,6 +667,106 @@ class KaspaEngine:
                 )
             outputs[index] = (amount, script)
         return outputs
+
+    # ------------------------------------------------------------------ prepaid refund payouts (CONTRACT v2.13)
+
+    def _check_payout_address(self, to_address: str) -> None:
+        prefix = NETWORK_ADDRESS_PREFIX[self._settings.kaspa_network]
+        if not _has_prefix(to_address, prefix):
+            raise PaymentVerificationError(
+                "wrong_network", f"the payout address must use the '{prefix}:' prefix on {self._settings.kaspa_network}"
+            )
+
+    async def verify_payout(self, tx_id: str, to_address: str, amount_sompi: int) -> None:
+        """Check that the merchant's own transaction ``tx_id`` pays ``to_address`` exactly ``amount_sompi`` on-chain.
+
+        Same lookup order as ``verify_k402`` (nothing is submitted): in ``accepted`` mode the sink hash is read first;
+        a mempool entry received by ``to_address`` gives the whole transaction, then the virtual chain is polled until
+        it accepts ``tx_id`` (falling back to the UTXO index once); otherwise the UTXO index (accepted outputs only).
+        Raises ``payment_not_found`` while the payout is not visible or not accepted yet, ``invalid_payout`` when it
+        does not pay the exact amount, ``RpcUnavailableError`` when the node cannot answer.
+        """
+        self._check_payout_address(to_address)
+        accepted_mode = self._settings.settlement_mode == "accepted"
+        addresses = [to_address.lower()]
+        start_hash = await self._sink_hash() if accepted_mode else ""
+        mempool_response = await self._rpc(
+            "get_mempool_entries_by_addresses",
+            lambda client: client.get_mempool_entries_by_addresses(
+                {"addresses": addresses, "includeOrphanPool": False, "filterTransactionPool": False}
+            ),
+        )
+        in_mempool = self._k402_mempool_outputs(mempool_response, tx_id)
+        if in_mempool is not None:
+            check_payout_outputs(tx_id, in_mempool, to_address, amount_sompi)
+            if accepted_mode:
+                try:
+                    await self._wait_for_acceptance(tx_id, start_hash)
+                except RpcUnavailableError as exc:
+                    if not await self._k402_utxo_outputs(addresses, tx_id):
+                        raise PaymentVerificationError(
+                            "payment_not_found", f"payout {tx_id} is not accepted yet; check again shortly"
+                        ) from exc
+            return
+        accepted_outputs = await self._k402_utxo_outputs(addresses, tx_id)
+        if not accepted_outputs:
+            raise PaymentVerificationError(
+                "payment_not_found", f"payout {tx_id} does not pay the buyer on this node yet; check again shortly"
+            )
+        check_payout_outputs(tx_id, accepted_outputs, to_address, amount_sompi)
+
+    async def submit_payout(
+        self, transaction: str, payload: bytes, to_address: str, amount_sompi: int
+    ) -> tuple[str, bool]:
+        """Broadcast a merchant-signed refund payout and wait for finality per ``settlement_mode``.
+
+        Returns ``(tx_id, accepted)``: ``accepted`` is False when the node took the transaction but did not accept it
+        within ``settlement_timeout_seconds`` (the caller records it as submitted and re-checks later).
+
+        The transaction must carry ``payload`` (``kasgate:v1:refund:<refund id hex>``) and pay ``to_address`` exactly
+        ``amount_sompi``; the node checks the merchant's inputs and signatures. Raises ``invalid_payout``,
+        ``tx_rejected`` (node refused it) or ``RpcUnavailableError``.
+        """
+        self._check_payout_address(to_address)
+        try:
+            raw = json.loads(transaction)
+        except (ValueError, RecursionError) as exc:
+            raise PaymentVerificationError("invalid_payout", "transaction is not valid JSON") from exc
+        if not isinstance(raw, dict):
+            raise PaymentVerificationError("invalid_payout", "transaction must be a JSON object")
+        try:
+            tx = Transaction.from_dict(raw)
+            tx.finalize()
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise PaymentVerificationError("invalid_payout", f"not a valid Kaspa transaction: {exc}") from exc
+        if not tx.inputs:
+            raise PaymentVerificationError("invalid_payout", "transaction has no inputs")
+        if tx.subnetwork != NATIVE_SUBNETWORK_ID or tx.gas != 0:
+            raise PaymentVerificationError("invalid_payout", "only native-subnetwork transactions are accepted")
+        if str(tx.payload or "").lower() != payload.hex():
+            raise PaymentVerificationError(
+                "invalid_payout", f"transaction payload must be {payload.decode('ascii')!r} (hex {payload.hex()})"
+            )
+        outputs: OutputMap = {}
+        for index, output in enumerate(tx.outputs):
+            script = parse_script_key(output.script_public_key)
+            if script is None:
+                raise PaymentVerificationError("invalid_payout", f"output {index} has an unreadable script")
+            outputs[index] = (int(output.value), script)
+        tx_id = str(tx.id)
+        check_payout_outputs(tx_id, outputs, to_address, amount_sompi)
+        accepted_mode = self._settings.settlement_mode == "accepted"
+        start_hash = await self._sink_hash() if accepted_mode else ""
+        already_accepted = await self._submit(tx, tx_id)
+        if accepted_mode and not already_accepted:
+            try:
+                await self._wait_for_acceptance(tx_id, start_hash)
+            except RpcUnavailableError as exc:
+                logger.warning("refund payout %s submitted but not accepted yet: %s", tx_id, exc.message)
+                return tx_id, False
+        return tx_id, True
 
     # ------------------------------------------------------------------ kaspa-exact-v2 (CONTRACT v2.10)
 
