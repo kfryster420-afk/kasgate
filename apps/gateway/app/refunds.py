@@ -52,9 +52,13 @@ from app.ledger import (
     note_attempt_transient,
     note_attempt_unseen,
     refund_event_data,
+    refundable_covers,
+    refundable_sompi,
     spendable_sompi,
 )
 from app.models import (
+    CREDIT_REASON_ATTEMPTS_EXHAUSTED,
+    LEDGER_KIND_FAILED_DELIVERY_CREDIT,
     PAYOUT_ATTEMPT_ABANDONED,
     PAYOUT_ATTEMPT_DUPLICATE,
     PAYOUT_ATTEMPT_INVALID,
@@ -79,7 +83,11 @@ from app.models import (
 from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
+    HEADER_CREDIT_SUMMARY,
+    MAX_SUMMARY_CREDITS,
     SLUG_RE,
+    BuyerCreditItem,
+    BuyerCreditSummary,
     PrepaidLedgerEntryRead,
     PrepaidRefundChallenge,
     PrepaidRefundChallengeRequest,
@@ -364,6 +372,8 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
         logger.exception("refund challenge lookup failed")
         return _store_unavailable()
     available = spendable_sompi(balance)
+    # CONTRACT v2.14: failed-delivery credit is call-only, so a refund may take only deposited, unspent credit.
+    refundable = refundable_sompi(balance)
     if payload.action == "status":
         if balance is None:
             return _error(404, "refund_not_found", "this key has no prepaid balance at this merchant")
@@ -371,19 +381,20 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
     elif payload.action == "request":
         if open_refund is not None:
             return _error(409, "refund_already_open", f"refund {open_refund.id} is still open for this balance")
-        amount = payload.amount_sompi if payload.amount_sompi is not None else available
+        amount = payload.amount_sompi if payload.amount_sompi is not None else refundable
         if amount < settings.min_output_sompi:
             return _error(
                 422,
                 "refund_too_small",
                 f"a refund must be at least {settings.min_output_sompi} sompi (the smallest standard Kaspa output); "
-                f"spendable credit is {available} sompi",
+                f"refundable credit is {refundable} sompi (failed-delivery credit is spendable on calls only)",
             )
-        if amount > available:
+        if amount > refundable:
             return _error(
                 409,
                 "insufficient_balance",
-                f"the spendable prepaid credit ({available} sompi) does not cover a {amount} sompi refund",
+                f"the refundable prepaid credit ({refundable} sompi) does not cover a {amount} sompi refund "
+                "(failed-delivery credit is spendable on calls only)",
             )
         refund_id = None
     else:
@@ -425,6 +436,7 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
         refund_id=refund_id,
         spendable_sompi=str(available),
         expires_at=stored.expires_at,
+        refundable_sompi=str(refundable),
     )
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -452,8 +464,7 @@ async def create_refund(signed: PrepaidRefundSigned, session: DbSession, redis: 
                 .where(
                     PrepaidBalance.merchant_id == stored.merchant_id,
                     PrepaidBalance.payer_public_key == stored.payer_public_key,
-                    PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi >= amount,
-                    or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
+                    refundable_covers(amount),
                 )
                 .values(refund_hold_sompi=PrepaidBalance.refund_hold_sompi + amount, updated_at=func.now())
                 .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
@@ -463,7 +474,7 @@ async def create_refund(signed: PrepaidRefundSigned, session: DbSession, redis: 
             await session.rollback()
             await _consume_challenge(redis, signed.nonce)
             return _error(
-                409, "insufficient_balance", "the spendable prepaid credit no longer covers this refund; ask again"
+                409, "insufficient_balance", "the refundable prepaid credit no longer covers this refund; ask again"
             )
         balance_id, balance = held
         refund = PrepaidRefund(
@@ -645,13 +656,57 @@ async def signed_refund_status(signed: PrepaidRefundSigned, session: DbSession, 
                 )
             ).scalars()
         )
+        summary = await _credit_summary(session, stored.merchant_id, stored.payer_public_key)
     except SQLAlchemyError:
         logger.exception("signed refund status lookup failed")
         return _store_unavailable()
     await _consume_challenge(redis, signed.nonce)
     return JSONResponse(
         content=[PrepaidRefundRead.model_validate(row).model_dump(mode="json") for row in rows],
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store", HEADER_CREDIT_SUMMARY: summary.to_header()},
+    )
+
+
+async def _credit_summary(session: AsyncSession, merchant_id: uuid.UUID, public_key: str) -> BuyerCreditSummary:
+    """CONTRACT v2.14: the signing buyer's failed-delivery credit at this merchant (for the signed status reply)."""
+    balance = await _balance_of(session, merchant_id, public_key)
+    rows: list[PrepaidLedgerEntry] = []
+    count = 0
+    if balance is not None:
+        is_credit = (PrepaidLedgerEntry.balance_id == balance.id) & (
+            PrepaidLedgerEntry.kind == LEDGER_KIND_FAILED_DELIVERY_CREDIT
+        )
+        count = int(
+            (await session.execute(select(func.count()).select_from(PrepaidLedgerEntry).where(is_credit))).scalar_one()
+        )
+        rows = list(
+            (
+                await session.execute(
+                    select(PrepaidLedgerEntry)
+                    .where(is_credit)
+                    .order_by(PrepaidLedgerEntry.created_at.desc(), PrepaidLedgerEntry.id)
+                    .limit(MAX_SUMMARY_CREDITS)
+                )
+            ).scalars()
+        )
+    credits = [
+        BuyerCreditItem(
+            txId=row.tx_id or "",
+            slug=row.slug or "",
+            creditSompi=str(row.amount_sompi),
+            shortfallSompi=str(row.shortfall_sompi),
+            reason="attempts_exhausted" if row.credit_reason == CREDIT_REASON_ATTEMPTS_EXHAUSTED else "window_expired",
+            createdAt=row.created_at,
+        )
+        for row in rows
+    ]
+    return BuyerCreditSummary(
+        merchantId=merchant_id,
+        creditedSompi=str(0 if balance is None else balance.credited_sompi),
+        creditBalanceSompi=str(0 if balance is None else balance.credit_balance_sompi),
+        refundableSompi=str(refundable_sompi(balance)),
+        creditCount=count,
+        credits=credits,
     )
 
 
@@ -983,7 +1038,7 @@ async def list_ledger(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[PrepaidLedgerEntryRead]:
-    """Refund payouts and expiries on this merchant's prepaid balances, newest first."""
+    """Refund payouts, expiries and failed-delivery credits on this merchant's prepaid balances, newest first."""
     rows = (
         await session.execute(
             select(PrepaidLedgerEntry)

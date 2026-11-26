@@ -17,11 +17,12 @@ KasGate holds no coins in any of these steps; they only change the off-chain rec
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -39,6 +40,8 @@ from app.models import (
     PREPAID_REFUND_PAYOUT_SUBMITTED,
     PREPAID_REFUND_REJECTED,
     PREPAID_REFUND_REQUESTED,
+    Endpoint,
+    Merchant,
     PrepaidBalance,
     PrepaidLedgerEntry,
     PrepaidRefund,
@@ -48,6 +51,9 @@ from app.payments import PaymentVerificationError, RpcUnavailableError
 from app.webhooks import enqueue_event
 
 logger = logging.getLogger("kasgate.ledger")
+
+# An extra worker pass (e.g. the failed-delivery credit sweep): (sessionmaker, batch size) -> rows changed.
+LedgerPass = Callable[[async_sessionmaker[AsyncSession], int], Awaitable[int]]
 
 MAX_ERROR_CHARS: Final = 300
 
@@ -65,6 +71,24 @@ def spendable_sompi(balance: PrepaidBalance | None, now: datetime | None = None)
     return max(0, balance.balance_sompi - balance.refund_hold_sompi)
 
 
+def refundable_sompi(balance: PrepaidBalance | None, now: datetime | None = None) -> int:
+    """CONTRACT v2.14: what a refund request may take: spendable credit minus the unspent failed-delivery credit.
+
+    Failed-delivery credit is call-only: debits spend it first and a refund never pays it out on-chain.
+    """
+    if balance is None:
+        return 0
+    return max(0, spendable_sompi(balance, now) - balance.credit_balance_sompi)
+
+
+def refundable_covers(amount: int | ColumnElement[int]) -> ColumnElement[bool]:
+    """SQL guard for a refund hold of `amount`: deposited, unspent and unexpired credit covers it (v2.13 + v2.14)."""
+    return and_(
+        PrepaidBalance.balance_sompi - PrepaidBalance.refund_hold_sompi - PrepaidBalance.credit_balance_sompi >= amount,
+        or_(PrepaidBalance.expires_at.is_(None), PrepaidBalance.expires_at > func.now()),
+    )
+
+
 def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -> dict[str, str | None]:
     data: dict[str, str | None] = {
         "refund_id": str(refund.id),
@@ -79,6 +103,43 @@ def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -
     if balance_sompi is not None:
         data["balance_sompi"] = str(balance_sompi)
     return data
+
+
+async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:
+    """CONTRACT v2.13: the endpoint's credit expiry override, else the merchant default; None = never expires."""
+    if endpoint.prepaid_expiry_days is not None:
+        return endpoint.prepaid_expiry_days
+    days: int | None = (
+        await session.execute(select(Merchant.prepaid_expiry_days).where(Merchant.id == endpoint.merchant_id))
+    ).scalar_one_or_none()
+    return days
+
+
+async def credit_expiry(
+    session: AsyncSession, endpoint: Endpoint
+) -> tuple[datetime | None, ColumnElement[datetime | None]]:
+    """Expiry for credit landing on a balance through `endpoint` (a deposit or a failed-delivery credit).
+
+    Uses the v2.13 policy in force now (the endpoint's `prepaid_expiry_days`, else the merchant default), never
+    retroactively: `expires_at = max(current expires_at, now + policy days)`. A later existing expiry is not
+    shortened. Returns the `expires_at` of a NEW balance and the expression for an EXISTING one: new credit gets
+    the policy expiry, an existing later expiry is kept, credit already promised "never expires" keeps that
+    promise, and a "never" policy clears the expiry (same rules as a deposit).
+    """
+    days = await expiry_policy_days(session, endpoint)
+    new_expiry = None if days is None else datetime.now(UTC) + timedelta(days=days)
+    next_expiry: ColumnElement[datetime | None]
+    if new_expiry is None:
+        next_expiry = literal(None, PrepaidBalance.expires_at.type)
+    else:
+        promised_never = and_(
+            PrepaidBalance.expires_at.is_(None), PrepaidBalance.balance_sompi > PrepaidBalance.refund_hold_sompi
+        )
+        next_expiry = case(
+            (promised_never, literal(None, PrepaidBalance.expires_at.type)),
+            else_=func.greatest(func.coalesce(PrepaidBalance.expires_at, new_expiry), new_expiry),
+        )
+    return new_expiry, next_expiry
 
 
 @dataclass(frozen=True)
@@ -210,6 +271,7 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
         return None
     amount = refund.amount_sompi
     late_from: str | None = None
+    from_credit = 0
     if refund.status in PREPAID_REFUND_OPEN_STATUSES:
         debit, hold_release = amount, amount
         note = "refund paid on-chain by the merchant"
@@ -217,6 +279,15 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
         late_from = refund.status
         hold_release = await _supersede_open_refund(session, refund, attempt.tx_id, balance_row, amount, now)
         debit = min(amount, max(0, balance_row.balance_sompi - (balance_row.refund_hold_sompi - hold_release)))
+        # CONTRACT v2.14: the coins already reached the buyer, so the re-debit takes deposited credit first and only
+        # then call-only failed-delivery credit (it never stays spendable next to an on-chain payout of the same sompi).
+        deposited_free = max(
+            0,
+            balance_row.balance_sompi
+            - (balance_row.refund_hold_sompi - hold_release)
+            - balance_row.credit_balance_sompi,
+        )
+        from_credit = max(0, debit - deposited_free)
         note = clip(
             f"late payout of a {late_from} refund: re-debited {debit} sompi"
             + (f", {amount - debit} sompi already spent or expired" if debit < amount else "")
@@ -230,6 +301,7 @@ async def finalize_payout(session: AsyncSession, attempt_id: uuid.UUID) -> PaidR
                     balance_sompi=PrepaidBalance.balance_sompi - debit,
                     refund_hold_sompi=PrepaidBalance.refund_hold_sompi - hold_release,
                     refunded_sompi=PrepaidBalance.refunded_sompi + debit,
+                    credit_balance_sompi=PrepaidBalance.credit_balance_sompi - from_credit,
                     updated_at=func.now(),
                 )
                 .returning(PrepaidBalance.balance_sompi)
@@ -307,6 +379,8 @@ async def expire_balance(session: AsyncSession, balance_id: uuid.UUID) -> int:
             .values(
                 balance_sompi=PrepaidBalance.balance_sompi - amount,
                 expired_sompi=PrepaidBalance.expired_sompi + amount,
+                # CONTRACT v2.14: unspent failed-delivery credit is part of what expires.
+                credit_balance_sompi=0,
                 updated_at=func.now(),
             )
             .returning(PrepaidBalance.balance_sompi)
@@ -618,21 +692,32 @@ async def recheck_payout_attempts(maker: async_sessionmaker[AsyncSession], engin
     return paid
 
 
-async def run_ledger_pass(maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier) -> int:
-    """One worker pass: expire due balances, then re-check submitted payouts. Returns the rows it changed."""
+async def run_ledger_pass(
+    maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier, extra_passes: Sequence[LedgerPass] = ()
+) -> int:
+    """One worker pass: expire due balances, re-check submitted payouts, then any extra passes (failed-delivery
+    credits). Returns the rows it changed."""
     limit = get_settings().ledger_batch_size
     async with maker() as session:
         changed = await expire_due_balances(session, limit)
     changed += await recheck_payout_attempts(maker, engine, limit)
+    for extra in extra_passes:
+        changed += await extra(maker, limit)
     return changed
 
 
 class LedgerWorker:
     """Background prepaid-ledger worker started by the app lifespan (safe to run on several replicas)."""
 
-    def __init__(self, maker: async_sessionmaker[AsyncSession], engine: PaymentVerifier) -> None:
+    def __init__(
+        self,
+        maker: async_sessionmaker[AsyncSession],
+        engine: PaymentVerifier,
+        extra_passes: Sequence[LedgerPass] = (),
+    ) -> None:
         self._maker = maker
         self._engine = engine
+        self._extra_passes = tuple(extra_passes)
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -654,7 +739,7 @@ class LedgerWorker:
         interval = get_settings().ledger_poll_interval_seconds
         while not self._stopping:
             try:
-                await run_ledger_pass(self._maker, self._engine)
+                await run_ledger_pass(self._maker, self._engine, self._extra_passes)
             except asyncio.CancelledError:
                 raise
             except Exception:
