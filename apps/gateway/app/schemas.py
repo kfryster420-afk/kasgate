@@ -59,7 +59,8 @@ HEADER_K402_PAYMENT = "X-K402-Payment"
 # CONTRACT v2.11 prepaid credit: the signed debit on a paid call and the debit receipt on its response.
 HEADER_PREPAID_DEBIT = "X-KasGate-Prepaid"
 HEADER_PREPAID_RECEIPT = "X-KasGate-Prepaid-Receipt"
-# Buyer-signed GET /v1/prepaid/balance: unix seconds + Schnorr signature over build_prepaid_balance_read_message.
+# Buyer-signed GET /v1/prepaid/balance and GET /v1/prepaid/refunds/status: unix seconds + Schnorr signature
+# over build_prepaid_balance_read_message / build_prepaid_refunds_read_message (same headers, distinct Purpose).
 HEADER_BALANCE_TIMESTAMP = "X-KasGate-Balance-Timestamp"
 HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 # CONTRACT v2.12 free trial calls: the offer on a 402, the signed trial call, and the trial state on its response.
@@ -92,6 +93,7 @@ SLUG_RE = r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
 PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
+PREPAID_REFUNDS_READ_PURPOSE = "kasgate:v1:refunds-status-read"
 PREPAID_BALANCE_READ_TOLERANCE_SECONDS = 300
 # Body-Hash of a request without a body.
 PREPAID_EMPTY_BODY_HASH = "-"
@@ -283,6 +285,19 @@ def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, 
         "KasGate\n"
         f"Domain: {domain}\n"
         f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Slug: {slug}\n"
+        f"Timestamp: {timestamp}"
+    )
+
+
+def build_prepaid_refunds_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
+    """The text a buyer signs to read GET /v1/prepaid/refunds/status. Same shape as the balance-read message;
+    a distinct Purpose so the signature cannot be reused for a balance read (or anything else)."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_REFUNDS_READ_PURPOSE}\n"
         f"Address: {address}\n"
         f"Slug: {slug}\n"
         f"Timestamp: {timestamp}"
@@ -839,6 +854,7 @@ class PrepaidOffer(StrictModel):
     depositQuoteUrl: str
     depositUrl: str
     challengeUrl: str
+    # Unsigned GET of this URL returns spendable_sompi (and expires_at); agents should not expect balance_sompi.
     balanceUrl: str
 
 
@@ -1644,13 +1660,13 @@ class PrepaidReceipt(X402Header):
 
 
 class PrepaidBalanceRead(BaseModel):
-    """Ledger totals (`deposited` / `debited` / `refunded` / `expired` / `refund_hold`) are null on the public
-    balance read unless the buyer signs it (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature).
-    `balance_sompi` and `spendable_sompi` stay public. Merchant views always carry every field."""
+    """Unsigned public GET /v1/prepaid/balance returns only `spendable_sompi` and `expires_at`; every other field
+    is null (including `merchant_id`, `payer_address`, `balance_sompi` and `updated_at`). A buyer-signed read
+    (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature) and merchant views fill every field."""
 
-    merchant_id: uuid.UUID
-    payer_address: str
-    balance_sompi: BalanceSompiStr
+    merchant_id: uuid.UUID | None
+    payer_address: str | None
+    balance_sompi: BalanceSompiStr | None
     deposited_sompi: BalanceSompiStr | None
     debited_sompi: BalanceSompiStr | None
     updated_at: datetime | None
@@ -1663,7 +1679,7 @@ class PrepaidBalanceRead(BaseModel):
     Signed-only on the public read.
     """
     spendable_sompi: BalanceSompiStr = "0"
-    """What calls can be paid from right now: balance minus the refund hold, or 0 once expired. Always public."""
+    """What calls can be paid from right now: balance minus the refund hold, or 0 once expired. Public unsigned."""
     expires_at: datetime | None = None
 
 
@@ -2008,6 +2024,9 @@ _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa
 NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
 IPV4_COMPATIBLE = ipaddress.ip_network("::/96")  # deprecated by RFC 4291; still routed to the v4 host by some stacks
 SITE_LOCAL = ipaddress.ip_network("fec0::/10")  # deprecated by RFC 3879; Python counts it as global
+# RFC 2765 SIIT IPv4-translated (not the v4-mapped ::ffff:0.0.0.0/96). Written unshortened so Python cannot
+# parse it as a mapped address.
+SIIT_IPV4_TRANSLATED = ipaddress.ip_network("0:0:0:0:ffff:0:0:0/96")
 
 
 def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
@@ -2027,11 +2046,12 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
 def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """True unless `ip` is a public unicast address (and, for IPv6, so is every IPv4 address it tunnels to).
 
-    The whole IPv4-compatible ``::/96`` block and site-local ``fec0::/10`` are refused outright: neither is a real
-    public destination, and both slip past ``is_global``.
+    The whole IPv4-compatible ``::/96`` block, site-local ``fec0::/10`` and SIIT IPv4-translated
+    ``0:0:0:0:ffff:0:0:0/96`` (``::ffff:0:0:0/96``) are refused outright: none is a real public destination, and
+    they slip past ``is_global``.
     """
     if isinstance(ip, ipaddress.IPv6Address):
-        if ip in IPV4_COMPATIBLE or ip in SITE_LOCAL:
+        if ip in IPV4_COMPATIBLE or ip in SITE_LOCAL or ip in SIIT_IPV4_TRANSLATED:
             return True
         if any(is_forbidden_ip(inner) for inner in _embedded_ipv4(ip)):
             return True

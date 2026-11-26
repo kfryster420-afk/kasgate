@@ -557,7 +557,7 @@ def build_server(
     async def prepaid_refunds(slug: str, include_reasons: bool = False) -> dict[str, Any]:
         """This buyer key's refund requests at the merchant behind `slug`, newest first.
 
-        By default a public read that signs nothing (the merchant's reject reasons are withheld). With
+        The default list is buyer-signed (same scheme as prepaid_balance; reasons stay withheld). With
         include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
         slug = validate_slug(slug)
         try:

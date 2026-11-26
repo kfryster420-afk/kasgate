@@ -18,6 +18,7 @@ from app.schema_guard import STALE_0008_MESSAGE, check_database_schema
 from tests.conftest import PAYER_ADDRESS, PgServer, Seed, SettingsOverride, StubEngine, bearer
 from tests.test_k402 import make_engine
 from tests.test_prepaid import CREDIT_SOMPI, fund
+from tests.test_prepaid_balance_privacy import refunds_status_headers
 from tests.test_refund_hardening import age, attempts_of, cancel, claim
 from tests.test_refund_payouts import AMOUNT, REFUND_ID, PayloadMempoolNode, bound_tx, payout_tx
 from tests.test_refunds import (
@@ -191,7 +192,11 @@ async def test_claim_details_are_hidden_publicly_and_shown_to_the_merchant_and_s
     assert body["status"] == "paying" and body["first_claimed_at"] == body["claimed_at"]
     claimed_at = datetime.fromisoformat(body["claimed_at"])
     assert datetime.fromisoformat(body["claim_expires_at"]) == claimed_at + timedelta(seconds=900)
-    public = await client.get("/v1/prepaid/refunds/status", params={"slug": shop.slug, "payer_address": PAYER_ADDRESS})
+    public = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": shop.slug, "payer_address": PAYER_ADDRESS},
+        headers=refunds_status_headers(slug=shop.slug),
+    )
     row = public.json()[0]
     assert row["status"] == "requested"
     assert row["claimed_at"] is None and row["first_claimed_at"] is None and row["claim_expires_at"] is None

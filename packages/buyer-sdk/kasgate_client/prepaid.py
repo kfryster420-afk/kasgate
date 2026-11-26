@@ -26,6 +26,7 @@ HEADER_BALANCE_SIGNATURE = "X-KasGate-Balance-Signature"
 PREPAID_SCHEME = "kasgate-prepaid-v1"
 PREPAID_DEBIT_PURPOSE = "kasgate:v1:prepaid-debit"
 PREPAID_BALANCE_READ_PURPOSE = "kasgate:v1:prepaid-balance-read"
+PREPAID_REFUNDS_READ_PURPOSE = "kasgate:v1:refunds-status-read"
 PREPAID_EMPTY_BODY_HASH = "-"
 PREPAID_RECEIPT_EXTENSION = "kasgate_prepaid_receipt"
 DEPOSIT_QUOTE_PATH = "/v1/prepaid/deposits/quote"
@@ -91,13 +92,13 @@ class PrepaidChallenge(_Model):
 
 
 class PrepaidBalance(_Model):
-    """Ledger totals (`deposited` / `debited` / `refunded` / `expired` / `refund_hold`) are only returned on a
-    buyer-signed read (the SDK always signs); an unsigned public read leaves them None. `balance_sompi` and
-    `spendable_sompi` stay public."""
+    """Ledger totals, `balance_sompi`, identity fields and `updated_at` are only returned on a buyer-signed
+    read (the SDK always signs). An unsigned public read leaves them None and returns only `spendable_sompi`
+    and `expires_at`. Fields are Optional so an older or unsigned payload still parses."""
 
-    merchant_id: uuid.UUID
-    payer_address: str
-    balance_sompi: BalanceStr
+    merchant_id: uuid.UUID | None = None
+    payer_address: str | None = None
+    balance_sompi: BalanceStr | None = None
     deposited_sompi: BalanceStr | None = None
     debited_sompi: BalanceStr | None = None
     updated_at: datetime | None = None
@@ -132,8 +133,9 @@ class PrepaidRefund(_Model):
     """A refund request of unused prepaid credit. `paid` means the merchant's payout `tx_id` was accepted on-chain.
 
     `paying`: the merchant claimed it and is paying (it can no longer be cancelled until `claim_expires_at`). The
-    public list hides `reason`, `last_error` and the claim (`paying` reads as `requested`, claim times null);
-    `prepaid_refunds(..., signed=True)` returns them. `hold_until`: a refund cancelled after a claim keeps its
+    GET list is buyer-signed (headers, Purpose `kasgate:v1:refunds-status-read`) and still hides `reason`,
+    `last_error` and the claim (`paying` reads as `requested`, claim times null);
+    `prepaid_refunds(..., signed=True)` (POST status challenge) returns them. `hold_until`: a refund cancelled after a claim keeps its
     amount set aside until then (a payout may still land). `late_paid_from` is set when the payout landed after the
     refund was cancelled or rejected (`shortfall_sompi`: credit already gone by then)."""
 
@@ -166,6 +168,18 @@ def build_prepaid_balance_read_message(*, domain: str, address: str, slug: str, 
         "KasGate\n"
         f"Domain: {domain}\n"
         f"Purpose: {PREPAID_BALANCE_READ_PURPOSE}\n"
+        f"Address: {address}\n"
+        f"Slug: {slug}\n"
+        f"Timestamp: {timestamp}"
+    )
+
+
+def build_prepaid_refunds_read_message(*, domain: str, address: str, slug: str, timestamp: int) -> str:
+    """The text signed to read GET /v1/prepaid/refunds/status (byte-identical to the gateway's)."""
+    return (
+        "KasGate\n"
+        f"Domain: {domain}\n"
+        f"Purpose: {PREPAID_REFUNDS_READ_PURPOSE}\n"
         f"Address: {address}\n"
         f"Slug: {slug}\n"
         f"Timestamp: {timestamp}"
