@@ -4,8 +4,9 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -30,7 +31,7 @@ from app.schemas import (
     HEADER_TRIAL_REMAINING,
     HealthStatus,
 )
-from app.security import build_upstream_client, build_webhook_client
+from app.security import RateLimited, build_upstream_client, build_webhook_client
 from app.trials import router as trials_router
 from app.webhooks import WebhookDispatcher
 from app.webhooks import router as webhooks_router
@@ -100,6 +101,10 @@ def create_app() -> FastAPI:
     app.include_router(trials_router)
     app.include_router(webhooks_router)
     app.include_router(proxy_router)
+
+    @app.exception_handler(RateLimited)
+    async def rate_limited_handler(_request: Request, exc: RateLimited) -> JSONResponse:
+        return exc.response()
 
     @app.get("/healthz", response_model=HealthStatus, tags=["system"])
     async def healthz(

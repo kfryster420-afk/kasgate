@@ -822,6 +822,12 @@ async def test_test_fire_is_rate_limited_per_merchant(
         assert fired.status_code == 200, fired.text
     limited = await client.post(f"/v1/webhooks/{first.webhook.id}/test", headers=bearer(seeded.api_key))
     assert limited.status_code == 429, limited.text
+    assert limited.json() == {
+        "error": "rate_limited",
+        "message": "rate limit exceeded; retry later",
+        "k402": None,
+        "accepts": None,
+    }
     assert 0 < int(limited.headers["Retry-After"]) <= 60
     assert len(webhook_receiver.requests) == 2  # the refused fire sent nothing
     assert len(await events(sessionmaker)) == 2  # and queued nothing

@@ -20,6 +20,7 @@ import httpcore
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from kaspa import PublicKey, verify_message
 from redis.asyncio import Redis
@@ -45,6 +46,7 @@ from app.schemas import (
     HEADER_TRIAL_REMAINING,
     NONCE_RE,
     REGISTER_PURPOSE,
+    X402ErrorBody,
     build_auth_challenge,
 )
 from app.schemas import (
@@ -578,12 +580,31 @@ RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hou
 RATE_LIMIT_WEBHOOK_TEST = RateLimit("webhook_test", "rl_webhook_test_per_minute", 60)
 
 
+RATE_LIMITED_MESSAGE = "rate limit exceeded; retry later"
+
+
+class RateLimited(Exception):
+    """The limiter rejected this request. The app handler turns it into a 429 X402ErrorBody (`rate_limited`)."""
+
+    def __init__(self, retry_after: int, message: str = RATE_LIMITED_MESSAGE) -> None:
+        self.retry_after = retry_after
+        self.message = message
+
+    def response(self) -> JSONResponse:
+        content = X402ErrorBody(error="rate_limited", message=self.message).model_dump(mode="json")
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content=content,
+            headers={"Retry-After": str(self.retry_after)},
+        )
+
+
 def client_ip(request: Request) -> str:
     return request.client.host if request.client is not None else "unknown"
 
 
 async def enforce_rate_limit(redis: Redis, rule: RateLimit, subject: str) -> None:
-    """Count one hit for `subject` in the current window; raise 429 with Retry-After when over the limit.
+    """Count one hit for `subject` in the current window; raise RateLimited (429 + Retry-After) when over the limit.
 
     INCR, EXPIRE NX and TTL run in one MULTI/EXEC, so the window is armed atomically on the first hit and a
     key can never be left without an expiry. Limits and switches come from `Settings`: with
@@ -613,11 +634,7 @@ async def enforce_rate_limit(redis: Redis, rule: RateLimit, subject: str) -> Non
         return
     if int(count) > limit:
         retry_after = int(ttl) if int(ttl) > 0 else rule.window_seconds
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="rate limit exceeded; retry later",
-            headers={"Retry-After": str(retry_after)},
-        )
+        raise RateLimited(retry_after)
 
 
 def limit_by_ip(rule: RateLimit) -> Callable[[Request, Redis], Awaitable[None]]:
