@@ -4,11 +4,11 @@ KasGate holds no keys and no coins. The deposit already paid the merchant on-cha
 FROM the merchant's own wallet TO the depositing address: no platform fee and no treasury output (money being
 returned is never taxed). The gateway only keeps the record:
 
-1. Buyer: ``POST /v1/prepaid/refunds/challenge`` (action ``request``, optional ``amount_sompi`` = all spendable credit
-   when omitted) -> a single-use challenge; sign it with the depositing key; ``POST /v1/prepaid/refunds`` ->
-   201 refund ``requested``. The amount moves into the balance's ``refund_hold_sompi`` (still owed, no longer
-   spendable). At most one open request per balance; at least ``MIN_OUTPUT_SOMPI`` (a smaller payout output is not
-   standard on Kaspa).
+1. Buyer: ``POST /v1/prepaid/refunds/challenge`` (action ``request``, optional ``amount_sompi`` = all refundable credit
+   when omitted; the unsigned reply does not include spendable or refundable totals) -> a single-use challenge; sign
+   it with the depositing key; ``POST /v1/prepaid/refunds`` -> 201 refund ``requested``. The amount moves into the
+   balance's ``refund_hold_sompi`` (still owed, no longer spendable). At most one open request per balance; at least
+   ``MIN_OUTPUT_SOMPI`` (a smaller payout output is not standard on Kaspa).
 2. Merchant [Bearer]: ``POST /v1/prepaid/refunds/{id}/claim`` (-> ``paying``) BEFORE broadcasting, so the buyer can
    no longer cancel; then ``POST /v1/prepaid/refunds/{id}/payout`` with the ``tx_id`` of a payment they broadcast
    (KasWare ``sendKaspa(payout_address, amount, {payload})``) or a signed ``transaction`` for the gateway to
@@ -61,7 +61,6 @@ from app.ledger import (
     refund_event_data,
     refundable_covers,
     refundable_sompi,
-    spendable_sompi,
 )
 from app.models import (
     CREDIT_REASON_ATTEMPTS_EXHAUSTED,
@@ -179,8 +178,10 @@ def decode_credit_status_cursor(token: str) -> tuple[datetime, uuid.UUID, uuid.U
         created_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         if created_at.tzinfo is None:
             return None
+        # astimezone(UTC) raises OverflowError (an ArithmeticError, not ValueError) when the UTC instant
+        # falls outside year 1..9999, e.g. 9999-12-31T23:59:59-01:00. Any parse/convert failure is invalid_cursor.
         return created_at.astimezone(UTC), uuid.UUID(credit_id), uuid.UUID(merchant_id), public_key
-    except (ValueError, UnicodeDecodeError, binascii.Error):
+    except (ValueError, OverflowError, ArithmeticError, TypeError, OSError, UnicodeDecodeError, binascii.Error):
         return None
 
 
@@ -436,8 +437,8 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
     except SQLAlchemyError:
         logger.exception("refund challenge lookup failed")
         return _store_unavailable()
-    available = spendable_sompi(balance)
     # CONTRACT v2.14: failed-delivery credit is call-only, so a refund may take only deposited, unspent credit.
+    # spendable/refundable totals stay off this unsigned response so credit cannot be derived from it.
     refundable = refundable_sompi(balance)
     if payload.action == "status":
         if balance is None:
@@ -499,9 +500,7 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
         payer_address=payload.payer_address,
         amount_sompi=str(amount),
         refund_id=refund_id,
-        spendable_sompi=str(available),
         expires_at=stored.expires_at,
-        refundable_sompi=str(refundable),
     )
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -857,7 +856,6 @@ async def credit_status_challenge(
         endpoint = await _endpoint_merchant(session, payload.slug)
         if endpoint is None:
             return _error(404, "endpoint_not_found", f"no active endpoint with slug '{payload.slug}'")
-        balance = await _balance_of(session, endpoint.merchant_id, public_key)
     except SQLAlchemyError:
         logger.exception("credit status challenge lookup failed")
         return _store_unavailable()
@@ -886,8 +884,6 @@ async def credit_status_challenge(
         payer_address=payload.payer_address,
         amount_sompi="0",
         refund_id=None,
-        spendable_sompi=str(spendable_sompi(balance)),
-        refundable_sompi=str(refundable_sompi(balance)),
         expires_at=stored.expires_at,
     )
     return JSONResponse(

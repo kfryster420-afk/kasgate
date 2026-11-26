@@ -20,7 +20,9 @@ Create Date: 2026-11-26 00:00:00
 * `prepaid_ledger_entries`: kind CHECK gains `failed_delivery_credit`; new nullable `settlement_id` (FK, unique),
   `slug` (indexed) and `credit_reason`; `shortfall_sompi` (default 0, credit rows only); a CHECK that credit rows
   (and only they) carry settlement, tx_id, slug and reason with direction `credit`; the amount CHECK allows 0 only
-  on a credit row fully clamped by the balance cap; a unique partial index on tx_id for credit rows.
+  on a credit row fully clamped by the balance cap; a unique partial index on tx_id for credit rows; a partial
+  index `ix_prepaid_ledger_entries_credit_balance_created` on `(balance_id, created_at DESC, id DESC)` for credit
+  rows, serving the signed credits/status page and count.
 * The webhook event type CHECK gains `prepaid.credit.failed_delivery` and
   `prepaid.credit.failed_delivery_shortfall`.
 
@@ -176,6 +178,13 @@ def upgrade() -> None:
     )
     op.create_index("ix_prepaid_ledger_entries_settlement_id", LEDGER, ["settlement_id"], unique=True)
     op.create_index("ix_prepaid_ledger_entries_slug", LEDGER, ["slug"], unique=False)
+    op.create_index(
+        "ix_prepaid_ledger_entries_credit_balance_created",
+        LEDGER,
+        ["balance_id", sa.text("created_at DESC"), sa.text("id DESC")],
+        unique=False,
+        postgresql_where=sa.text(CREDIT_ROW_SQL),
+    )
 
     op.create_index(
         "ix_settlements_undelivered",
@@ -209,6 +218,7 @@ def downgrade() -> None:
     _replace_check("webhook_events", "ck_webhook_events_event_type_known", f"event_type IN ({OLD_EVENT_TYPES_SQL})")
     op.drop_index("ix_settlements_stale_pending", table_name="settlements")
     op.drop_index("ix_settlements_undelivered", table_name="settlements")
+    op.drop_index("ix_prepaid_ledger_entries_credit_balance_created", table_name=LEDGER)
     op.drop_index("ix_prepaid_ledger_entries_slug", table_name=LEDGER)
     op.drop_index("ix_prepaid_ledger_entries_settlement_id", table_name=LEDGER)
     op.drop_index("ix_prepaid_ledger_entries_credit_tx_id", table_name=LEDGER)
