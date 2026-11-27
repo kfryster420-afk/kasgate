@@ -8,11 +8,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+import kasgate_client as sdk
 import kaspa
 from app import schemas as gw
 from kasgate_client import KasGateClient, compute_fee_split
 from mcp import Client
 from sdk_helpers import PAYER, PAYER_KEY, challenge, make_utxo, static_utxos
+from test_refund_tools import signed_read_ok
 
 from kasgate_mcp import Config, build_server
 
@@ -24,6 +26,7 @@ DEBIT_NONCE = "abcdef0123456789" * 2
 class Gateway:
     def __init__(self) -> None:
         self.balance = 0
+        self.unsigned_balance_only = False
         self.price = 1000
         self.message = ""
         self.upstream_status = 200
@@ -35,7 +38,9 @@ class Gateway:
         if path == "/v1/directory":
             return httpx.Response(404, json={"detail": "not found"})
         if path == "/v1/prepaid/deposits/quote":
-            body = gw.PrepaidDepositQuoteRequest.model_validate(json.loads(request.content))
+            body = gw.PrepaidDepositQuoteRequest.model_validate(
+                json.loads(request.content)
+            )
             merchant, fee = compute_fee_split(body.amount_sompi)
             return httpx.Response(
                 201,
@@ -47,12 +52,16 @@ class Gateway:
                     "fee_sompi": str(fee),
                     "credit_sompi": str(merchant),
                     "balance_sompi": str(self.balance),
-                    "required": json.loads(challenge(body.amount_sompi).model_dump_json()),
+                    "required": json.loads(
+                        challenge(body.amount_sompi).model_dump_json()
+                    ),
                     "deposit_url": "http://gateway.test/v1/prepaid/deposits",
                 },
             )
         if path == "/v1/prepaid/deposits":
-            signature = gw.PaymentSignature.from_header(request.headers["PAYMENT-SIGNATURE"])
+            signature = gw.PaymentSignature.from_header(
+                request.headers["PAYMENT-SIGNATURE"]
+            )
             tx = kaspa.Transaction.from_dict(json.loads(signature.rawTx))
             credit, fee = tx.outputs[0].value, tx.outputs[1].value
             self.balance += credit
@@ -60,7 +69,9 @@ class Gateway:
                 201,
                 headers={
                     "PAYMENT-RESPONSE": gw.PaymentResponse(
-                        txId=signature.txId, network="kaspa:testnet-10", usdValueAtSettlement="0"
+                        txId=signature.txId,
+                        network="kaspa:testnet-10",
+                        usdValueAtSettlement="0",
                     ).to_header()
                 },
                 json={
@@ -77,9 +88,20 @@ class Gateway:
                 },
             )
         if path == "/v1/prepaid/balance":
+            public: dict[str, Any] = {
+                "spendable_sompi": str(self.balance),
+                "expires_at": None,
+            }
+            if self.unsigned_balance_only or not signed_read_ok(
+                request, sdk.PREPAID_BALANCE_READ_PURPOSE
+            ):
+                return httpx.Response(
+                    200, json=public
+                )  # the unsigned public read: spendable and expiry only
             return httpx.Response(
                 200,
-                json={
+                json=public
+                | {
                     "merchant_id": str(MERCHANT_ID),
                     "payer_address": request.url.params["payer_address"],
                     "balance_sompi": str(self.balance),
@@ -89,10 +111,17 @@ class Gateway:
                 },
             )
         if path == "/v1/prepaid/challenge":
-            body = gw.PrepaidChallengeRequest.model_validate(json.loads(request.content))
+            body = gw.PrepaidChallengeRequest.model_validate(
+                json.loads(request.content)
+            )
             if self.balance < self.price:
                 return httpx.Response(
-                    402, json={"error": "insufficient_balance", "message": "top up", "accepts": None}
+                    402,
+                    json={
+                        "error": "insufficient_balance",
+                        "message": "top up",
+                        "accepts": None,
+                    },
                 )
             expires = datetime.now(UTC) + timedelta(seconds=60)
             self.message = gw.build_prepaid_debit_message(
@@ -120,10 +149,21 @@ class Gateway:
                 balance_sompi=str(self.balance),
                 expires_at=expires,
             )
-            return httpx.Response(201, content=payload.model_dump_json(), headers={"content-type": "application/json"})
+            return httpx.Response(
+                201,
+                content=payload.model_dump_json(),
+                headers={"content-type": "application/json"},
+            )
         header = gw.PrepaidDebitHeader.from_header(request.headers["X-KasGate-Prepaid"])
-        public_key = kaspa.PrivateKey(PAYER_KEY).to_public_key().to_x_only_public_key().to_string()
-        assert kaspa.verify_message(self.message, header.signature, kaspa.PublicKey(public_key))
+        public_key = (
+            kaspa.PrivateKey(PAYER_KEY)
+            .to_public_key()
+            .to_x_only_public_key()
+            .to_string()
+        )
+        assert kaspa.verify_message(
+            self.message, header.signature, kaspa.PublicKey(public_key)
+        )
         refunded = self.upstream_status >= 500
         if not refunded:
             self.balance -= self.price
@@ -135,7 +175,9 @@ class Gateway:
             status="refunded" if refunded else "debited",
         )
         return httpx.Response(
-            self.upstream_status, headers={"X-KasGate-Prepaid-Receipt": receipt.to_header()}, json={"ok": not refunded}
+            self.upstream_status,
+            headers={"X-KasGate-Prepaid-Receipt": receipt.to_header()},
+            json={"ok": not refunded},
         )
 
 
@@ -166,7 +208,9 @@ async def test_deposit_then_prepaid_calls_and_balance() -> None:
     fake = Gateway()
     server = make_server(fake)
     async with Client(server) as client:
-        deposit = await client.call_tool("prepaid_deposit", {"slug": "cheap-api", "amount_kas": "1"})
+        deposit = await client.call_tool(
+            "prepaid_deposit", {"slug": "cheap-api", "amount_kas": "1"}
+        )
         assert not deposit.is_error, deposit.content[0].text
         data = structured(deposit)
         merchant, fee = compute_fee_split(KAS)
@@ -175,7 +219,8 @@ async def test_deposit_then_prepaid_calls_and_balance() -> None:
         assert data["budget"]["spent_sompi"] == KAS
 
         call = await client.call_tool(
-            "call_prepaid_endpoint", {"slug": "cheap-api", "path": "v1/items?limit=3", "max_price_kas": "0.001"}
+            "call_prepaid_endpoint",
+            {"slug": "cheap-api", "path": "v1/items?limit=3", "max_price_kas": "0.001"},
         )
         assert not call.is_error, call.content[0].text
         result = structured(call)
@@ -183,10 +228,17 @@ async def test_deposit_then_prepaid_calls_and_balance() -> None:
         assert result["prepaid"]["status"] == "debited"
         assert result["prepaid"]["balance_sompi"] == merchant - 1000
 
-        balance = structured(await client.call_tool("prepaid_balance", {"slug": "cheap-api"}))
-        assert balance["balance_sompi"] == merchant - 1000 and balance["payer_address"] == PAYER
+        balance = structured(
+            await client.call_tool("prepaid_balance", {"slug": "cheap-api"})
+        )
+        assert (
+            balance["balance_sompi"] == merchant - 1000
+            and balance["payer_address"] == PAYER
+        )
         budget = structured(await client.call_tool("get_budget", {}))
-    assert budget["spent_sompi"] == KAS  # debits do not draw the session budget a second time
+    assert (
+        budget["spent_sompi"] == KAS
+    )  # debits do not draw the session budget a second time
     assert "/p/cheap-api/v1/items" in fake.paths
 
 
@@ -194,7 +246,9 @@ async def test_deposit_over_session_budget_is_refused_before_signing() -> None:
     fake = Gateway()
     server = make_server(fake, session_budget_sompi=KAS)
     async with Client(server) as client:
-        result = await client.call_tool("prepaid_deposit", {"slug": "cheap-api", "amount_kas": "2"})
+        result = await client.call_tool(
+            "prepaid_deposit", {"slug": "cheap-api", "amount_kas": "2"}
+        )
         assert result.is_error
         assert "session budget" in result.content[0].text
     assert "/v1/prepaid/deposits" not in fake.paths
@@ -204,7 +258,9 @@ async def test_deposit_below_minimum_releases_the_reservation() -> None:
     fake = Gateway()
     server = make_server(fake)
     async with Client(server) as client:
-        result = await client.call_tool("prepaid_deposit", {"slug": "cheap-api", "amount_kas": "0.5"})
+        result = await client.call_tool(
+            "prepaid_deposit", {"slug": "cheap-api", "amount_kas": "0.5"}
+        )
         assert result.is_error
         budget = structured(await client.call_tool("get_budget", {}))
     assert budget["reserved_sompi"] == 0 and budget["spent_sompi"] == 0
@@ -226,7 +282,9 @@ async def test_prepaid_call_over_cap_is_never_signed() -> None:
     fake.price = KAS
     server = make_server(fake)
     async with Client(server) as client:
-        result = await client.call_tool("call_prepaid_endpoint", {"slug": "cheap-api", "max_price_kas": "0.5"})
+        result = await client.call_tool(
+            "call_prepaid_endpoint", {"slug": "cheap-api", "max_price_kas": "0.5"}
+        )
     assert result.is_error
     assert "/p/cheap-api" not in fake.paths
 
@@ -237,19 +295,45 @@ async def test_refunded_upstream_failure_is_reported() -> None:
     fake.upstream_status = 502
     server = make_server(fake)
     async with Client(server) as client:
-        result = structured(await client.call_tool("call_prepaid_endpoint", {"slug": "cheap-api"}))
+        result = structured(
+            await client.call_tool("call_prepaid_endpoint", {"slug": "cheap-api"})
+        )
     assert result["status_code"] == 502
-    assert result["prepaid"]["status"] == "refunded" and result["prepaid"]["balance_sompi"] == 5000
+    assert (
+        result["prepaid"]["status"] == "refunded"
+        and result["prepaid"]["balance_sompi"] == 5000
+    )
 
 
 async def test_prepaid_tools_validate_slug_and_path() -> None:
     server = make_server(Gateway())
     async with Client(server) as client:
         bad_slug = await client.call_tool("prepaid_balance", {"slug": "../x"})
-        bad_path = await client.call_tool("call_prepaid_endpoint", {"slug": "cheap-api", "path": "../../v1/admin"})
+        bad_path = await client.call_tool(
+            "call_prepaid_endpoint", {"slug": "cheap-api", "path": "../../v1/admin"}
+        )
     assert bad_slug.is_error and bad_path.is_error
 
 
 def test_server_exposes_its_config() -> None:
     server = make_server(Gateway())
     assert server.kasgate_config.gateway_url == "http://gateway.test"
+
+
+async def test_prepaid_balance_never_depends_on_signed_only_fields() -> None:
+    fake = Gateway()
+    fake.balance = 5000
+    fake.unsigned_balance_only = (
+        True  # a gateway that answers with the public shape only
+    )
+    async with Client(make_server(fake)) as client:
+        result = await client.call_tool("prepaid_balance", {"slug": "cheap-api"})
+    assert not result.is_error, result.content[0].text
+    data = structured(result)
+    assert (data["spendable_sompi"], data["spendable_kas"]) == (5000, "0.00005")
+    assert (
+        data["balance_sompi"] is None
+        and data["balance_kas"] is None
+        and data["updated_at"] is None
+    )
+    assert data["deposited_sompi"] is None and data["merchant_id"] is None

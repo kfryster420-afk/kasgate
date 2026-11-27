@@ -112,10 +112,13 @@ adds or drops credit for calls already paid. There is no per-endpoint override (
   `credit_id` on each item of signed `POST /v1/prepaid/credits/status`.
 * Buyer view: `POST /v1/prepaid/credits/challenge` `{slug, payer_address}` then signed
   `POST /v1/prepaid/credits/status` `{nonce, signature, before?, limit?}` (action `credits`; same challenge store,
-  message layout, Purpose, key binding, single-use consume and rate limit as refunds/status). The challenge's
-  `spendable_sompi` and `refundable_sompi` are informational only. Each page needs a fresh challenge. `limit`
+  message layout, Purpose, key binding, single-use consume and rate limit as refunds/status). The unsigned credits
+  (and refunds) challenge does not include `spendable_sompi` or `refundable_sompi`; the signed status body is the
+  only source for those values. Each page needs a fresh challenge. `limit`
   defaults to 10, max 100 (else 422). `before` is the opaque `next_cursor` from the previous page (newest first
-  by `(created_at, id)`, bound to this merchant and key). Reply is
+  by `(created_at, id)`, bound to this merchant and key). The cursor is unsigned base64url: tamper-evident by
+  that binding, not a secret (a forged cursor only moves the window over this signer's own rows, or is 400
+  `invalid_cursor`). `created_at` is the database clock. Reply is
   `{merchant_id, credited_sompi, credit_balance_sompi, refundable_sompi, credit_count, credits, next_cursor}`
   with a page of `{credit_id, tx_id, slug, credit_sompi, shortfall_sompi, reason, created_at}`. `credit_count` is
   the total. `next_cursor` is null when there are no more pages. A malformed or foreign `before` is 400
@@ -146,7 +149,9 @@ Signed like every KasGate webhook (`X-KasGate-Signature`), with deterministic ev
 * `prepaid_debits.credit_sompi` (`BETWEEN 0 AND amount_sompi`).
 * `prepaid_ledger_entries`: kind `failed_delivery_credit`; `settlement_id` (FK RESTRICT, unique), `slug`,
   `credit_reason`, `shortfall_sompi` (credit rows only). The amount CHECK is 0008's exactly plus a fully clamped
-  credit row (`amount 0, shortfall > 0`). Unique partial index on `tx_id` for credit rows.
+  credit row (`amount 0, shortfall > 0`). Unique partial index on `tx_id` for credit rows; partial index
+  `ix_prepaid_ledger_entries_credit_balance_created` on `(balance_id, created_at DESC, id DESC)` for credit rows
+  (credits/status page and count). Credit `created_at` is stamped by the database (`now()`), not the app clock.
 * `webhook_events` event-type CHECK gains both events.
 * Downgrade refuses while any credit row, credited balance, credit-paid debit, credit event or webhook subscribed
   to one exists.

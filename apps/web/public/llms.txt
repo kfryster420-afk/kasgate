@@ -64,7 +64,7 @@ first, and it is never refunded (refundable_sompi on the balance excludes it). R
 /v1/prepaid/credits/challenge then a signed POST /v1/prepaid/credits/status (action credits; same signing as a
 refunds status challenge). Each page needs a fresh challenge. The status body takes optional before (cursor) and
 limit (default 10, max 100) and returns next_cursor. Each credit has credit_id, the same ledger id as creditId
-on X-KasGate-Credit. spendable_sompi and refundable_sompi on the challenge are informational only.
+on X-KasGate-Credit. The unsigned credits and refunds challenges do not include spendable_sompi or refundable_sompi; read those on the signed status (or on GET /v1/prepaid/balance). The credits cursor is tamper-evident by binding, not a secret.
 
 ## Free trial calls (kasgate-trial-v1)
 

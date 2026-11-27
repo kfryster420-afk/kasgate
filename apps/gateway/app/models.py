@@ -19,6 +19,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    desc,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -661,6 +662,13 @@ class PrepaidLedgerEntry(Base):
         Index("ix_prepaid_ledger_entries_settlement_id", "settlement_id", unique=True),
         Index("ix_prepaid_ledger_entries_slug", "slug"),
         Index("ix_prepaid_ledger_entries_balance_id", "balance_id"),
+        Index(
+            "ix_prepaid_ledger_entries_credit_balance_created",
+            "balance_id",
+            desc("created_at"),
+            desc("id"),
+            postgresql_where=FAILED_DELIVERY_CREDIT_ROW_SQL,
+        ),
         Index("ix_prepaid_ledger_entries_merchant_created", "merchant_id", "created_at"),
         Index("ix_prepaid_ledger_entries_refund_id", "refund_id", unique=True),
         CheckConstraint(LEDGER_AMOUNT_SQL, name="amount_valid"),

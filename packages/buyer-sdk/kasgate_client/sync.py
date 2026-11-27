@@ -13,9 +13,11 @@ from collections.abc import Coroutine
 from typing import Any, TypeVar
 
 import httpx
+from typing_extensions import Self
 
 from .catalog import DiscoverResult
 from .client import KasGateClient
+from .credit import BuyerCreditStatus, CreditObservation, FailedDeliveryCreditHint
 from .prepaid import PrepaidBalance, PrepaidDepositReceipt, PrepaidRefund
 from .trials import TrialStatus
 
@@ -86,8 +88,30 @@ class KasGateSyncClient:
     ) -> PrepaidDepositReceipt:
         return self._call(self._client.prepaid_deposit(gateway_url, slug, amount_sompi, **kwargs))
 
-    def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str) -> PrepaidBalance:
-        return self._call(self._client.prepaid_balance(gateway_url, slug))
+    def prepaid_balance(self, gateway_url: str | httpx.URL, slug: str, *, signed: bool = True) -> PrepaidBalance:
+        return self._call(self._client.prepaid_balance(gateway_url, slug, signed=signed))
+
+    def credit_status(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+    ) -> BuyerCreditStatus:
+        return self._call(self._client.credit_status(gateway_url, slug, before=before, limit=limit))
+
+    def confirm_credit(
+        self,
+        gateway_url: str | httpx.URL,
+        slug: str,
+        credit: CreditObservation | FailedDeliveryCreditHint | httpx.Response,
+        *,
+        baseline_credited_sompi: int | None = None,
+    ) -> CreditObservation:
+        return self._call(
+            self._client.confirm_credit(gateway_url, slug, credit, baseline_credited_sompi=baseline_credited_sompi)
+        )
 
     def prepaid_request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self._call(self._client.prepaid_request(method, url, **kwargs))
@@ -122,7 +146,7 @@ class KasGateSyncClient:
         finally:
             self._stop_loop()
 
-    def __enter__(self) -> KasGateSyncClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
