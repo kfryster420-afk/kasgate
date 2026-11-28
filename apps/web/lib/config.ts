@@ -10,7 +10,11 @@ export const NETWORK_LABEL = IS_TESTNET ? "testnet-10" : "mainnet";
 
 /** Official TN-10 faucet, as listed on the Kaspa wiki (https://wiki.kaspa.org/en/testnets). */
 export const TESTNET_FAUCET_URL = "https://faucet-tn10.kaspanet.io/";
-export const TESTNET_EXPLORER_URL = "https://explorer-tn10.kaspa.org";
+/** explorer-tn10.kaspa.org answers 402 DEPLOYMENT_DISABLED, so links go to the Kaspa.stream TN10 explorer instead. */
+export const TESTNET_EXPLORER_URL = "https://tn10.kaspa.stream";
+/** A real settled testnet payment (demo-httpbin), shown on the home page. */
+export const DEMO_SETTLEMENT_TX_ID = "7beab60d8cf21002ba12e85255ec93cf24c3c7c8f3e5a2d3dc84016da8e79170";
+export const DEMO_ENDPOINT_SLUG = "demo-httpbin";
 export const KASWARE_URL = "https://www.kasware.xyz";
 export const GITHUB_REPO_URL = "https://github.com/kfryster420-afk/kasgate";
 export const GITHUB_BUG_URL = `${GITHUB_REPO_URL}/issues/new?template=bug_report.yml`;

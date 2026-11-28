@@ -9,9 +9,12 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --test lib/server/client-ip.test.mjs lib/balance-read.test.mjs"
+    "test:unit": "node --test lib/server/client-ip.test.mjs lib/balance-read.test.mjs",
+    "test": "npm run test:unit && tsx --test lib/trial/demo.test.ts"
   },
   "dependencies": {
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "lucide-react": "^0.468.0",
     "next": "^15.1.0",
     "react": "^19.0.0",
@@ -28,6 +31,7 @@
     "eslint-config-next": "^15.1.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.2"
   },
   "engines": {

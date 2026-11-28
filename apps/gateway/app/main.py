@@ -17,6 +17,7 @@ from app.db import engine as db_engine
 from app.deps import get_sessionmaker
 from app.failed_delivery import router as failed_delivery_router
 from app.failed_delivery import sweep_pass as failed_delivery_sweep_pass
+from app.faucet import router as faucet_router
 from app.kaspa_engine import engine as kaspa_engine
 from app.ledger import LedgerWorker
 from app.oracle import KasUsdOracle
@@ -113,6 +114,7 @@ def create_app() -> FastAPI:
     app.include_router(failed_delivery_router)
     app.include_router(prepaid_router)
     app.include_router(trials_router)
+    app.include_router(faucet_router)
     app.include_router(webhooks_router)
     app.include_router(proxy_router)
 
