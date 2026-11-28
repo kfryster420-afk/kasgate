@@ -1,7 +1,8 @@
-import { ArrowRight, Bot, FileSpreadsheet, Gauge, Hexagon, Lock, Zap } from "lucide-react";
+import { ArrowRight, Bot, ExternalLink, FileSpreadsheet, Gauge, Hexagon, Lock, Wallet, Zap } from "lucide-react";
 import Link from "next/link";
 import { CodeBlock } from "@/components/code-block";
-import { GATEWAY_PUBLIC_URL, IS_TESTNET, NETWORK_LABEL } from "@/lib/config";
+import { TryItNow } from "@/components/try-it-now";
+import { ADDRESS_PREFIX, DEMO_ENDPOINT_SLUG, GATEWAY_PUBLIC_URL, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, NETWORK_LABEL, TESTNET_FAUCET_URL } from "@/lib/config";
 import { getMinOutputSompi } from "@/lib/server/gateway";
 import { curlCreateEndpoint, curlRegisterMerchant } from "@/lib/snippets";
 import { flatFeeMaxPriceSompi, formatKas, minPriceSompi } from "@/lib/sompi";
@@ -25,7 +26,7 @@ export default async function LandingPage() {
 
   return (
     <div>
-      <section className="mx-auto max-w-6xl px-4 pb-16 pt-20 text-center">
+      <section className="mx-auto max-w-6xl px-4 pb-10 pt-14 text-center sm:pt-20">
         {IS_TESTNET ? (
           <span className="badge border-amber-700 bg-amber-950/60 font-mono text-amber-200">testnet beta · Kaspa {NETWORK_LABEL}</span>
         ) : (
@@ -38,9 +39,12 @@ export default async function LandingPage() {
           KasGate wraps any HTTP API in a pay-per-call paywall. No SDK, no deploy, no custody. Humans and AI agents pay on-chain; the platform fee is 1.5% with a small flat minimum on low-priced calls.
         </p>
         <div className="mt-8 flex flex-wrap justify-center gap-3">
-          <Link href="/onboarding" className="btn-primary px-6 py-3 text-base">
-            Monetize an API
+          <a href="#try-it-now" className="btn-primary px-6 py-3 text-base">
+            Try it now, no wallet
             <ArrowRight className="h-4 w-4" aria-hidden />
+          </a>
+          <Link href="/onboarding" className="btn-secondary px-6 py-3 text-base">
+            Monetize an API
           </Link>
           <Link href="/directory" className="btn-secondary px-6 py-3 text-base">
             Browse the directory
@@ -49,7 +53,19 @@ export default async function LandingPage() {
             Beta guide
           </Link>
         </div>
-        <dl className="mx-auto mt-14 grid max-w-3xl grid-cols-3 gap-4 text-left">
+      </section>
+
+      {IS_TESTNET && (
+        <section className="mx-auto max-w-6xl px-4 pb-6" aria-label="Try KasGate">
+          <div className="grid gap-4 md:grid-cols-2">
+            <TryItNow gatewayUrl={GATEWAY_PUBLIC_URL} slug={DEMO_ENDPOINT_SLUG} addressPrefix={ADDRESS_PREFIX} network={KASPA_NETWORK} />
+            <PayForReal />
+          </div>
+        </section>
+      )}
+
+      <section className="mx-auto max-w-6xl px-4 py-8">
+        <dl className="mx-auto mt-0 grid max-w-3xl grid-cols-3 gap-4 text-left">
           <Metric value="1.5%" label="platform fee" />
           <Metric value={minPrice ?? "—"} label="minimum price per call" />
           <Metric value="0" label="lines of code" />
@@ -103,6 +119,52 @@ function Metric({ value, label }: { value: string; label: string }) {
     <div className="card p-4">
       <dd className="font-mono text-3xl font-bold text-kas-300">{value}</dd>
       <dt className="text-sm text-zinc-500">{label}</dt>
+    </div>
+  );
+}
+
+const PAY_STEPS = [
+  { title: "Install KasWare", body: "The browser wallet that signs Kaspa payments.", href: KASWARE_URL, link: "kasware.xyz" },
+  { title: `Switch to ${NETWORK_LABEL}`, body: "Open KasWare, choose the network menu and pick Testnet 10.", href: null, link: null },
+  { title: "Get test KAS from the faucet", body: "Paste your kaspatest: address; test coins are free and worth nothing.", href: TESTNET_FAUCET_URL, link: "faucet-tn10.kaspanet.io" },
+] as const;
+
+function PayForReal() {
+  return (
+    <div className="card flex flex-col p-5 text-left sm:p-6">
+      <div className="flex items-center gap-2">
+        <span className="badge border-zinc-700 bg-zinc-900 font-mono text-zinc-300">wallet</span>
+        <span className="font-mono text-xs text-zinc-500">on-chain payment</span>
+      </div>
+      <h2 className="mt-3 text-xl font-semibold text-zinc-50">Pay for real with KasWare</h2>
+      <p className="mt-1.5 text-sm text-zinc-400">Connect a wallet and settle a call on-chain: your share to the merchant, the fee to the treasury, in one transaction.</p>
+      <ol className="mt-4 space-y-3">
+        {PAY_STEPS.map((step, index) => (
+          <li key={step.title} className="flex gap-3">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-kas-700 bg-kas-900/40 font-mono text-xs text-kas-300">{index + 1}</span>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-zinc-100">{step.title}</p>
+              <p className="text-sm text-zinc-400">{step.body}</p>
+              {step.href && (
+                <a href={step.href} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 break-all text-sm text-kas-300 hover:text-kas-200">
+                  {step.link}
+                  <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                </a>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+      <p className="mt-4 text-sm text-zinc-400">Then connect KasWare and pay: the beta guide walks through it, and the directory lists endpoints to call.</p>
+      <div className="mt-4 flex flex-wrap gap-3">
+        <Link href="/beta" className="btn-primary px-5 py-2.5">
+          <Wallet className="h-4 w-4" aria-hidden />
+          Connect and pay
+        </Link>
+        <Link href="/directory" className="btn-secondary px-5 py-2.5">
+          Browse the directory
+        </Link>
+      </div>
     </div>
   );
 }
