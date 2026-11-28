@@ -7,6 +7,8 @@ and retries with PAYMENT-SIGNATURE. A successful call returns the upstream respo
 The public beta runs on Kaspa testnet-10 (network kaspa:testnet-10, address prefix kaspatest:). Mainnet
 is not launched. Do not send mainnet funds.
 
+Quickstart (sell an API or pay from Python/MCP, step by step): /quickstart on the web host.
+
 The merchant dashboard and this website are on the web host. Payment, quotes, and the machine-readable
 catalog are on the gateway (API) host configured as PUBLIC_BASE_URL, typically api.<the-same-domain>.
 

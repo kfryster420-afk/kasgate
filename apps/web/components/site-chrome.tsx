@@ -3,6 +3,7 @@ import { Hexagon } from "lucide-react";
 import { GITHUB_REPO_URL, NETWORK_LABEL } from "@/lib/config";
 
 const NAV = [
+  { href: "/quickstart", label: "Quickstart" },
   { href: "/beta", label: "Beta" },
   { href: "/directory", label: "Directory" },
   { href: "/onboarding", label: "Onboarding", hideOnMobile: true },
@@ -45,6 +46,9 @@ export function SiteFooter() {
       <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 sm:flex-row">
         <p>© KasGate. Non-custodial: payments settle directly on the Kaspa network.</p>
         <div className="flex flex-wrap justify-center gap-4 font-mono text-xs">
+          <Link href="/quickstart" className="hover:text-zinc-300">
+            /quickstart
+          </Link>
           <Link href="/beta" className="hover:text-zinc-300">
             /beta
           </Link>
