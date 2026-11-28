@@ -884,6 +884,8 @@ class X402ErrorBody(StrictModel):
     message: str
     k402: Literal["0.2"] | None = None
     accepts: list[PaymentOffer] | None = None
+    trial: "TrialOffer | None" = None
+    """Present on a 402 from an endpoint with free trial calls; mirrors X-KasGate-Trial-Offer."""
 
 
 # ---------------------------------------------------------------- merchants
@@ -2084,6 +2086,9 @@ class TrialOffer(X402Header):
     freeTrialCalls: Annotated[int, Field(ge=1, le=TRIAL_MAX_CALLS)]
     challengeUrl: str
     statusUrl: str
+
+
+X402ErrorBody.model_rebuild()
 
 
 class TrialChallengeRequest(PrepaidChallengeRequest):

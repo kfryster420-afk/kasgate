@@ -425,6 +425,63 @@ async def test_upstream_response_cannot_spoof_payment_headers(client: httpx.Asyn
     PaymentResponse.from_header(response.headers[HEADER_PAYMENT_RESPONSE])
 
 
+_UPSTREAM_CACHE_HEADERS = {
+    "Cache-Control": "max-age=2678400",
+    "Expires": "Wed, 01 Jan 2025 00:00:00 GMT",
+    "ETag": '"abc123"',
+    "Last-Modified": "Wed, 01 Jan 2025 00:00:00 GMT",
+    "Age": "104342",
+    "Surrogate-Control": "max-age=2678400",
+    "CDN-Cache-Control": "max-age=2678400",
+    "Cloudflare-CDN-Cache-Control": "max-age=2678400",
+    "Pragma": "public",
+}
+_STRIPPED_CACHE_HEADERS = (
+    "expires",
+    "etag",
+    "last-modified",
+    "age",
+    "surrogate-control",
+    "cdn-cache-control",
+    "cloudflare-cdn-cache-control",
+)
+
+
+def assert_no_store(response: httpx.Response) -> None:
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
+    for name in _STRIPPED_CACHE_HEADERS:
+        assert name not in response.headers, name
+
+
+async def test_unpaid_challenge_is_not_cacheable(client: httpx.AsyncClient, seeded: Seed) -> None:
+    response = await client.get("/p/weather")
+    assert response.status_code == 402
+    assert_no_store(response)
+
+
+async def test_paid_upstream_cache_headers_are_replaced(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream
+) -> None:
+    upstream.handler = lambda request: httpx.Response(200, json={"ok": True}, headers=_UPSTREAM_CACHE_HEADERS)
+    response = await client.get("/p/weather", headers=await pay(client))
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert HEADER_PAYMENT_RESPONSE in response.headers
+    assert_no_store(response)
+
+
+async def test_upstream_error_cache_headers_are_replaced(
+    client: httpx.AsyncClient, seeded: Seed, upstream: Upstream
+) -> None:
+    upstream.handler = lambda request: httpx.Response(418, text="teapot", headers=_UPSTREAM_CACHE_HEADERS)
+    response = await client.get("/p/weather", headers=await pay(client))
+    assert response.status_code == 418
+    assert response.text == "teapot"
+    assert HEADER_PAYMENT_RESPONSE in response.headers
+    assert_no_store(response)
+
+
 async def test_upstream_error_status_is_passed_through(
     client: httpx.AsyncClient, seeded: Seed, upstream: Upstream, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:

@@ -74,6 +74,8 @@ from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import Settings, get_settings
 from app.deps import (
@@ -237,12 +239,74 @@ _DROPPED_REQUEST_HEADERS: Final[frozenset[str]] = (
         }
     )
 )
+# Cache / validator headers from an upstream must never reach the client: Cloudflare (and other
+# CDNs) would otherwise cache a paid /p/* body and serve it for free. Forced no-store is applied
+# centrally by NoStorePaidMiddleware; these names are also stripped when relaying upstream bytes.
+_UPSTREAM_CACHE_HEADERS: Final[frozenset[str]] = frozenset(
+    {
+        "cache-control",
+        "pragma",
+        "expires",
+        "surrogate-control",
+        "cdn-cache-control",
+        "cloudflare-cdn-cache-control",
+        "age",
+        "etag",
+        "last-modified",
+    }
+)
+_NO_STORE_CACHE_CONTROL: Final[str] = "no-store, private"
+_NO_STORE_PRAGMA: Final[str] = "no-cache"
+
 # Upstream response headers that are never returned to the agent.
 _DROPPED_RESPONSE_HEADERS: Final[frozenset[str]] = (
     HOP_BY_HOP_HEADERS
     | PAYMENT_HEADERS
+    | _UPSTREAM_CACHE_HEADERS
     | frozenset({"content-length", "content-encoding", "set-cookie", "set-cookie2"})
 )
+
+
+def is_no_store_path(path: str) -> bool:
+    """Paywalled proxy responses, plus quote / balance / refund-status reads (they must not be cached)."""
+    if path == PROXY_PATH_PREFIX or path.startswith(f"{PROXY_PATH_PREFIX}/"):
+        return True
+    if path == "/v1/quote" or path.startswith("/v1/quote/"):
+        return True
+    if path == "/v1/prepaid/balance":
+        return True
+    return path == "/v1/prepaid/refunds/status" or path.startswith("/v1/prepaid/refunds/status/")
+
+
+def apply_no_store(headers: MutableHeaders) -> None:
+    """Drop cache validators and force Cache-Control: no-store, private plus Pragma: no-cache."""
+    for name in _UPSTREAM_CACHE_HEADERS:
+        del headers[name]
+    headers["Cache-Control"] = _NO_STORE_CACHE_CONTROL
+    headers["Pragma"] = _NO_STORE_PRAGMA
+
+
+class NoStorePaidMiddleware:
+    """Force no-store on every /p/* response (402, paid 200, redelivery, trial/prepaid, errors).
+
+    Also covers GET /v1/quote/*, GET /v1/prepaid/balance and /v1/prepaid/refunds/status, so those
+    reads cannot be cached either. Applied as outermost middleware so no later layer overwrites it.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not is_no_store_path(str(scope.get("path", ""))):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                apply_no_store(MutableHeaders(scope=message))
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
 
 _VERIFICATION_CODES: Final[frozenset[str]] = frozenset(
     {"invalid_payment_header", "underpaid", "invalid_fee_split", "wrong_network", "tx_rejected"}
@@ -326,6 +390,8 @@ def _error(
                 "accepts": accepts,
             }
         ).model_dump(mode="json")
+        if content.get("trial") is None:
+            content.pop("trial", None)
     except ValueError:
         content = {"error": error, "message": message}
     return JSONResponse(status_code=status_code, content=content, headers=out_headers)
@@ -2418,8 +2484,8 @@ def trial_nonce_lock_key(nonce: str) -> str:
     return f"{TRIAL_NONCE_LOCK_PREFIX}{nonce}"
 
 
-def trial_offer_header(endpoint: Endpoint) -> str | None:
-    """The X-KasGate-Trial-Offer value for a 402 from `endpoint`, or None when it has no free trial calls."""
+def trial_offer_for(endpoint: Endpoint) -> TrialOffer | None:
+    """The trial offer advertised on a 402 from `endpoint`, or None when it has no free trial calls."""
     if endpoint.free_trial_calls <= 0:
         return None
     base = get_settings().public_base_url
@@ -2427,16 +2493,34 @@ def trial_offer_header(endpoint: Endpoint) -> str | None:
         freeTrialCalls=endpoint.free_trial_calls,
         challengeUrl=f"{base}/v1/trials/challenge",
         statusUrl=f"{base}/v1/trials/status?slug={endpoint.slug}",
-    ).to_header()
+    )
+
+
+def trial_offer_header(endpoint: Endpoint) -> str | None:
+    """The X-KasGate-Trial-Offer value for a 402 from `endpoint`, or None when it has no free trial calls."""
+    offer = trial_offer_for(endpoint)
+    return None if offer is None else offer.to_header()
 
 
 def with_trial_offer(response: Response, endpoint: Endpoint) -> Response:
-    """Advertise the endpoint's free trial on a 402 (no-op for any other status or an endpoint without trials)."""
-    if response.status_code == 402:
-        offer = trial_offer_header(endpoint)
-        if offer is not None:
-            response.headers[HEADER_TRIAL_OFFER] = offer
-    return response
+    """Advertise the endpoint's free trial on a 402 (header + additive JSON `trial`; no-op otherwise)."""
+    if response.status_code != 402:
+        return response
+    offer = trial_offer_for(endpoint)
+    if offer is None:
+        return response
+    response.headers[HEADER_TRIAL_OFFER] = offer.to_header()
+    if not isinstance(response, JSONResponse) or not response.body:
+        return response
+    try:
+        payload = json.loads(bytes(response.body))
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return response
+    if not isinstance(payload, dict) or "trial" in payload:
+        return response
+    payload["trial"] = offer.model_dump(mode="json")
+    headers = {k: v for k, v in response.headers.items() if k.lower() not in {"content-length", "content-type"}}
+    return JSONResponse(status_code=response.status_code, content=payload, headers=headers)
 
 
 @dataclass(frozen=True)
