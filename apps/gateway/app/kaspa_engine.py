@@ -1326,6 +1326,17 @@ class KaspaEngine:
             logger.warning("submit attempt %d for %s failed: %s", attempt + 1, tx_id, last_error)
         raise RpcUnavailableError(last_error)
 
+    async def utxos_for_address(self, address: str) -> list[dict[str, Any]]:
+        """Node UTXO entries (RPC form) of one address; ``RpcUnavailableError`` if the node is down."""
+        response = await self._rpc(
+            "get_utxos_by_addresses", lambda client: client.get_utxos_by_addresses({"addresses": [address]})
+        )
+        return [_as_dict(entry) for entry in _as_list(_as_dict(response).get("entries"))]
+
+    async def broadcast(self, tx: Transaction, tx_id: str) -> None:
+        """Submit a locally built and signed transaction to the node (mempool); no acceptance wait."""
+        await self._submit(tx, tx_id)
+
     async def _drop_client(self) -> None:
         async with self._connect_lock:
             client, self._client = self._client, None

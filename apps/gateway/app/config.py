@@ -4,7 +4,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KaspaNetwork = Literal["kaspa:testnet-10", "kaspa:mainnet"]
@@ -113,6 +113,26 @@ class Settings(BaseSettings):
     # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate
     # limits. Empty (default): X-Forwarded-For is ignored and the TCP peer address is the client.
     trusted_proxy_ips: list[str] = []
+    # Testnet faucet (POST /v1/faucet/claim). Disabled unless FAUCET_PRIVATE_KEY (64 hex chars) is set; a dedicated hot
+    # wallet key, never a buyer, treasury or merchant key. Enabling it on any network but testnet-10 refuses to start.
+    faucet_private_key: SecretStr | None = None
+    faucet_amount_sompi: int = Field(default=5_000_000_000, ge=1, le=1_000_000_000_000)
+    faucet_daily_cap_sompi: int = Field(default=500_000_000_000, ge=1)
+    faucet_max_network_fee_sompi: int = Field(default=10_000_000, ge=1)
+
+    @field_validator("faucet_private_key")
+    @classmethod
+    def _faucet_key(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None or not v.get_secret_value().strip():
+            return None
+        raw = v.get_secret_value().strip().lower()
+        if len(raw) != 64 or any(ch not in "0123456789abcdef" for ch in raw):
+            raise ValueError("FAUCET_PRIVATE_KEY must be 64 hex characters")
+        return SecretStr(raw)
+
+    @property
+    def faucet_enabled(self) -> bool:
+        return self.faucet_private_key is not None
 
     @field_validator("trusted_proxy_ips")
     @classmethod
@@ -137,6 +157,12 @@ class Settings(BaseSettings):
     def failed_delivery_credit_wait_seconds(self) -> int:
         """Seconds after the redelivery window before the sweep may credit: one upstream attempt plus the grace."""
         return math.ceil(self.upstream_timeout_seconds) + self.failed_delivery_credit_grace_seconds
+
+    @model_validator(mode="after")
+    def _faucet_testnet_only(self) -> "Settings":
+        if self.faucet_private_key is not None and self.kaspa_network != "kaspa:testnet-10":
+            raise ValueError("the faucet is testnet only: FAUCET_PRIVATE_KEY requires KASPA_NETWORK=kaspa:testnet-10")
+        return self
 
     @model_validator(mode="after")
     def _treasury_matches_network(self) -> "Settings":
