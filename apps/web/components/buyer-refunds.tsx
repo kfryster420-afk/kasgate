@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
+import { ChevronDown, Eye, Loader2, PlugZap, RefreshCw, Search, Undo2, XCircle } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ApiError, apiFetch } from "@/lib/api-client";
 import { ADDRESS_PREFIX, EXPECTED_AUTH_DOMAIN, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, TESTNET_EXPLORER_URL } from "@/lib/config";
@@ -8,11 +8,25 @@ import { formatDateTime, shortHash } from "@/lib/format";
 import { getKasware, isSignatureToken, isWalletRejection, kaswareNetworkRefusal, walletErrorText } from "@/lib/kasware";
 import { buyerReadMessage, normaliseBalanceSignature, PREPAID_BALANCE_READ_PURPOSE, PREPAID_REFUNDS_READ_PURPOSE, type BuyerReadPurpose } from "@/lib/balance-read";
 import { checkRefundChallenge } from "@/lib/refund-challenge";
+import { CREDIT_REASON_LABEL } from "@/lib/credit-labels";
+import { checkCreditChallenge } from "@/lib/credit-challenge";
+import { CREDIT_STATUS_PAGE, parseBuyerCreditStatus } from "@/lib/credit-status";
 import { refundErrorMessage, txIdsInMessage } from "@/lib/refund-errors";
 import { claimExpiresAt } from "@/lib/refund-payout";
 import { formatKas, parseKasToSompi } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
-import type { FullPrepaidBalanceRead, PrepaidBalanceRead, PrepaidRefundChallenge, PrepaidRefundChallengeRequest, PrepaidRefundRead, PrepaidRefundSigned } from "@/lib/types";
+import type {
+  BuyerCreditStatus,
+  BuyerCreditStatusItem,
+  FullPrepaidBalanceRead,
+  PrepaidBalanceRead,
+  PrepaidCreditStatusChallenge,
+  PrepaidCreditStatusRequest,
+  PrepaidRefundChallenge,
+  PrepaidRefundChallengeRequest,
+  PrepaidRefundRead,
+  PrepaidRefundSigned,
+} from "@/lib/types";
 import { checkKaspaAddress, checkSlug } from "@/lib/validation";
 import { KasAmount } from "./kas-amount";
 import { LatePayoutNote, REFUND_STATUS_HELP, RefundStatusBadge } from "./refund-status";
@@ -27,16 +41,36 @@ function isP2pkAddress(address: string): boolean {
  * `balanceSigned`: the balance came from a buyer-signed read, so balance and ledger totals are present (the unsigned
  * read has only spendable and expiry). `refunds`: null until a buyer-signed refunds-status read (CONTRACT v2.12.1,
  * #6: there is no unsigned refund list). `signed`: the rows came from a signed `status` challenge, so they carry
- * the merchant's reasons and payout errors.
+ * the merchant's reasons and payout errors. `credits`: pages read with signed `credits` challenges (CONTRACT v2.14).
  */
-type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[] | null; signed: boolean };
-type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | "refunds" | `cancel:${string}`;
+type Lookup = { slug: string; address: string; balance: PrepaidBalanceRead; balanceSigned: boolean; refunds: PrepaidRefundRead[] | null; signed: boolean; credits: CreditView | null };
+type Busy = null | "connect" | "lookup" | "request" | "status" | "balance" | "refunds" | "credits" | "credits-more" | `cancel:${string}`;
+
+/** Signed POST /v1/prepaid/credits/status pages: totals of the last page read, the rows loaded so far, the next cursor. */
+type CreditView = { totals: BuyerCreditStatus; items: BuyerCreditStatusItem[]; nextCursor: string | null };
 
 /** A read signature is honoured for ±300 s; reuse one for reloads (after a request or cancel) for 4 minutes, then sign again. */
 const READ_SIGNATURE_REUSE_MS = 240_000;
 type ReadSignature = { timestamp: string; signature: string; at: number };
 
 const SOMPI_RE = /^(0|[1-9][0-9]{0,17})$/;
+
+/** A strict decimal sompi string as a bigint, else null. */
+function sompiOrNull(value: string | null | undefined): bigint | null {
+  return typeof value === "string" && SOMPI_RE.test(value) ? BigInt(value) : null;
+}
+
+/**
+ * What a refund may take: the signed credits/status `refundable_sompi` when read, else the balance's v2.14
+ * `refundable_sompi` when the read carried it, else spendable. The gateway enforces the real limit either way.
+ */
+function refundLimit(lookup: Lookup): { refundable: bigint; callOnly: bigint } {
+  if (lookup.credits) return { refundable: BigInt(lookup.credits.totals.refundable_sompi), callOnly: BigInt(lookup.credits.totals.credit_balance_sompi) };
+  return {
+    refundable: sompiOrNull(lookup.balance.refundable_sompi) ?? BigInt(lookup.balance.spendable_sompi),
+    callOnly: sompiOrNull(lookup.balance.credit_balance_sompi) ?? 0n,
+  };
+}
 
 /** True when the balance and every ledger total are strict decimal sompi strings (a signed read). */
 function hasLedgerTotals(balance: PrepaidBalanceRead): balance is FullPrepaidBalanceRead {
@@ -161,7 +195,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     } catch (e) {
       setError(readErrorText(e, "your refund requests"));
     }
-    const next: Lookup = { slug: slugValue, address: addressValue, balance, balanceSigned, refunds, signed: false };
+    const next: Lookup = { slug: slugValue, address: addressValue, balance, balanceSigned, refunds, signed: false, credits: null };
     setLookup(next);
     return next;
   }
@@ -254,7 +288,7 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     event.preventDefault();
     setNotice(null);
     if (!lookup) return;
-    const spendable = BigInt(lookup.balance.spendable_sompi);
+    const { refundable, callOnly } = refundLimit(lookup);
     let amountSompi: string | undefined;
     if (amount.trim() !== "") {
       const parsed = parseKasToSompi(amount);
@@ -262,13 +296,17 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
         setAmountError("Enter an amount in KAS, e.g. 1.5 (up to 8 decimals), or leave it blank for all spendable credit");
         return;
       }
-      if (parsed > spendable) {
-        setAmountError(`You can get back at most ${formatKas(spendable)} KAS (your spendable credit)`);
+      if (parsed > refundable) {
+        setAmountError(
+          callOnly > 0n
+            ? `You can get back at most ${formatKas(refundable)} KAS. Credit from failed calls only pays for calls and is never refunded.`
+            : `You can get back at most ${formatKas(refundable)} KAS (your refundable credit)`,
+        );
         return;
       }
       amountSompi = parsed.toString();
     }
-    const effective = amountSompi === undefined ? spendable : BigInt(amountSompi);
+    const effective = amountSompi === undefined ? refundable : BigInt(amountSompi);
     if (pricing.status === "ready" && effective < pricing.minOutput) {
       setAmountError(`A refund must be at least ${formatKas(pricing.minOutput)} KAS (the smallest standard Kaspa output). Spend smaller amounts on calls instead.`);
       return;
@@ -366,10 +404,63 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
     setBusy("status");
     setError(null);
     try {
-      const rows = await signAndSend<PrepaidRefundRead[]>({ slug: lookup.slug, payer_address: lookup.address, action: "status" }, "/api/prepaid/refunds/status", {});
-      setLookup({ ...lookup, refunds: rows, signed: true });
+      const refunds = await signAndSend<PrepaidRefundRead[]>({ slug: lookup.slug, payer_address: lookup.address, action: "status" }, "/api/prepaid/refunds/status", {});
+      setLookup({ ...lookup, refunds, signed: true });
     } catch (e) {
       setError(refundErrorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * CONTRACT v2.14 buyer credits: POST credits/challenge -> line-by-line check -> KasWare signMessage -> POST credits/status.
+   * A challenge is single use, so every page (the newest, then each "older" page via next_cursor) is a new signature.
+   */
+  async function loadCredits(more: boolean) {
+    if (!lookup) return;
+    const before = more ? (lookup.credits?.nextCursor ?? null) : null;
+    if (more && before === null) return;
+    setNotice(null);
+    setBusy(more ? "credits-more" : "credits");
+    setError(null);
+    try {
+      const wallet = getKasware();
+      if (!wallet) throw new Error("KasWare was not detected in this browser. Credits are shown only to the depositing key.");
+      const accounts = await wallet.requestAccounts();
+      if (accounts[0]?.trim().toLowerCase() !== lookup.address) throw new Error("The connected KasWare account is not this address. Switch accounts in KasWare and connect again.");
+      const wrongNetwork = await kaswareNetworkRefusal(wallet, KASPA_NETWORK);
+      if (wrongNetwork) throw new Error(wrongNetwork);
+      const challenge = await apiFetch<PrepaidCreditStatusChallenge>("/api/prepaid/credits/challenge", {
+        method: "POST",
+        body: { slug: lookup.slug, payer_address: lookup.address },
+      });
+      const refusal = checkCreditChallenge(challenge, { address: lookup.address, slug: lookup.slug, domain: EXPECTED_AUTH_DOMAIN });
+      if (refusal) throw new Error(refusal);
+      let signature: string;
+      try {
+        signature = await wallet.signMessage(challenge.message, { type: "schnorr" });
+      } catch (e) {
+        if (isWalletRejection(e)) throw new Error("You declined to sign in KasWare. Nothing was read.");
+        throw new Error(`KasWare: ${walletErrorText(e)}`);
+      }
+      if (!isSignatureToken(signature)) throw new Error("KasWare returned an unexpected signature.");
+      const body: PrepaidCreditStatusRequest = { nonce: challenge.nonce, signature: signature.trim().toLowerCase(), limit: CREDIT_STATUS_PAGE };
+      if (before !== null) body.before = before;
+      const reply = await apiFetch<unknown>("/api/prepaid/credits/status", { method: "POST", body });
+      const totals = parseBuyerCreditStatus(reply, CREDIT_STATUS_PAGE);
+      if (!totals) throw new Error("The gateway's credit status reply did not have the documented shape.");
+      const loaded = more && lookup.credits ? lookup.credits.items : [];
+      const seen = new Set(loaded.map((item) => item.credit_id));
+      const items = [...loaded, ...totals.credits.filter((item) => !seen.has(item.credit_id))];
+      setLookup({ ...lookup, credits: { totals, items, nextCursor: totals.next_cursor } });
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "invalid_cursor") {
+        setLookup({ ...lookup, credits: lookup.credits ? { ...lookup.credits, nextCursor: null } : null });
+        setError("The page marker for older credits was not accepted. Sign again from the newest credits.");
+      } else {
+        setError(refundErrorMessage(e));
+      }
     } finally {
       setBusy(null);
     }
@@ -380,6 +471,9 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
   const openRefund = lookup?.refunds?.find((r) => r.status === "requested" || r.status === "paying" || r.status === "payout_submitted") ?? null;
   const balance = lookup?.balance ?? null;
   const expired = balance?.expires_at ? Date.parse(balance.expires_at) <= Date.now() : false;
+  const limit = lookup ? refundLimit(lookup) : null;
+  const signedRefundable = balance && sompiOrNull(balance.refundable_sompi) !== null ? (balance.refundable_sompi ?? null) : null;
+  const signedCallOnly = balance && sompiOrNull(balance.credit_balance_sompi) !== null ? (balance.credit_balance_sompi ?? null) : null;
 
   return (
     <div className="mt-8 space-y-6">
@@ -487,6 +581,22 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                     <KasAmount sompi={balance.expired_sompi} align="left" />
                   </dd>
                 </div>
+                {signedRefundable !== null ? (
+                  <div>
+                    <dt className="label">Refundable</dt>
+                    <dd>
+                      <KasAmount sompi={signedRefundable} align="left" tone="text-zinc-100" />
+                    </dd>
+                  </div>
+                ) : null}
+                {signedCallOnly !== null ? (
+                  <div>
+                    <dt className="label" title="Credit from failed paid calls: spent first by calls, never refunded on-chain">Call-only credit</dt>
+                    <dd>
+                      <KasAmount sompi={signedCallOnly} align="left" tone={signedCallOnly === "0" ? "text-zinc-500" : "text-violet-300"} />
+                    </dd>
+                  </div>
+                ) : null}
               </dl>
             ) : (
               <>
@@ -529,9 +639,9 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
                     label="Amount (KAS)"
                     htmlFor="refund-amount"
                     error={amountError}
-                    hint={`Blank = all spendable credit (${formatKas(balance.spendable_sompi)} KAS). Minimum ${pricing.status === "ready" ? formatKas(pricing.minOutput) : "0.20"} KAS.`}
+                    hint={`Blank = all refundable credit (${formatKas(limit?.refundable ?? 0n)} KAS). Minimum ${pricing.status === "ready" ? formatKas(pricing.minOutput) : "0.20"} KAS.`}
                   >
-                    <input id="refund-amount" className="input font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={formatKas(balance.spendable_sompi)} inputMode="decimal" autoComplete="off" />
+                    <input id="refund-amount" className="input font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={formatKas(limit?.refundable ?? 0n)} inputMode="decimal" autoComplete="off" />
                   </Field>
                 </div>
                 <button type="submit" className="btn-primary sm:mt-6" disabled={busy !== null || !canSign}>
@@ -672,6 +782,106 @@ export function BuyerRefunds({ initialSlug }: { initialSlug: string }) {
               The merchant pays a refund on-chain to exactly this address for exactly the requested amount. Your balance drops only once that payment is seen on
               the network.
             </p>
+          </section>
+
+          <section className="space-y-2" aria-labelledby="buyer-credits-heading" data-buyer-credits>
+            <h2 id="buyer-credits-heading" className="text-sm font-medium text-zinc-100">
+              Credit from failed calls
+            </h2>
+            <div className="card space-y-3 p-4">
+              {lookup.credits ? (
+                <>
+                  <dl className="grid gap-4 sm:grid-cols-4" data-credit-totals>
+                    <div>
+                      <dt className="label">Credited in total</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.credited_sompi} align="left" tone="text-violet-300" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label" title="Spent first by calls; never paid back on-chain">Call-only credit (never refundable)</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.credit_balance_sompi} align="left" tone="text-zinc-100" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label">Refundable now</dt>
+                      <dd>
+                        <KasAmount sompi={lookup.credits.totals.refundable_sompi} align="left" tone="text-zinc-100" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="label">Credits</dt>
+                      <dd className="font-mono text-sm text-zinc-100" data-credit-count>
+                        {lookup.credits.totals.credit_count}
+                      </dd>
+                    </div>
+                  </dl>
+                  {lookup.credits.items.length > 0 ? (
+                    <table className="w-full min-w-[640px]">
+                      <thead>
+                        <tr className="border-b border-zinc-800">
+                          <th className="th">When</th>
+                          <th className="th">Call</th>
+                          <th className="th">Why</th>
+                          <th className="th text-right">Credited (call-only)</th>
+                          <th className="th text-right">Not credited (cap)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {lookup.credits.items.map((credit) => (
+                          <tr key={credit.credit_id} data-buyer-credit={credit.credit_id}>
+                            <td className="td whitespace-nowrap font-mono text-xs">{formatDateTime(credit.created_at)}</td>
+                            <td className="td font-mono text-xs">
+                              {credit.slug}
+                              <div className="text-[11px] text-zinc-600" title={credit.tx_id}>
+                                call {shortHash(credit.tx_id)}
+                              </div>
+                            </td>
+                            <td className="td text-xs text-zinc-400">{CREDIT_REASON_LABEL[credit.reason]}</td>
+                            <td className="td">
+                              <KasAmount sompi={credit.credit_sompi} tone="text-violet-300" />
+                            </td>
+                            <td className="td">
+                              <KasAmount sompi={credit.shortfall_sompi} tone={credit.shortfall_sompi === "0" ? "text-zinc-600" : "text-amber-300"} />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <p className="text-xs text-zinc-500">No paid call to this merchant has been credited.</p>
+                  )}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <p className="text-[11px] text-zinc-500" data-credit-shown>
+                      Showing {lookup.credits.items.length} of {lookup.credits.totals.credit_count} credits, newest first.
+                    </p>
+                    {lookup.credits.nextCursor !== null ? (
+                      <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void loadCredits(true)} disabled={busy !== null || !canSign} data-more-credits>
+                        {busy === "credits-more" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <ChevronDown className="h-3.5 w-3.5" aria-hidden />}
+                        Sign to load older credits
+                      </button>
+                    ) : null}
+                    <button type="button" className="btn-ghost px-2 py-1 text-xs" onClick={() => void loadCredits(false)} disabled={busy !== null || !canSign} data-reload-credits>
+                      <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+                      Newest
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-wrap items-center gap-3">
+                  <button type="button" className="btn-secondary px-3 py-1.5 text-xs" onClick={() => void loadCredits(false)} disabled={busy !== null || !canSign} data-load-credits>
+                    {busy === "credits" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                    Sign to see credits
+                  </button>
+                  <p className="text-[11px] text-zinc-500">Shown only to the depositing key. Each page is one read-only KasWare signature (it authorises nothing else).</p>
+                </div>
+              )}
+              <p className="text-[11px] text-zinc-500">
+                When a paid call fails for good, the merchant&apos;s share comes back to you as call-only credit: it pays for your next calls first and is never paid back
+                on-chain. The platform fee is not returned.
+              </p>
+            </div>
           </section>
         </>
       ) : busy === "lookup" ? (

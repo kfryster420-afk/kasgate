@@ -19,7 +19,7 @@ export function parseRetryAfter(value: string | null): number | undefined {
 }
 
 interface GatewayRequest {
-  method?: "GET" | "POST" | "PATCH" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   /** Session token (`kgs_…`) sent as `Authorization: Bearer`. */
   bearer?: string;
   /** Pre-serialised JSON body. */

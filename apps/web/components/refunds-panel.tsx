@@ -4,13 +4,16 @@ import { Ban, ChevronLeft, ChevronRight, FileSignature, Hash, ListTree, Loader2,
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch, errorMessage } from "@/lib/api-client";
 import { IS_TESTNET, TESTNET_EXPLORER_URL } from "@/lib/config";
-import { formatDateTime, shortAddress, shortHash } from "@/lib/format";
+import { formatDateTime, formatUsd, shortAddress, shortHash } from "@/lib/format";
+import { usdForSompi } from "@/lib/usd-at-settlement";
+import { CREDIT_REASON_LABEL, LEDGER_KIND_LABEL, LEDGER_KIND_TONE } from "@/lib/credit-labels";
 import { refundErrorMessage } from "@/lib/refund-errors";
+import { formatKas } from "@/lib/sompi";
 import { claimExpiresAt, claimLeavesTime, forgetPayout, minutesLeft, recordedPayout, rememberPayout, sendRefundPayout, UNKNOWN_TXID, type RecordedPayout } from "@/lib/refund-payout";
 import {
   PREPAID_REFUND_REASON_MAX_LENGTH,
   type MerchantRead,
-  type PrepaidLedgerEntryRead,
+  type PrepaidLedgerEntryWithUsd,
   type PrepaidRefundPayoutRead,
   type PrepaidRefundRead,
   type PrepaidRefundStatus,
@@ -520,7 +523,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
   const [tab, setTab] = useState<Tab>("open");
   const [page, setPage] = useState(0);
   const [refunds, setRefunds] = useState<PrepaidRefundRead[]>([]);
-  const [ledger, setLedger] = useState<PrepaidLedgerEntryRead[]>([]);
+  const [ledger, setLedger] = useState<PrepaidLedgerEntryWithUsd[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [localReload, setLocalReload] = useState(0);
@@ -540,7 +543,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
     const offset = page * PAGE_SIZE;
     const load = async () => {
       if (tab === "ledger") {
-        const rows = await apiFetch<PrepaidLedgerEntryRead[]>(`/api/prepaid/ledger?limit=${PAGE_SIZE}&offset=${offset}`);
+        const rows = await apiFetch<PrepaidLedgerEntryWithUsd[]>(`/api/prepaid/ledger?limit=${PAGE_SIZE}&offset=${offset}`);
         if (!cancelled) setLedger(rows);
         return;
       }
@@ -650,10 +653,18 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                     {shortAddress(entry.payer_address)}
                   </td>
                   <td className="td">
-                    <span className={`badge ${entry.kind === "refund" ? "border-sky-800 bg-sky-950/50 text-sky-300" : "border-zinc-700 bg-zinc-900 text-zinc-300"}`}>
-                      {entry.kind === "refund" ? "refund payout" : "credit expired"}
-                    </span>
+                    <span className={`badge ${LEDGER_KIND_TONE[entry.kind]}`}>{LEDGER_KIND_LABEL[entry.kind]}</span>
                     <div className="mt-1 font-mono text-[11px] text-zinc-600">{entry.direction}</div>
+                    {entry.kind === "failed_delivery_credit" ? (
+                      <div className="mt-1 text-[11px] text-zinc-400" data-ledger-credit>
+                        {entry.slug ? <span className="font-mono">{entry.slug}</span> : null}
+                        {entry.credit_reason ? ` · ${CREDIT_REASON_LABEL[entry.credit_reason]}` : null}
+                        <div className="text-zinc-500">Call-only: never refunded on-chain.</div>
+                        {BigInt(entry.shortfall_sompi) > 0n ? (
+                          <div className="text-amber-300/90">Not credited (balance cap): {formatKas(BigInt(entry.shortfall_sompi))} KAS</div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </td>
                   <td className="td">
                     <KasAmount sompi={entry.amount_sompi} tone={entry.direction === "debit" ? "text-amber-300" : "text-emerald-300"} />
@@ -662,9 +673,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
                     <KasAmount sompi={entry.balance_after_sompi} />
                   </td>
                   <td className="td text-right" data-ledger-usd>
-                    <span className="text-xs text-zinc-500" title="The gateway records no KAS/USD rate for refund payouts and expiries (PrepaidLedgerEntryRead has no USD fields); the deposits these credits came from carry their USD value in Settlements.">
-                      not recorded
-                    </span>
+                    <LedgerUsd entry={entry} />
                   </td>
                   <td className="td">
                     {entry.tx_id ? txLink(entry.tx_id) : null}
@@ -696,7 +705,7 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
         )}
         {!loading && rowsShown === 0 ? (
           <div className="td py-8 text-center text-zinc-500">
-            {tab === "ledger" ? "No refund payouts or expiries yet." : tab === "open" ? "No open refund requests." : "No refunds in this view."}
+            {tab === "ledger" ? "No refund payouts, expiries or failed-call credits yet." : tab === "open" ? "No open refund requests." : "No refunds in this view."}
           </div>
         ) : null}
         {loading ? (
@@ -707,5 +716,29 @@ export function RefundsPanel({ merchant, reloadKey, onMerchantChange, onUnauthor
       </div>
       <CreditExpirySettings merchant={merchant} onSaved={onMerchantChange} onUnauthorized={onUnauthorized} />
     </section>
+  );
+}
+
+/** USD at settlement for a ledger row: failed-call credits use the credited call's settlement rate; refunds and expiries have none. */
+function LedgerUsd({ entry }: { entry: PrepaidLedgerEntryWithUsd }) {
+  if (entry.kind !== "failed_delivery_credit") {
+    return (
+      <span className="text-xs text-zinc-500" title="The gateway records no KAS/USD rate for refund payouts and expiries (PrepaidLedgerEntryRead has no USD fields); the deposits these credits came from carry their USD value in Settlements.">
+        not recorded
+      </span>
+    );
+  }
+  const usd = entry.usd ? usdForSompi(entry.amount_sompi, entry.usd.kas_usd_rate) : null;
+  if (usd === null) {
+    return (
+      <span className="text-xs text-zinc-500" title="The credited call's settlement has no KAS/USD rate, or it is older than the newest 1,000 settlements this view looks through.">
+        no rate
+      </span>
+    );
+  }
+  return (
+    <span className="font-mono text-xs text-zinc-200" title={`At the credited call's settlement rate of $${entry.usd?.kas_usd_rate ?? ""} per KAS`}>
+      {formatUsd(usd)}
+    </span>
   );
 }
