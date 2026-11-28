@@ -87,8 +87,10 @@ async function failure(promise: Promise<unknown>): Promise<DemoError> {
 }
 
 test("fetchChallenge: trials disabled when the 402 carries no offer", async () => {
-  const error = await failure(fetchChallenge(config(() => new Response(body(), { status: 402 })), PATH));
+  const seen: bigint[] = [];
+  const error = await failure(fetchChallenge({ ...config(() => new Response(body(), { status: 402 })), onChallenge: (c) => seen.push(c.totalSompi) }, PATH));
   assert.equal(error.kind, "trials_disabled");
+  assert.deepEqual(seen, [60000000n]);
 });
 
 test("fetchChallenge: gateway down on network failure and 503; 429 keeps Retry-After", async () => {
@@ -141,6 +143,12 @@ test("runTrialCall signs the rebuilt text, sends X-KasGate-Trial and reads the r
   assert.equal(outcome.remaining, 0);
   assert.equal(outcome.receiptStatus, "used");
   assert.equal(outcome.body, '{"ok":true}');
+});
+
+test("runTrialCall: a refunded trial (upstream down) is reported as upstream_failed", async () => {
+  const receipt = btoa(JSON.stringify({ status: "refunded", nonce: "ab".repeat(16) }));
+  const error = await failure(runTrialCall(trialGateway(() => new Response("{}", { status: 502, headers: { "X-KasGate-Trial-Receipt": receipt } })), PATH));
+  assert.equal(error.kind, "upstream_failed");
 });
 
 test("runTrialCall: exhausted trial and daily cap map to trial_cap_reached; a non-trial answer is refused", async () => {

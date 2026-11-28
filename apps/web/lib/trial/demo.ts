@@ -24,6 +24,7 @@ export type DemoErrorKind =
   | "trials_disabled"
   | "trial_cap_reached"
   | "trial_replayed"
+  | "upstream_failed"
   | "bad_response";
 
 export class DemoError extends Error {
@@ -201,10 +202,10 @@ export async function fetchChallenge(config: DemoConfig, path: string): Promise<
     throw new DemoError("bad_response", `Expected an HTTP 402 from the demo endpoint but got ${response.status}.`);
   }
   const challenge = parsePayment402(await response.text(), response.headers, config);
+  config.onChallenge?.(challenge);
   if (challenge.trialCalls === null) {
     throw new DemoError("trials_disabled", "Free trials are not switched on for this demo endpoint right now. You can still pay for real below.");
   }
-  config.onChallenge?.(challenge);
   return challenge;
 }
 
@@ -258,6 +259,9 @@ export async function runTrialCall(config: DemoConfig, path: string): Promise<Tr
   const limit = Number(call.headers.get("X-KasGate-Trial-Limit"));
   const remaining = Number(call.headers.get("X-KasGate-Trial-Remaining"));
   const receiptStatus = receipt["status"] === "used" || receipt["status"] === "refunded" ? receipt["status"] : null;
+  if (receiptStatus === "refunded" || call.status >= 500) {
+    throw new DemoError("upstream_failed", "The demo API did not answer, so this free call was not counted. Try again in a moment.");
+  }
   return {
     status: call.status,
     contentType: call.headers.get("Content-Type") ?? "",
