@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test lib/trial/demo.test.ts"
+    "test:unit": "tsx --test lib/server/client-ip.test.mjs lib/balance-read.test.mjs lib/credit-status.test.mjs",
+    "test": "npm run test:unit && tsx --test lib/trial/demo.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",

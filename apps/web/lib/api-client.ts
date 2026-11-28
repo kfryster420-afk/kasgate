@@ -6,13 +6,16 @@ export class ApiError extends Error {
   readonly code: string | undefined;
   /** Per-row errors keyed by selection index (POST /api/endpoints/import only). */
   readonly rowErrors: Record<string, string>;
+  /** Seconds to wait before retrying (from the gateway's Retry-After), when given. */
+  readonly retryAfter: number | undefined;
 
-  constructor(message: string, status: number, code?: string, rowErrors: Record<string, string> = {}) {
+  constructor(message: string, status: number, code?: string, rowErrors: Record<string, string> = {}, retryAfter?: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.rowErrors = rowErrors;
+    this.retryAfter = retryAfter;
   }
 
   get isNodeUnavailable(): boolean {
@@ -40,18 +43,20 @@ export async function apiFetch<T>(path: string, init: { method?: string; body?: 
     let message = `Request failed (HTTP ${response.status})`;
     let code: string | undefined;
     let rowErrors: Record<string, string> = {};
+    let retryAfter: number | undefined;
     try {
       const parsed = JSON.parse(text) as Partial<ApiErrorBody>;
       if (typeof parsed.error === "string") message = parsed.error;
       if (typeof parsed.code === "string") code = parsed.code;
       if (parsed.row_errors && typeof parsed.row_errors === "object") rowErrors = parsed.row_errors;
+      if (typeof parsed.retry_after === "number" && Number.isInteger(parsed.retry_after) && parsed.retry_after >= 0) retryAfter = parsed.retry_after;
     } catch {
       /* keep generic message */
     }
     if (code === "rpc_unavailable" || response.status === 503) {
       throw new ApiError(KASPA_UNAVAILABLE_MESSAGE, 503, "rpc_unavailable");
     }
-    throw new ApiError(message, response.status, code, rowErrors);
+    throw new ApiError(message, response.status, code, rowErrors, retryAfter);
   }
   return JSON.parse(text) as T;
 }

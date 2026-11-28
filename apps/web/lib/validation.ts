@@ -2,11 +2,15 @@ import { ADDRESS_PREFIX, MAX_SOMPI, MAX_USD_MICROS } from "./config";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, minPriceSompi } from "./sompi";
 import {
   HTTP_METHODS,
+  PREPAID_EXPIRY_DAYS_MAX,
+  PREPAID_REFUND_REASON_MAX_LENGTH,
+  PREPAID_REFUND_STATUSES,
   PRICE_CURRENCIES,
   TRIAL_DAILY_CAP_MAX,
   TRIAL_MAX_CALLS,
   WEBHOOK_EVENT_TYPES,
   type HttpMethod,
+  type PrepaidRefundStatus,
   type PriceCurrency,
   type WebhookEventType,
 } from "./types";
@@ -237,4 +241,53 @@ export function checkWebhookEventTypes(input: unknown): Check<WebhookEventType[]
     if (!out.includes(item as WebhookEventType)) out.push(item as WebhookEventType);
   }
   return ok(out.sort());
+}
+
+/**
+ * CONTRACT v2.13 credit expiry (schemas.PrepaidExpiryDays): null (never expire / use the merchant default) or a whole
+ * number of days 1..3650. Strict like the gateway: numbers only, no numeric strings.
+ */
+export function checkPrepaidExpiryDays(input: unknown): Check<number | null> {
+  if (input === null) return ok(null);
+  if (typeof input !== "number" || !Number.isInteger(input) || input < 1 || input > PREPAID_EXPIRY_DAYS_MAX) {
+    return fail(`Credit expiry must be a whole number of days from 1 to ${PREPAID_EXPIRY_DAYS_MAX.toLocaleString("en-US")}`);
+  }
+  return ok(input);
+}
+
+/** Parses the text of an expiry input: blank means null, otherwise 1..3650 whole days. */
+export function parseExpiryDaysInput(text: string): Check<number | null> {
+  const value = text.trim();
+  if (value === "") return ok(null);
+  if (!/^\d{1,4}$/.test(value)) return checkPrepaidExpiryDays(Number.NaN);
+  return checkPrepaidExpiryDays(Number(value));
+}
+
+/** schemas.PrepaidRefundReject.reason: 1..300 characters (after trimming). */
+export function checkRefundReason(input: unknown): Check<string> {
+  if (typeof input !== "string" || input.trim() === "") return fail("Give the buyer a reason");
+  const value = input.trim();
+  if (value.length > PREPAID_REFUND_REASON_MAX_LENGTH) return fail(`Reason must be at most ${PREPAID_REFUND_REASON_MAX_LENGTH} characters`);
+  return ok(value);
+}
+
+/** A Kaspa transaction id: 64 hex (normalised to lowercase, as validate_tx_id accepts). */
+export function checkTxId(input: unknown): Check<string> {
+  if (typeof input !== "string" || !/^[0-9a-fA-F]{64}$/.test(input.trim())) return fail("A transaction id is 64 hex characters");
+  return ok(input.trim().toLowerCase());
+}
+
+/** A positive sompi amount as a decimal string (SompiStr: at most 18 digits). */
+export function checkSompiAmount(input: unknown): Check<string> {
+  if (typeof input !== "string" || !/^[1-9][0-9]{0,17}$/.test(input.trim())) return fail("Amount must be a positive whole number of sompi (at most 18 digits)");
+  return ok(input.trim());
+}
+
+export function checkSlug(input: unknown): Check<string> {
+  if (typeof input !== "string" || !SLUG_RE.test(input.trim().toLowerCase())) return fail("Enter the endpoint slug (3-64 lowercase letters, digits or dashes)");
+  return ok(input.trim().toLowerCase());
+}
+
+export function isRefundStatus(value: unknown): value is PrepaidRefundStatus {
+  return typeof value === "string" && (PREPAID_REFUND_STATUSES as readonly string[]).includes(value);
 }

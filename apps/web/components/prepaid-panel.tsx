@@ -1,11 +1,12 @@
 "use client";
 
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { apiFetch, errorMessage } from "@/lib/api-client";
 import { formatDateTime, formatUsd, shortAddress, shortHash } from "@/lib/format";
 import { formatKas, formatSompi } from "@/lib/sompi";
-import type { EndpointRead, PrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
+import type { EndpointRead, MerchantPrepaidBalanceRead, PrepaidDebitRead, PrepaidDepositRead, PrepaidLedgerKind } from "@/lib/types";
 import { ErrorBanner, Spinner } from "./ui";
 
 const PAGE_SIZE = 25;
@@ -16,7 +17,7 @@ const TABS: { kind: PrepaidLedgerKind; label: string }[] = [
 ];
 
 type Rows =
-  | { kind: "balances"; rows: PrepaidBalanceRead[] }
+  | { kind: "balances"; rows: MerchantPrepaidBalanceRead[] }
   | { kind: "deposits"; rows: PrepaidDepositRead[] }
   | { kind: "debits"; rows: PrepaidDebitRead[] };
 
@@ -68,7 +69,12 @@ export function PrepaidPanel({ endpoints, reloadKey }: { endpoints: EndpointRead
           </h2>
           <p className="text-xs text-zinc-500">
             Deposits settle on-chain to your address (you receive the deposit minus the platform fee); balances are what buyers can still spend on your
-            endpoints. Refunded debits (upstream failed) are returned to the buyer&apos;s balance.
+            endpoints. Refunded debits (upstream failed) are returned to the buyer&apos;s balance. Spendable excludes credit held by an open refund request and
+            is 0 once the credit has expired. Buyers can ask for unused credit back on the{" "}
+            <Link href="/prepaid/refunds" className="text-kas-300 hover:underline">
+              buyer refund page
+            </Link>
+            .
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -101,13 +107,21 @@ export function PrepaidPanel({ endpoints, reloadKey }: { endpoints: EndpointRead
       <ErrorBanner message={error} />
       <div className="card overflow-x-auto">
         {data.kind === "balances" ? (
-          <table className="w-full min-w-[720px]">
+          <table className="w-full min-w-[1420px]">
             <thead>
               <tr className="border-b border-zinc-800">
                 <th className="th">Buyer</th>
                 <th className="th text-right">Balance</th>
+                <th className="th text-right">Spendable</th>
+                <th className="th text-right">Refund hold</th>
+                <th className="th text-right">Refundable</th>
+                <th className="th text-right" title="Unspent failed-call credit: pays for calls first, never refunded on-chain">Call-only credit</th>
                 <th className="th text-right">Deposited (credit)</th>
+                <th className="th text-right" title="Merchant shares of failed paid calls credited back (CONTRACT v2.14)">Failed-call credited</th>
                 <th className="th text-right">Debited</th>
+                <th className="th text-right">Refunded</th>
+                <th className="th text-right">Expired</th>
+                <th className="th">Expires (UTC)</th>
                 <th className="th">Updated (UTC)</th>
               </tr>
             </thead>
@@ -118,8 +132,22 @@ export function PrepaidPanel({ endpoints, reloadKey }: { endpoints: EndpointRead
                     {shortAddress(row.payer_address)}
                   </td>
                   <Kas sompi={row.balance_sompi} tone="text-kas-300" />
+                  <Kas sompi={row.spendable_sompi} tone="text-emerald-300" />
+                  <Kas sompi={row.refund_hold_sompi} tone={row.refund_hold_sompi === "0" ? "text-zinc-500" : "text-amber-300"} />
+                  <Kas sompi={row.refundable_sompi} />
+                  <Kas sompi={row.credit_balance_sompi} tone={row.credit_balance_sompi === "0" ? "text-zinc-500" : "text-violet-300"} />
                   <Kas sompi={row.deposited_sompi} />
+                  <Kas sompi={row.credited_sompi} tone={row.credited_sompi === "0" ? "text-zinc-500" : "text-violet-300"} />
                   <Kas sompi={row.debited_sompi} />
+                  <Kas sompi={row.refunded_sompi} />
+                  <Kas sompi={row.expired_sompi} />
+                  <td className="td whitespace-nowrap font-mono text-xs">
+                    {row.expires_at ? (
+                      <span className={Date.parse(row.expires_at) <= Date.now() ? "text-red-300" : "text-zinc-300"}>{formatDateTime(row.expires_at)}</span>
+                    ) : (
+                      <span className="text-zinc-600">never</span>
+                    )}
+                  </td>
                   <td className="td whitespace-nowrap font-mono text-xs">{row.updated_at ? formatDateTime(row.updated_at) : "—"}</td>
                 </tr>
               ))}

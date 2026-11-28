@@ -9,7 +9,9 @@ import type { EndpointRead, MerchantKeyIssued, MerchantRead } from "@/lib/types"
 import { AnalyticsPanel } from "./analytics-panel";
 import { ApiKeyReveal } from "./api-key-reveal";
 import { EndpointsPanel } from "./endpoints-panel";
+import { AutoCreditPanel } from "./auto-credit-panel";
 import { PrepaidPanel } from "./prepaid-panel";
+import { RefundsPanel } from "./refunds-panel";
 import { TrialsPanel } from "./trials-panel";
 import { WebhooksPanel } from "./webhooks-panel";
 import { SettlementsPanel } from "./settlements-panel";
@@ -115,6 +117,8 @@ export function DashboardClient() {
           <EndpointsPanel endpoints={endpoints} onChanged={() => setReloadKey((k) => k + 1)} onUnauthorized={toLogin} />
           <SettlementsPanel endpoints={endpoints} reloadKey={reloadKey} />
           <PrepaidPanel endpoints={endpoints} reloadKey={reloadKey} />
+          <RefundsPanel merchant={merchant} reloadKey={reloadKey} onMerchantChange={setMerchant} onUnauthorized={toLogin} />
+          <AutoCreditPanel reloadKey={reloadKey} onUnauthorized={toLogin} />
           <TrialsPanel endpoints={endpoints} reloadKey={reloadKey} />
           <WebhooksPanel reloadKey={reloadKey} />
         </>
