@@ -88,6 +88,5 @@ class SpendBudget:
 
     async def release(self, amount_sompi: int) -> None:
         async with self._lock:
-            if amount_sompi > self.reserved_sompi:
-                amount_sompi = self.reserved_sompi
+            amount_sompi = min(amount_sompi, self.reserved_sompi)
             self.reserved_sompi -= amount_sompi

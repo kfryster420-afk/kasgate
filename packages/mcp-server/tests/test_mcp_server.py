@@ -8,20 +8,21 @@ from typing import Any
 import httpx
 import pytest
 from kasgate_client import KasGateClient
-from kasgate_mcp import Config, build_server
-from kasgate_mcp.server import validate_path, validate_slug
 from mcp import Client
 from sdk_helpers import (
     MERCHANT,
     MIN_PRICE,
-    PAYER_KEY,
     NONCE,
+    PAYER_KEY,
     PRICE,
     FakeGateway,
     challenge,
     make_utxo,
     static_utxos,
 )
+
+from kasgate_mcp import Config, build_server
+from kasgate_mcp.server import validate_path, validate_slug
 
 KAS = 100_000_000
 DIRECTORY = {
@@ -135,6 +136,7 @@ EXPECTED_TOOLS = {
     "prepaid_refunds",
     "trial_status",
     "call_free_trial",
+    "get_credit_status",
 }
 
 

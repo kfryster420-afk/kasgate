@@ -15,13 +15,17 @@ from urllib.parse import quote, unquote
 
 import httpx
 from kasgate_client import (
+    DEFAULT_CREDIT_PAGE_BUDGET,
     DEFAULT_MAX_PRICE_SOMPI,
+    MAX_STATUS_CREDITS,
+    CreditObservation,
     KasGateClient,
     KasGateError,
     PaymentReceipt,
     PrepaidReceipt,
     PrepaidRefund,
     TrialReceipt,
+    credit_of,
     kas_to_sompi,
     prepaid_receipt_of,
     receipt_of,
@@ -52,13 +56,19 @@ def read_key_file(path: str, *, allow_insecure: bool = False) -> str:
     """
     expanded = os.path.expanduser(path)
     try:
-        fd = os.open(expanded, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))  # never block on a FIFO
+        fd = os.open(
+            expanded, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        )  # never block on a FIFO
     except OSError as exc:
-        raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be opened: {exc.strerror}") from exc
+        raise SystemExit(
+            f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be opened: {exc.strerror}"
+        ) from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} is not a regular file")
+            raise SystemExit(
+                f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} is not a regular file"
+            )
         if os.name != "nt" and info.st_mode & 0o077:
             mode = stat.S_IMODE(info.st_mode)
             if not allow_insecure:
@@ -66,15 +76,23 @@ def read_key_file(path: str, *, allow_insecure: bool = False) -> str:
                     f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} has mode {mode:04o}: it must not be readable by "
                     f"group or others (chmod 600), or set KASGATE_ALLOW_INSECURE_KEY_FILE=1 to override"
                 )
-            logger.warning("buyer key file %s has mode %04o and is readable by others (override in effect)", expanded, mode)
+            logger.warning(
+                "buyer key file %s has mode %04o and is readable by others (override in effect)",
+                expanded,
+                mode,
+            )
         try:
             text = os.read(fd, 4096).decode("utf-8").strip()
         except (OSError, UnicodeDecodeError) as exc:
-            raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be read as text") from exc
+            raise SystemExit(
+                f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} cannot be read as text"
+            ) from exc
     finally:
         os.close(fd)
     if not KEY_RE.fullmatch(text):
-        raise SystemExit(f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} must contain one 64-character hex private key")
+        raise SystemExit(
+            f"KASGATE_BUYER_PRIVATE_KEY_FILE {expanded!r} must contain one 64-character hex private key"
+        )
     return text
 
 
@@ -94,6 +112,8 @@ class Config:
     session_budget_sompi: int = DEFAULT_MAX_PRICE_SOMPI
     timeout_seconds: float = 60.0
     use_free_trials: bool = True
+    auto_confirm_credit: bool = True
+    credit_page_budget: int = DEFAULT_CREDIT_PAGE_BUDGET
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -110,33 +130,67 @@ class Config:
         inline_key = (env.get("KASGATE_BUYER_PRIVATE_KEY") or "").strip() or None
         if key_file:
             if inline_key:
-                logger.warning("KASGATE_BUYER_PRIVATE_KEY_FILE is set: ignoring KASGATE_BUYER_PRIVATE_KEY")
+                logger.warning(
+                    "KASGATE_BUYER_PRIVATE_KEY_FILE is set: ignoring KASGATE_BUYER_PRIVATE_KEY"
+                )
             buyer_key: str | None = read_key_file(
-                key_file, allow_insecure=env.get("KASGATE_ALLOW_INSECURE_KEY_FILE", "").strip().lower() in TRUTHY
+                key_file,
+                allow_insecure=env.get("KASGATE_ALLOW_INSECURE_KEY_FILE", "")
+                .strip()
+                .lower()
+                in TRUTHY,
             )
         else:
             buyer_key = inline_key
         try:
             timeout = float(env.get("KASGATE_REQUEST_TIMEOUT", "60"))
         except ValueError as exc:
-            raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a number of seconds") from exc
+            raise SystemExit(
+                "KASGATE_REQUEST_TIMEOUT must be a number of seconds"
+            ) from exc
         if not 0 < timeout < float("inf"):
-            raise SystemExit("KASGATE_REQUEST_TIMEOUT must be a positive number of seconds")
+            raise SystemExit(
+                "KASGATE_REQUEST_TIMEOUT must be a positive number of seconds"
+            )
+        try:
+            page_budget = int(
+                env.get(
+                    "KASGATE_CREDIT_PAGE_BUDGET", str(DEFAULT_CREDIT_PAGE_BUDGET)
+                ).strip()
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                "KASGATE_CREDIT_PAGE_BUDGET must be an integer within 1..100"
+            ) from exc
+        if not 1 <= page_budget <= 100:
+            raise SystemExit(
+                "KASGATE_CREDIT_PAGE_BUDGET must be an integer within 1..100"
+            )
         return cls(
-            gateway_url=env.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip("/"),
+            gateway_url=env.get("KASGATE_GATEWAY_URL", "http://localhost:8000").rstrip(
+                "/"
+            ),
             buyer_private_key=buyer_key,
             network=env.get("KASGATE_NETWORK", "kaspa:testnet-10"),
             rpc_url=(env.get("KASGATE_RPC_URL") or "").strip() or None,
             max_price_sompi=max_price,
             session_budget_sompi=session_budget,
             timeout_seconds=timeout,
-            use_free_trials=env.get("KASGATE_USE_FREE_TRIALS", "1").strip().lower() in TRUTHY,
+            use_free_trials=env.get("KASGATE_USE_FREE_TRIALS", "1").strip().lower()
+            in TRUTHY,
+            auto_confirm_credit=env.get("KASGATE_AUTO_CONFIRM_CREDIT", "1")
+            .strip()
+            .lower()
+            in TRUTHY,
+            credit_page_budget=page_budget,
         )
 
 
 def validate_slug(slug: str) -> str:
     if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
-        raise ToolError("slug must be 3-64 characters of lowercase letters, digits and hyphens")
+        raise ToolError(
+            "slug must be 3-64 characters of lowercase letters, digits and hyphens"
+        )
     return slug
 
 
@@ -144,19 +198,30 @@ def validate_path(path: str | None) -> str:
     """Keep the request inside /p/{slug}: no traversal, no absolute URLs, no control characters."""
     path = (path or "").strip()
     if "://" in path or path.startswith("//") or _BAD_PATH_CHARS.search(path):
-        raise ToolError("path must be a relative URL path (optionally with a ?query), without scheme or host")
+        raise ToolError(
+            "path must be a relative URL path (optionally with a ?query), without scheme or host"
+        )
     raw_path, _, query = path.partition("?")
     segments = [segment for segment in raw_path.split("/") if segment != ""]
     for segment in segments:
         decoded = unquote(unquote(segment))
-        if decoded in {".", ".."} or "/" in decoded or "\\" in decoded or "\x00" in decoded:
+        if (
+            decoded in {".", ".."}
+            or "/" in decoded
+            or "\\" in decoded
+            or "\x00" in decoded
+        ):
             raise ToolError("path traversal segments are not allowed")
     cleaned = "/".join(segments)
     return f"{cleaned}?{query}" if query else cleaned
 
 
 def _truncate(text: str) -> str:
-    return text if len(text) <= MAX_RESULT_CHARS else text[:MAX_RESULT_CHARS] + "\n...[truncated]"
+    return (
+        text
+        if len(text) <= MAX_RESULT_CHARS
+        else text[:MAX_RESULT_CHARS] + "\n...[truncated]"
+    )
 
 
 def _describe_response(response: httpx.Response) -> dict[str, Any]:
@@ -169,7 +234,11 @@ def _describe_response(response: httpx.Response) -> dict[str, Any]:
             body = _truncate(response.text)
     else:
         body = _truncate(response.text)
-    return {"status_code": response.status_code, "content_type": content_type, "body": body}
+    return {
+        "status_code": response.status_code,
+        "content_type": content_type,
+        "body": body,
+    }
 
 
 def _describe_receipt(receipt: PaymentReceipt) -> dict[str, Any]:
@@ -195,6 +264,60 @@ def _describe_prepaid_receipt(receipt: PrepaidReceipt) -> dict[str, Any]:
         "balance_kas": sompi_to_kas(int(receipt.balanceSompi)),
         "amount_sompi": int(receipt.amountSompi),
         "balance_sompi": int(receipt.balanceSompi),
+    }
+
+
+CREDIT_NOTES = {
+    "hint": (
+        "UNVERIFIED: X-KasGate-Credit is an unsigned hint. Do not count this as credit until the gateway's signed "
+        "credit status lists it (get_credit_status)."
+    ),
+    "confirmed": (
+        "Confirmed: the gateway's signed credit status lists this credit. This is call-only credit at this merchant: "
+        "spend it with call_prepaid_endpoint. It is not refundable and it does not reduce the session budget's "
+        "spent amount."
+    ),
+    "unconfirmed": (
+        "The signed credit status did not corroborate this hint (or could not be read). Do not rely on any credit "
+        "from it; get_credit_status can check again."
+    ),
+    "invalid": "The credit header was malformed or did not fit this call and was ignored. No credit is claimed.",
+}
+
+
+def _describe_credit(observation: CreditObservation) -> dict[str, Any]:
+    """The `credit` part of a paid-call result. Amounts appear at top level only once the balance confirms them."""
+    hint = observation.hint
+    confirmation = observation.confirmation
+    return {
+        "status": observation.status,
+        "confirmed": observation.confirmed,
+        "credit_sompi": hint.credit_sompi if observation.confirmed and hint else None,
+        "credit_kas": sompi_to_kas(hint.credit_sompi)
+        if observation.confirmed and hint
+        else None,
+        "hint": None
+        if hint is None
+        else {
+            "credit_id": str(hint.creditId),
+            "tx_id": hint.txId,
+            "merchant_id": str(hint.merchantId),
+            "credit_sompi": hint.credit_sompi,
+            "reason": hint.reason,
+        },
+        "confirmation": None
+        if confirmation is None
+        else {
+            "basis": confirmation.basis,
+            "credited_sompi": confirmation.credited_sompi,
+            "baseline_credited_sompi": confirmation.baseline_credited_sompi,
+            "http_status": confirmation.http_status,
+            "error_code": confirmation.error_code,
+            "pages_read": confirmation.pages_read,
+            "detail": confirmation.detail,
+        },
+        "error": observation.error,
+        "note": CREDIT_NOTES[observation.status],
     }
 
 
@@ -229,15 +352,22 @@ def build_server(
             "withdraw it with prepaid_refund_cancel). Endpoints may offer free trial calls: "
             "the paying tools use them automatically before paying (see `trial` in the result), trial_status shows "
             "what is left and call_free_trial makes a call that can never pay. A tighter max_price_kas can only "
-            "lower the configured ceiling, never raise it. Keys are never logged."
+            "lower the configured ceiling, never raise it. A failed paid call may report a `credit`: treat it as real "
+            "only when credit.confirmed is true (the gateway's signed credit status lists it), never from the header "
+            "alone; get_credit_status shows this key's credits at a merchant. Keys are never logged."
         ),
     )
     state: dict[str, Any] = {"http": http_client, "buyer": buyer}
-    budget = SpendBudget(per_call_max_sompi=cfg.max_price_sompi, session_cap_sompi=cfg.session_budget_sompi)
+    budget = SpendBudget(
+        per_call_max_sompi=cfg.max_price_sompi,
+        session_cap_sompi=cfg.session_budget_sompi,
+    )
 
     def public_http() -> httpx.AsyncClient:
         if state["http"] is None:
-            state["http"] = httpx.AsyncClient(timeout=cfg.timeout_seconds, follow_redirects=False)
+            state["http"] = httpx.AsyncClient(
+                timeout=cfg.timeout_seconds, follow_redirects=False
+            )
         return state["http"]
 
     def paying_client() -> KasGateClient:
@@ -256,6 +386,8 @@ def build_server(
                     timeout=cfg.timeout_seconds,
                     follow_redirects=False,
                     use_free_trials=cfg.use_free_trials,
+                    auto_confirm_credit=cfg.auto_confirm_credit,
+                    credit_page_budget=cfg.credit_page_budget,
                 )
             except KasGateError as exc:
                 raise ToolError(f"cannot start the payment client: {exc}") from exc
@@ -267,7 +399,9 @@ def build_server(
         except httpx.HTTPError as exc:
             raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
         if response.status_code != 200:
-            raise ToolError(f"gateway answered {response.status_code}: {response.text[:300]}")
+            raise ToolError(
+                f"gateway answered {response.status_code}: {response.text[:300]}"
+            )
         try:
             return response.json()
         except ValueError as exc:
@@ -314,7 +448,9 @@ def build_server(
         kwargs = _request_kwargs(method, body)
         client = paying_client()
         try:
-            response = await client.request(method, url, max_price_kas=max_price_kas, **kwargs)
+            response = await client.request(
+                method, url, max_price_kas=max_price_kas, **kwargs
+            )
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -324,6 +460,20 @@ def build_server(
         result["payment"] = _describe_receipt(receipt) if receipt else None
         trial = trial_receipt_of(response)
         result["trial"] = _describe_trial_receipt(trial) if trial else None
+        observation = credit_of(response)
+        if (
+            observation is not None
+            and observation.status == "hint"
+            and cfg.auto_confirm_credit
+        ):
+            # A client that was not built to confirm on its own (an injected one): check the signed status here.
+            observation = await client.confirm_credit(
+                cfg.gateway_url, slug, observation
+            )
+        # Spend is never reduced by a credit: the payment above stays spent, the credit is call-only prepaid credit.
+        result["credit"] = (
+            _describe_credit(observation) if observation is not None else None
+        )
         return result
 
     @server.tool()
@@ -332,13 +482,19 @@ def build_server(
         return await get_json("/v1/directory")
 
     @server.tool()
-    async def search_catalog(query: str = "", limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+    async def search_catalog(
+        query: str = "", limit: int = 50, cursor: str | None = None
+    ) -> dict[str, Any]:
         """Search the public catalog of listed endpoints (GET /v1/catalog).
 
         `query` is matched as a case-insensitive substring of slug, name, or description. `limit` is 1-200
         (default 50). Pass `cursor` from a previous `next_cursor` to fetch the next page.
         """
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 200
+        ):
             raise ToolError("limit must be an integer from 1 to 200")
         if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
             raise ToolError("cursor must be a non-empty string")
@@ -390,6 +546,9 @@ def build_server(
         Refuses before signing anything if the quoted total exceeds max_price_kas (or the server's ceiling,
         whichever is lower). `path` is appended to the endpoint (e.g. "v1/items?limit=3"); `body` is sent as JSON.
         This tool does not draw down the session spend cap; use call_with_budget for session-capped spending.
+        If the upstream failed for good and the gateway announced a credit, `credit` says so: only
+        `credit.confirmed == true` (the gateway's signed credit status lists it) counts; the header alone is an
+        unsigned hint.
         """
         return await _execute_paid_call(slug, method, path, body, max_price_kas)
 
@@ -406,7 +565,9 @@ def build_server(
         The catalog (quoted list price) is reserved atomically before any key use or signing. If the live
         402 amount exceeds the reservation, the reservation is released and nothing is signed. The
         reservation is released on any failure and committed on success. Concurrent calls cannot together
-        exceed the session cap. max_price_kas can only tighten the per-call maximum.
+        exceed the session cap. max_price_kas can only tighten the per-call maximum. A failed call that was
+        credited stays fully spent: `credit` (unsigned hint until `credit.confirmed`) is call-only prepaid
+        credit and never lowers the spent amount.
         """
         slug = validate_slug(slug)
         per_call = _parse_optional_max_price_kas(max_price_kas)
@@ -452,14 +613,18 @@ def build_server(
         except BudgetError as exc:
             raise ToolError(str(exc)) from exc
         try:
-            receipt = await paying_client().prepaid_deposit(cfg.gateway_url, slug, amount)
+            receipt = await paying_client().prepaid_deposit(
+                cfg.gateway_url, slug, amount
+            )
         except KasGateError as exc:
             await budget.release(reserved)
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except BaseException as exc:
             await budget.release(reserved)
             if isinstance(exc, httpx.HTTPError):
-                raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+                raise ToolError(
+                    f"gateway request failed: {type(exc).__name__}"
+                ) from exc
             raise
         await budget.commit(reserved)
         return {
@@ -484,20 +649,94 @@ def build_server(
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
             raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+
+        def sompi(value: str | None) -> int | None:
+            return None if value is None else int(value)
+
+        spendable = sompi(balance.spendable_sompi)
         return {
-            "merchant_id": str(balance.merchant_id),
+            "merchant_id": None
+            if balance.merchant_id is None
+            else str(balance.merchant_id),
             "payer_address": balance.payer_address,
-            "balance_kas": sompi_to_kas(int(balance.balance_sompi)),
-            "balance_sompi": int(balance.balance_sompi),
-            "deposited_sompi": None if balance.deposited_sompi is None else int(balance.deposited_sompi),
-            "debited_sompi": None if balance.debited_sompi is None else int(balance.debited_sompi),
-            "refunded_sompi": None if balance.refunded_sompi is None else int(balance.refunded_sompi),
-            "expired_sompi": None if balance.expired_sompi is None else int(balance.expired_sompi),
-            "refund_hold_sompi": None if balance.refund_hold_sompi is None else int(balance.refund_hold_sompi),
-            "spendable_sompi": int(balance.spendable_sompi)
-            if balance.spendable_sompi is not None
-            else int(balance.balance_sompi),
-            "expires_at": balance.expires_at.isoformat() if balance.expires_at else None,
+            "spendable_kas": None if spendable is None else sompi_to_kas(spendable),
+            "spendable_sompi": spendable,
+            "expires_at": balance.expires_at.isoformat()
+            if balance.expires_at
+            else None,
+            "balance_kas": None
+            if balance.balance_sompi is None
+            else sompi_to_kas(int(balance.balance_sompi)),
+            "balance_sompi": sompi(balance.balance_sompi),
+            "deposited_sompi": sompi(balance.deposited_sompi),
+            "debited_sompi": sompi(balance.debited_sompi),
+            "refunded_sompi": sompi(balance.refunded_sompi),
+            "expired_sompi": sompi(balance.expired_sompi),
+            "refund_hold_sompi": sompi(balance.refund_hold_sompi),
+            "credited_sompi": sompi(balance.credited_sompi),
+            "updated_at": balance.updated_at.isoformat()
+            if balance.updated_at
+            else None,
+        }
+
+    @server.tool()
+    async def get_credit_status(
+        slug: str, before: str | None = None, limit: int = 10
+    ) -> dict[str, Any]:
+        """This buyer key's failed-delivery credit at the merchant behind `slug`, from the gateway's SIGNED status.
+
+        Signs one fresh `credits` challenge (it moves no coins and never touches the session budget) and returns
+        lifetime `credited_sompi`, the unspent call-only `credit_balance_sompi` (spend it with call_prepaid_endpoint;
+        never refundable), `refundable_sompi`, `credit_count` (all pages) and one page of `credits`, newest first:
+        `limit` 1..100 (default 10). To read older credits, call again with `before` set to the `next_cursor` of the
+        previous page (null on the last page). A key with no balance gets zeros. The paid-call tools run the same check,
+        page by page, behind `credit.confirmed`.
+        """
+        slug = validate_slug(slug)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_STATUS_CREDITS
+        ):
+            raise ToolError(f"limit must be an integer within 1..{MAX_STATUS_CREDITS}")
+        if before is not None and (
+            not isinstance(before, str) or not 1 <= len(before) <= 512
+        ):
+            raise ToolError("before must be the next_cursor of a previous page")
+        try:
+            status = await paying_client().credit_status(
+                cfg.gateway_url, slug, before=before, limit=limit
+            )
+        except KasGateError as exc:
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ToolError(f"gateway request failed: {type(exc).__name__}") from exc
+        return {
+            "merchant_id": str(status.merchant_id),
+            "credited_sompi": status.credited_sompi,
+            "credited_kas": sompi_to_kas(status.credited_sompi),
+            "credit_balance_sompi": status.credit_balance_sompi,
+            "credit_balance_kas": sompi_to_kas(status.credit_balance_sompi),
+            "refundable_sompi": status.refundable_sompi,
+            "credit_count": status.credit_count,
+            "credits": [
+                {
+                    "credit_id": str(item.credit_id),
+                    "tx_id": item.tx_id,
+                    "slug": item.slug,
+                    "credit_sompi": item.credit_sompi,
+                    "credit_kas": sompi_to_kas(item.credit_sompi),
+                    "shortfall_sompi": item.shortfall_sompi,
+                    "reason": item.reason,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in status.credits
+            ],
+            "next_cursor": status.next_cursor,
+            "note": (
+                "Call-only credit: it can pay calls at this merchant, it is not refundable, and it does not change "
+                "the session budget. `credits` is one page of credit_count; pass next_cursor as `before` for older ones."
+            ),
         }
 
     def _describe_refund(refund: PrepaidRefund) -> dict[str, Any]:
@@ -511,14 +750,18 @@ def build_server(
             "reason": refund.reason,
             "late_paid_from": refund.late_paid_from,
             "shortfall_sompi": int(refund.shortfall_sompi),
-            "claim_expires_at": refund.claim_expires_at.isoformat() if refund.claim_expires_at else None,
+            "claim_expires_at": refund.claim_expires_at.isoformat()
+            if refund.claim_expires_at
+            else None,
             "hold_until": refund.hold_until.isoformat() if refund.hold_until else None,
             "created_at": refund.created_at.isoformat(),
             "paid_at": refund.paid_at.isoformat() if refund.paid_at else None,
         }
 
     @server.tool()
-    async def prepaid_refund_request(slug: str, amount_kas: float | str | None = None) -> dict[str, Any]:
+    async def prepaid_refund_request(
+        slug: str, amount_kas: float | str | None = None
+    ) -> dict[str, Any]:
         """Ask the merchant behind `slug` to pay unused prepaid credit back to this buyer's address (CONTRACT v2.13).
 
         Omit `amount_kas` for all spendable credit (at least 0.2 KAS). The amount is held at once and can no longer
@@ -526,9 +769,13 @@ def build_server(
         "paid". Signs one refund request, never a transaction; it does not touch the session budget.
         """
         slug = validate_slug(slug)
-        amount = None if amount_kas is None else _parse_optional_max_price_kas(amount_kas)
+        amount = (
+            None if amount_kas is None else _parse_optional_max_price_kas(amount_kas)
+        )
         try:
-            refund = await paying_client().prepaid_refund_request(cfg.gateway_url, slug, amount)
+            refund = await paying_client().prepaid_refund_request(
+                cfg.gateway_url, slug, amount
+            )
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -544,7 +791,9 @@ def build_server(
         except ValueError as exc:
             raise ToolError("refund_id must be a UUID") from exc
         try:
-            refund = await paying_client().prepaid_refund_cancel(cfg.gateway_url, slug, parsed)
+            refund = await paying_client().prepaid_refund_cancel(
+                cfg.gateway_url, slug, parsed
+            )
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -552,14 +801,18 @@ def build_server(
         return _describe_refund(refund)
 
     @server.tool()
-    async def prepaid_refunds(slug: str, include_reasons: bool = False) -> dict[str, Any]:
+    async def prepaid_refunds(
+        slug: str, include_reasons: bool = False
+    ) -> dict[str, Any]:
         """This buyer key's refund requests at the merchant behind `slug`, newest first.
 
         The default list is buyer-signed (same scheme as prepaid_balance; reasons stay withheld). With
         include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
         slug = validate_slug(slug)
         try:
-            refunds = await paying_client().prepaid_refunds(cfg.gateway_url, slug, signed=include_reasons)
+            refunds = await paying_client().prepaid_refunds(
+                cfg.gateway_url, slug, signed=include_reasons
+            )
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -588,7 +841,9 @@ def build_server(
         _parse_optional_max_price_kas(max_price_kas)
         kwargs = _request_kwargs(method, body)
         try:
-            response = await paying_client().prepaid_request(method, url, max_price_kas=max_price_kas, **kwargs)
+            response = await paying_client().prepaid_request(
+                method, url, max_price_kas=max_price_kas, **kwargs
+            )
         except KasGateError as exc:
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
