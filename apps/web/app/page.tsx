@@ -1,6 +1,7 @@
 import { ArrowRight, Bot, ExternalLink, FileSpreadsheet, Gauge, Hexagon, Lock, Wallet, Zap } from "lucide-react";
 import Link from "next/link";
 import { CodeBlock } from "@/components/code-block";
+import { FaucetBox } from "@/components/faucet-box";
 import { TryItNow } from "@/components/try-it-now";
 import { ADDRESS_PREFIX, DEMO_ENDPOINT_SLUG, GATEWAY_PUBLIC_URL, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, NETWORK_LABEL, TESTNET_FAUCET_URL } from "@/lib/config";
 import { getMinOutputSompi } from "@/lib/server/gateway";
@@ -156,6 +157,7 @@ function PayForReal() {
           </li>
         ))}
       </ol>
+      {IS_TESTNET && <FaucetBox />}
       <p className="mt-4 text-sm text-zinc-400">Then connect KasWare and pay: the beta guide walks through it, and the directory lists endpoints to call.</p>
       <div className="mt-4 flex flex-wrap gap-3">
         <Link href="/beta" className="btn-primary px-5 py-2.5">
