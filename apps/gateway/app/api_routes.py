@@ -1472,7 +1472,7 @@ def render_llms_txt() -> str:
         "Merchants get signed webhooks (X-KasGate-Signature: t=<unix>,v1=<hex HMAC-SHA256>); verify them with\n"
         "kasgate_client.verify_webhook_signature.\n"
         "\n"
-        "Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kfryster420-afk/kasgate).\n"
+        "Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kasgate/kasgate).\n"
     )
 
 

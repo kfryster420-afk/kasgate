@@ -72,4 +72,4 @@ compose_in_infra() {
   docker compose -f "${infra_dir}/docker-compose.yml" -f "${infra_dir}/deploy/docker-compose.prod.yml" "$@"
 }
 
-default_repo_url() { printf '%s' "https://github.com/kfryster420-afk/kasgate.git"; }
+default_repo_url() { printf '%s' "https://github.com/kasgate/kasgate.git"; }

@@ -16,7 +16,7 @@ export const TESTNET_EXPLORER_URL = "https://tn10.kaspa.stream";
 export const DEMO_SETTLEMENT_TX_ID = "7beab60d8cf21002ba12e85255ec93cf24c3c7c8f3e5a2d3dc84016da8e79170";
 export const DEMO_ENDPOINT_SLUG = "demo-httpbin";
 export const KASWARE_URL = "https://www.kasware.xyz";
-export const GITHUB_REPO_URL = "https://github.com/kfryster420-afk/kasgate";
+export const GITHUB_REPO_URL = "https://github.com/kasgate/kasgate";
 export const GITHUB_BUG_URL = `${GITHUB_REPO_URL}/issues/new?template=bug_report.yml`;
 export const GITHUB_BETA_FEEDBACK_URL = `${GITHUB_REPO_URL}/issues/new?template=beta_feedback.yml`;
 export const GITHUB_SECURITY_URL = `${GITHUB_REPO_URL}/security/advisories/new`;
