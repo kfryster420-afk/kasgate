@@ -2274,18 +2274,29 @@ async def _debit_balance(
 
 
 async def refund_prepaid_debit(
-    session: AsyncSession, redis: Redis, debit_id: uuid.UUID, status_code: int | None
+    session: AsyncSession,
+    redis: Redis,
+    debit_id: uuid.UUID,
+    status_code: int | None,
+    *,
+    orphaned_for_seconds: float | None = None,
 ) -> int | None:
     """Return a debit to its balance (status refunded) in one transaction; the new balance, or None if it failed.
 
     Only a `debited` row is refunded, so a refund can never run twice. A store failure is dead-lettered to Redis
-    for reconciliation.
+    for reconciliation. `orphaned_for_seconds` is for the orphan sweeper: the refund then also needs the row to
+    still be in flight (`upstream_status_code IS NULL`) and older than that on the database clock, so a request that
+    finished (or is still young) between the sweeper's read and this write is never touched.
     """
+    guards = [PrepaidDebit.id == debit_id, PrepaidDebit.status == PREPAID_DEBIT_DEBITED]
+    if orphaned_for_seconds is not None:
+        guards.append(PrepaidDebit.upstream_status_code.is_(None))
+        guards.append(PrepaidDebit.created_at < func.now() - timedelta(seconds=orphaned_for_seconds))
     try:
         row = (
             await session.execute(
                 update(PrepaidDebit)
-                .where(PrepaidDebit.id == debit_id, PrepaidDebit.status == PREPAID_DEBIT_DEBITED)
+                .where(*guards)
                 .values(status=PREPAID_DEBIT_REFUNDED, refunded_at=func.now(), upstream_status_code=status_code)
                 .returning(PrepaidDebit.balance_id, PrepaidDebit.amount_sompi, PrepaidDebit.credit_sompi)
             )

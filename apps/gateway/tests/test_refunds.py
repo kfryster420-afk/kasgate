@@ -38,6 +38,7 @@ from tests.conftest import (
     seed_endpoint,
 )
 from tests.test_prepaid import CREDIT_SOMPI, DEPOSIT_SOMPI, add_endpoint, fund, request_challenge
+from tests.test_prepaid_balance_privacy import refunds_status_headers, signed_headers
 
 MIN_REFUND = 20_000_000
 PAYOUT_TX = "ab" * 32
@@ -75,7 +76,9 @@ async def refund_challenge(
         body["amount_sompi"] = amount
     if refund_id is not None:
         body["refund_id"] = str(refund_id)
-    return await client.post("/v1/prepaid/refunds/challenge", json=body)
+    # Without an amount the gateway derives "all refundable credit" only for a buyer-signed balance read.
+    headers = signed_headers(slug=slug) if action == "request" and amount is None and payer == PAYER_ADDRESS else {}
+    return await client.post("/v1/prepaid/refunds/challenge", json=body, headers=headers)
 
 
 async def challenge_of(client: httpx.AsyncClient, **kwargs: Any) -> PrepaidRefundChallenge:
@@ -200,8 +203,17 @@ async def test_full_refund_is_held_then_debited_only_when_the_payout_is_seen(
     # The held credit no longer pays calls.
     blocked = await request_challenge(client)
     assert blocked.status_code == 402 and "spendable" in blocked.json()["message"]
-    balance = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    assert (balance["refund_hold_sompi"], balance["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
+    public = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
+    assert public["spendable_sompi"] == "0" and public["balance_sompi"] is None
+    assert public["refund_hold_sompi"] is public["refunded_sompi"] is public["expired_sompi"] is None
+    totals = (
+        await client.get(
+            "/v1/prepaid/balance",
+            params={"slug": "cheap", "payer_address": PAYER_ADDRESS},
+            headers=signed_headers(),
+        )
+    ).json()
+    assert (totals["refund_hold_sompi"], totals["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
 
     paid = await payout(client, shop, refund.id, tx_id=PAYOUT_TX)
     assert paid.status_code == 200, paid.text
@@ -374,9 +386,15 @@ async def test_merchant_rejects_with_a_reason(
     twice = await client.post(path, json={"reason": "again"}, headers=bearer(shop.api_key))
     assert twice.status_code == 409 and twice.json()["error"] == "refund_not_rejectable"
     assert await event_types(sessionmaker) == ["prepaid.refund.requested", "prepaid.refund.rejected"]
-    public = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
+    unsigned = await client.get("/v1/prepaid/refunds/status", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})
+    assert unsigned.status_code == 401 and unsigned.json()["error"] == "invalid_balance_signature"
+    public = await client.get(
+        "/v1/prepaid/refunds/status",
+        params={"slug": "cheap", "payer_address": PAYER_ADDRESS},
+        headers=refunds_status_headers(),
+    )
     assert public.status_code == 200 and [r["status"] for r in public.json()] == ["rejected"]
-    assert public.json()[0]["reason"] is None  # reasons are not public
+    assert public.json()[0]["reason"] is None  # reasons stay hidden on the signed GET
     status_challenge = await challenge_of(client, action="status")
     assert status_challenge.amount_sompi == "0" and "Action: status" in status_challenge.message
     mine = await client.post("/v1/prepaid/refunds/status", json=signed(status_challenge))
@@ -593,7 +611,7 @@ async def test_merchant_expiry_policy_and_endpoint_override(
     assert created.json()["prepaid_expiry_days"] == 7
     before = datetime.now(UTC)
     receipt = await fund(client, slug="short-lived")
-    assert receipt.balance_sompi == str(CREDIT_SOMPI)
+    assert "balance_sompi" not in receipt.model_dump()
     row = await balance_of(sessionmaker, shop.merchant_id)
     assert row.expires_at is not None
     assert before + timedelta(days=7) - timedelta(minutes=1) <= row.expires_at <= datetime.now(UTC) + timedelta(days=7)
@@ -639,7 +657,7 @@ async def test_expired_credit_stops_paying_and_is_swept_into_the_ledger(
     assert blocked.status_code == 402
     assert (await refund_challenge(client)).status_code == 422  # nothing spendable to refund
     balance = (await client.get("/v1/prepaid/balance", params={"slug": "cheap", "payer_address": PAYER_ADDRESS})).json()
-    assert (balance["balance_sompi"], balance["spendable_sompi"]) == (str(CREDIT_SOMPI), "0")
+    assert (balance["balance_sompi"], balance["spendable_sompi"]) == (None, "0")
 
     async with sessionmaker() as session:
         assert await expire_due_balances(session, 10) == 1
@@ -681,8 +699,9 @@ async def test_a_deposit_expires_overdue_credit_before_adding_new_credit(
     await fund(client)
     await set_expiry(sessionmaker, shop.merchant_id, datetime.now(UTC) - timedelta(seconds=1))
     receipt = await fund(client)
-    assert receipt.balance_sompi == str(CREDIT_SOMPI)  # the old credit expired, only the new deposit counts
+    assert "balance_sompi" not in receipt.model_dump()
     row = await balance_of(sessionmaker, shop.merchant_id)
+    assert row.balance_sompi == CREDIT_SOMPI  # the old credit expired, only the new deposit counts
     assert (row.expired_sompi, row.deposited_sompi) == (CREDIT_SOMPI, 2 * CREDIT_SOMPI)
     assert row.expires_at is not None and row.expires_at > datetime.now(UTC)
     assert_identity(row)

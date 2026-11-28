@@ -76,7 +76,7 @@ async with KasGateClient(PRIVATE_KEY_HEX, max_price_kas="0.01") as client:
 Refunds of unused credit (CONTRACT v2.13):
 
 ```python
-refund = await client.prepaid_refund_request("https://gw.example", "weather")            # all spendable credit
+refund = await client.prepaid_refund_request("https://gw.example", "weather")            # all refundable credit (the SDK signs the challenge request)
 refund = await client.prepaid_refund_request("https://gw.example", "weather", 25_000_000)  # or an amount (>= 0.2 KAS)
 print(await client.prepaid_refunds("https://gw.example", "weather"))   # signed read; requested -> paying -> payout_submitted -> paid
 print(await client.prepaid_refunds("https://gw.example", "weather", signed=True))  # also the merchant's reasons

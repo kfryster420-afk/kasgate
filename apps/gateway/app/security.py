@@ -20,6 +20,7 @@ import httpcore
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from kaspa import PublicKey, verify_message
 from redis.asyncio import Redis
@@ -46,7 +47,14 @@ from app.schemas import (
     HEADER_TRIAL_REMAINING,
     NONCE_RE,
     REGISTER_PURPOSE,
+    X402ErrorBody,
     build_auth_challenge,
+)
+from app.schemas import (
+    NAT64_WELL_KNOWN as NAT64_WELL_KNOWN,
+)
+from app.schemas import (
+    is_forbidden_ip as is_forbidden_ip,
 )
 
 logger = logging.getLogger("kasgate.security")
@@ -319,30 +327,6 @@ class UpstreamBlockedError(Exception):
     """Raised when an upstream host resolves to a non-public address."""
 
 
-NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
-
-
-def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
-    """IPv4 addresses a v6 address can tunnel to: v4-mapped, 6to4, Teredo (server and client) and NAT64."""
-    found: list[ipaddress.IPv4Address] = []
-    if ip.ipv4_mapped is not None:
-        found.append(ip.ipv4_mapped)
-    if ip.sixtofour is not None:
-        found.append(ip.sixtofour)
-    if ip.teredo is not None:
-        found.extend(ip.teredo)
-    if ip in NAT64_WELL_KNOWN:
-        found.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
-    return found
-
-
-def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True unless `ip` is a public unicast address (and, for IPv6, so is every IPv4 address it tunnels to)."""
-    if isinstance(ip, ipaddress.IPv6Address) and any(is_forbidden_ip(inner) for inner in _embedded_ipv4(ip)):
-        return True
-    return not ip.is_global or ip.is_multicast
-
-
 async def _getaddrinfo(host: str, port: int) -> list[tuple[Any, Any, Any, Any, tuple[Any, ...]]]:
     """DNS lookup seam: the one place the upstream guard talks to the resolver (replaced in tests)."""
     loop = asyncio.get_running_loop()
@@ -594,6 +578,27 @@ RATE_LIMIT_AUTH_VERIFY = RateLimit("auth_verify", "rl_auth_verify_per_minute", 6
 RATE_LIMIT_UNPAID_PROXY = RateLimit("proxy_unpaid", "rl_unpaid_proxy_per_minute", 60)
 # CONTRACT v2.12: free trial calls actually served, per client IP (anti-abuse on top of the per-endpoint daily cap).
 RATE_LIMIT_TRIAL_CALLS = RateLimit("trial_calls", "rl_trial_calls_per_ip_per_hour", 3600)
+# Webhook test-fire, per merchant: each call makes an outbound HTTPS request to the merchant's URL right away.
+RATE_LIMIT_WEBHOOK_TEST = RateLimit("webhook_test", "rl_webhook_test_per_minute", 60)
+
+
+RATE_LIMITED_MESSAGE = "rate limit exceeded; retry later"
+
+
+class RateLimited(Exception):
+    """The limiter rejected this request. The app handler turns it into a 429 X402ErrorBody (`rate_limited`)."""
+
+    def __init__(self, retry_after: int, message: str = RATE_LIMITED_MESSAGE) -> None:
+        self.retry_after = retry_after
+        self.message = message
+
+    def response(self) -> JSONResponse:
+        content = X402ErrorBody(error="rate_limited", message=self.message).model_dump(mode="json")
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content=content,
+            headers={"Retry-After": str(self.retry_after)},
+        )
 
 
 RATE_LIMIT_PREPAID_REFUND = RateLimit("prepaid_refund", "rl_prepaid_refund_per_minute", 60)
@@ -632,7 +637,7 @@ def client_ip(request: Request) -> str:
 
 
 async def enforce_rate_limit(redis: Redis, rule: RateLimit, subject: str) -> None:
-    """Count one hit for `subject` in the current window; raise 429 with Retry-After when over the limit.
+    """Count one hit for `subject` in the current window; raise RateLimited (429 + Retry-After) when over the limit.
 
     INCR, EXPIRE NX and TTL run in one MULTI/EXEC, so the window is armed atomically on the first hit and a
     key can never be left without an expiry. Limits and switches come from `Settings`: with
@@ -662,11 +667,7 @@ async def enforce_rate_limit(redis: Redis, rule: RateLimit, subject: str) -> Non
         return
     if int(count) > limit:
         retry_after = int(ttl) if int(ttl) > 0 else rule.window_seconds
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="rate limit exceeded; retry later",
-            headers={"Retry-After": str(retry_after)},
-        )
+        raise RateLimited(retry_after)
 
 
 def limit_by_ip(rule: RateLimit) -> Callable[[Request, Redis], Awaitable[None]]:

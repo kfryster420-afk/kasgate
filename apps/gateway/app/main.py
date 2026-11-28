@@ -4,8 +4,9 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -14,9 +15,11 @@ from app.api_routes import router as api_router
 from app.api_routes import well_known_router
 from app.config import get_settings
 from app.db import engine as db_engine
+from app.debit_sweeper import DebitSweeper
 from app.deps import get_sessionmaker
 from app.failed_delivery import router as failed_delivery_router
 from app.failed_delivery import sweep_pass as failed_delivery_sweep_pass
+from app.faucet import router as faucet_router
 from app.kaspa_engine import engine as kaspa_engine
 from app.ledger import LedgerWorker
 from app.oracle import KasUsdOracle
@@ -37,7 +40,7 @@ from app.schemas import (
     HEADER_TRIAL_REMAINING,
     HealthStatus,
 )
-from app.security import build_upstream_client, build_webhook_client
+from app.security import RateLimited, build_upstream_client, build_webhook_client
 from app.trials import router as trials_router
 from app.webhooks import WebhookDispatcher
 from app.webhooks import router as webhooks_router
@@ -69,12 +72,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ledger_worker = ledger_worker
     if settings.ledger_worker_enabled:
         ledger_worker.start()
+    debit_sweeper = DebitSweeper(get_sessionmaker(), redis)
+    app.state.debit_sweeper = debit_sweeper
+    if settings.prepaid_debit_sweeper_enabled:
+        debit_sweeper.start()
     await kaspa_engine.start()
     try:
         yield
     finally:
         await dispatcher.stop()
         await ledger_worker.stop()
+        await debit_sweeper.stop()
         await kaspa_engine.stop()
         await webhook_client.aclose()
         await http_client.aclose()
@@ -115,8 +123,13 @@ def create_app() -> FastAPI:
     app.include_router(failed_delivery_router)
     app.include_router(prepaid_router)
     app.include_router(trials_router)
+    app.include_router(faucet_router)
     app.include_router(webhooks_router)
     app.include_router(proxy_router)
+
+    @app.exception_handler(RateLimited)
+    async def rate_limited_handler(_request: Request, exc: RateLimited) -> JSONResponse:
+        return exc.response()
 
     @app.get("/healthz", response_model=HealthStatus, tags=["system"])
     async def healthz(

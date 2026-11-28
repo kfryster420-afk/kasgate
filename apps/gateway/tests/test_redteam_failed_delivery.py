@@ -41,6 +41,8 @@ from tests.test_failed_delivery_credit import (
     _settlement,
 )
 from tests.test_prepaid import CHEAP_SOMPI, add_endpoint, debit_header, fund, get_debit_challenge, prepaid_call
+from tests.test_prepaid_balance_privacy import signed_headers
+from tests.test_refunds import challenge_of, signed
 
 POLICY = "/v1/prepaid/failed-delivery-policy"
 
@@ -294,12 +296,17 @@ async def test_held_credited_balance_is_spendable_on_calls_not_refundable_and_id
     assert balance.refunded_sompi == 0
     assert_identity(balance)
     # refundable = balance - hold - unspent credit = 0: a request for the credit (or the default amount) is refused.
-    too_much = await client.post(
+    # The unsigned challenge only checks the public spendable total, so it is issued; the refundable cap is enforced
+    # when the signed request is submitted.
+    too_much = await challenge_of(client, amount=SPLIT.merchant_sompi)
+    refused = await client.post("/v1/prepaid/refunds", json=signed(too_much))
+    assert refused.status_code == 409 and refused.json()["error"] == "insufficient_balance"
+    assert str(SPLIT.merchant_sompi) not in refused.json()["message"]
+    default = await client.post(
         "/v1/prepaid/refunds/challenge",
-        json={"slug": "cheap", "payer_address": PAYER_ADDRESS, "amount_sompi": SPLIT.merchant_sompi},
+        json={"slug": "cheap", "payer_address": PAYER_ADDRESS},
+        headers=signed_headers(),
     )
-    assert too_much.status_code == 409 and too_much.json()["error"] == "insufficient_balance"
-    default = await client.post("/v1/prepaid/refunds/challenge", json={"slug": "cheap", "payer_address": PAYER_ADDRESS})
     assert default.status_code == 422 and default.json()["error"] == "refund_too_small"
     # The credit still pays calls.
     upstream.handler = None

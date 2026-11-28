@@ -30,11 +30,15 @@ from app.schemas import (
 from app.security import build_webhook_client
 from app.webhooks import (
     WebhookDispatcher,
+    WebhookSecrets,
     backoff_seconds,
     claim_due,
     compute_signature,
     decrypt_secret,
+    decrypt_secrets,
     deliver_due,
+    encrypt_secret,
+    encrypt_secrets,
     enqueue_event,
     record_result,
     send_webhook,
@@ -122,6 +126,24 @@ def test_signature_round_trip_and_forgeries() -> None:
     assert verify_signature(secret, f"t={now},v1={'0' * 64},v1={compute_signature(secret, now, body)}", body, now=now)
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    ["\u00b2", "1\u00b2", "\u0661\u0662", "\uff11", "9" * 5000, "+1", " 1", "-1"],
+)
+def test_signature_header_with_a_non_ascii_or_absurd_timestamp_is_rejected_not_crashed(timestamp: str) -> None:
+    """str.isdigit() is True for '²', Arabic-Indic and full-width digits; int() then raised (or hit the 4300-digit
+    limit). Each must simply fail verification."""
+    secret = "whsec_" + "a" * 43
+    body = b"{}"
+    assert verify_signature(secret, f"t={timestamp},v1={'0' * 64}", body, now=1_800_000_000) is False
+
+
+def test_signature_header_with_a_non_ascii_v1_is_rejected_not_crashed() -> None:
+    secret = "whsec_" + "a" * 43
+    now = 1_800_000_000
+    assert verify_signature(secret, f"t={now},v1=\u00e9\u00e9", b"{}", now=now) is False
+
+
 # ---------------------------------------------------------------- CRUD + secret handling
 
 
@@ -145,6 +167,74 @@ async def test_create_shows_secret_once_and_stores_it_encrypted(
     rotated = await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))
     assert rotated.status_code == 200
     assert rotated.json()["secret"] != created.secret
+
+
+async def test_rotation_keeps_the_previous_secret_signing_for_the_overlap(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+) -> None:
+    created = await create_hook(client, seeded, ["trial.used"])
+    before = datetime.now(UTC)
+    response = await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))
+    assert response.status_code == 200, response.text
+    rotated = WebhookCreated.model_validate(response.json())
+    assert rotated.previous_secret_expires_at is not None
+    assert abs((rotated.previous_secret_expires_at - before).total_seconds() - 86_400) < 5
+    assert rotated.webhook.secret_prefix == rotated.secret[:10]
+    async with sessionmaker() as session:
+        stored = bytes((await session.execute(select(Webhook.secret_encrypted))).scalar_one())
+    assert decrypt_secret(stored) == rotated.secret
+    assert created.secret.encode() not in stored and rotated.secret.encode() not in stored
+
+    fired = await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    assert fired.json()["status"] == "succeeded"
+    [request] = webhook_receiver.requests
+    header = request.headers[WEBHOOK_SIGNATURE_HEADER]
+    stamp = int(request.headers[WEBHOOK_TIMESTAMP_HEADER])
+    assert header == (
+        f"t={stamp},v1={compute_signature(rotated.secret, stamp, request.content)}"
+        f",v1={compute_signature(created.secret, stamp, request.content)}"
+    )
+    assert verify_signature(rotated.secret, header, request.content)
+    assert verify_signature(created.secret, header, request.content)  # receivers not yet switched keep working
+
+    again = WebhookCreated.model_validate(
+        (await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))).json()
+    )
+    await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    header = webhook_receiver.requests[-1].headers[WEBHOOK_SIGNATURE_HEADER]
+    body = webhook_receiver.requests[-1].content
+    assert header.count("v1=") == 2
+    assert verify_signature(again.secret, header, body) and verify_signature(rotated.secret, header, body)
+    assert not verify_signature(created.secret, header, body)  # only the most recently replaced secret overlaps
+
+
+async def test_rotation_with_no_overlap_signs_with_the_new_secret_only(
+    client: httpx.AsyncClient, seeded: Seed, webhook_receiver: WebhookReceiver, override_settings: Any
+) -> None:
+    override_settings(webhook_secret_overlap_seconds=0)
+    created = await create_hook(client, seeded, ["trial.used"])
+    rotated = await client.post(f"/v1/webhooks/{created.webhook.id}/rotate-secret", headers=bearer(seeded.api_key))
+    assert rotated.json()["previous_secret_expires_at"] is None
+    await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    [request] = webhook_receiver.requests
+    header = request.headers[WEBHOOK_SIGNATURE_HEADER]
+    assert header.count("v1=") == 1
+    assert verify_signature(rotated.json()["secret"], header, request.content)
+    assert not verify_signature(created.secret, header, request.content)
+
+
+def test_previous_secret_stops_signing_when_the_overlap_ends() -> None:
+    stored = WebhookSecrets(current="whsec_new", previous="whsec_old", previous_until=1_800_086_400)
+    assert stored.signing_secrets(1_800_086_399) == ["whsec_new", "whsec_old"]
+    assert stored.signing_secrets(1_800_086_400) == ["whsec_new"]
+    assert decrypt_secrets(encrypt_secrets(stored)) == stored
+    assert decrypt_secrets(encrypt_secret("whsec_bare")) == WebhookSecrets(current="whsec_bare")
+    assert signature_header("whsec_new", 5, b"{}", also=["whsec_old"]) == (
+        f"t=5,v1={compute_signature('whsec_new', 5, b'{}')},v1={compute_signature('whsec_old', 5, b'{}')}"
+    )
 
 
 async def test_webhook_crud_is_merchant_scoped(
@@ -232,6 +322,11 @@ async def test_webhook_count_is_capped(client: httpx.AsyncClient, seeded: Seed, 
         "https://[fd00::1]/x",
         "https://[fe80::1]/x",
         "https://[::ffff:127.0.0.1]/x",
+        "https://[::7f00:1]/x",  # IPv4-compatible 127.0.0.1
+        "https://[::a9fe:a9fe]/x",  # IPv4-compatible 169.254.169.254 (cloud metadata)
+        "https://[fec0::1]/x",  # site-local
+        "https://[64:ff9b::a00:1]/x",  # NAT64 of 10.0.0.1
+        "https://[2002:7f00:1::]/x",  # 6to4 of 127.0.0.1
         "https://user:pw@hooks.example.com/x",
         "https://hooks.example.com/x#frag",
         "https://hooks.example.com/a b",
@@ -718,6 +813,56 @@ async def test_test_fire_delivers_immediately(
     webhook_receiver.status = 410
     failed = await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
     assert (failed.json()["status"], failed.json()["last_status_code"]) == ("pending", 410)
+
+
+async def test_test_fire_is_rate_limited_per_merchant(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+    override_settings: Any,
+) -> None:
+    override_settings(rl_webhook_test_per_minute=2)
+    first = await create_hook(client, seeded, ["trial.used"])
+    second = await create_hook(client, seeded, ["trial.used"])
+    for hook in (first, second):  # the limit is the merchant's, across all of its webhooks
+        fired = await client.post(f"/v1/webhooks/{hook.webhook.id}/test", headers=bearer(seeded.api_key))
+        assert fired.status_code == 200, fired.text
+    limited = await client.post(f"/v1/webhooks/{first.webhook.id}/test", headers=bearer(seeded.api_key))
+    assert limited.status_code == 429, limited.text
+    assert limited.json() == {
+        "error": "rate_limited",
+        "message": "rate limit exceeded; retry later",
+        "k402": None,
+        "accepts": None,
+    }
+    assert 0 < int(limited.headers["Retry-After"]) <= 60
+    assert len(webhook_receiver.requests) == 2  # the refused fire sent nothing
+    assert len(await events(sessionmaker)) == 2  # and queued nothing
+
+
+async def test_test_fire_keeps_only_the_newest_finished_test_events(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    webhook_receiver: WebhookReceiver,
+    override_settings: Any,
+) -> None:
+    override_settings(webhook_test_events_kept=2)
+    created = await create_hook(client, seeded, ["trial.used"])
+    fired = [
+        (await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))).json()
+        for _ in range(4)
+    ]
+    kept = await events(sessionmaker)
+    assert len(kept) == 2 and len(await deliveries(sessionmaker)) == 2
+    assert {e.event_id for e in kept} == {fired[2]["event_id"], fired[3]["event_id"]}
+
+    webhook_receiver.status = 500  # failing test deliveries stay pending for retry and are never pruned
+    for _ in range(3):
+        await client.post(f"/v1/webhooks/{created.webhook.id}/test", headers=bearer(seeded.api_key))
+    statuses = sorted(d.status for d in await deliveries(sessionmaker))
+    assert statuses == ["pending", "pending", "pending", "succeeded", "succeeded"]
 
 
 async def test_dispatcher_delivers_in_the_background(

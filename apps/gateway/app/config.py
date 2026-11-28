@@ -4,7 +4,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KaspaNetwork = Literal["kaspa:testnet-10", "kaspa:mainnet"]
@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     webhook_backoff_max_seconds: float = Field(default=3600.0, gt=0, le=86_400)
     webhook_lease_seconds: int = Field(default=60, ge=15, le=600)
     webhook_max_per_merchant: int = Field(default=10, ge=1, le=100)
+    # POST /v1/webhooks/{id}/test per merchant per minute, and how many settled test events are kept per webhook.
+    rl_webhook_test_per_minute: int = Field(default=10, ge=1)
+    webhook_test_events_kept: int = Field(default=20, ge=1, le=1000)
+    # rotate-secret: how long the previous secret keeps signing deliveries alongside the new one.
+    webhook_secret_overlap_seconds: int = Field(default=86_400, ge=0, le=7 * 86_400)
     # CONTRACT v2.13 prepaid ledger worker: credit expiry and re-checks of submitted refund payouts.
     ledger_worker_enabled: bool = True
     ledger_poll_interval_seconds: float = Field(default=30.0, gt=0, le=3600)
@@ -83,6 +88,13 @@ class Settings(BaseSettings):
     prepaid_payout_pending_max_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
     # Total time one upstream call may take (connect, response and body) before it counts as a timeout.
     upstream_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    # Orphaned in-flight prepaid debits: a debit whose upstream call never recorded a status (the worker died between
+    # the debit and the response) is refunded by this sweeper once it is older than the age below. The age must stay
+    # well above one upstream attempt, so a live request is never refunded under its own feet (see the validator).
+    prepaid_debit_sweeper_enabled: bool = True
+    prepaid_debit_sweeper_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
+    prepaid_debit_orphan_age_seconds: int = Field(default=900, ge=300, le=86_400)
+    prepaid_debit_sweeper_batch_size: int = Field(default=100, ge=1, le=1000)
     # Failed-delivery auto-credit (run by the ledger worker): a paid call whose last delivery failed is credited once
     # its redelivery window, one full upstream attempt (UPSTREAM_TIMEOUT_SECONDS, rounded up) and this extra margin
     # have passed, so a redelivery claimed just before the window closed has finished first.
@@ -113,6 +125,26 @@ class Settings(BaseSettings):
     # Reverse proxies (IPs or CIDRs, JSON list) whose X-Forwarded-For is trusted for the client IP used by rate
     # limits. Empty (default): X-Forwarded-For is ignored and the TCP peer address is the client.
     trusted_proxy_ips: list[str] = []
+    # Testnet faucet (POST /v1/faucet/claim). Disabled unless FAUCET_PRIVATE_KEY (64 hex chars) is set; a dedicated hot
+    # wallet key, never a buyer, treasury or merchant key. Enabling it on any network but testnet-10 refuses to start.
+    faucet_private_key: SecretStr | None = None
+    faucet_amount_sompi: int = Field(default=5_000_000_000, ge=1, le=1_000_000_000_000)
+    faucet_daily_cap_sompi: int = Field(default=500_000_000_000, ge=1)
+    faucet_max_network_fee_sompi: int = Field(default=10_000_000, ge=1)
+
+    @field_validator("faucet_private_key")
+    @classmethod
+    def _faucet_key(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None or not v.get_secret_value().strip():
+            return None
+        raw = v.get_secret_value().strip().lower()
+        if len(raw) != 64 or any(ch not in "0123456789abcdef" for ch in raw):
+            raise ValueError("FAUCET_PRIVATE_KEY must be 64 hex characters")
+        return SecretStr(raw)
+
+    @property
+    def faucet_enabled(self) -> bool:
+        return self.faucet_private_key is not None
 
     @field_validator("trusted_proxy_ips")
     @classmethod
@@ -137,6 +169,21 @@ class Settings(BaseSettings):
     def failed_delivery_credit_wait_seconds(self) -> int:
         """Seconds after the redelivery window before the sweep may credit: one upstream attempt plus the grace."""
         return math.ceil(self.upstream_timeout_seconds) + self.failed_delivery_credit_grace_seconds
+
+    @model_validator(mode="after")
+    def _orphan_age_exceeds_upstream_timeout(self) -> "Settings":
+        floor = 3 * self.upstream_timeout_seconds + 60
+        if self.prepaid_debit_orphan_age_seconds < floor:
+            raise ValueError(
+                f"PREPAID_DEBIT_ORPHAN_AGE_SECONDS must be at least 3 x UPSTREAM_TIMEOUT_SECONDS + 60 ({floor:g})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _faucet_testnet_only(self) -> "Settings":
+        if self.faucet_private_key is not None and self.kaspa_network != "kaspa:testnet-10":
+            raise ValueError("the faucet is testnet only: FAUCET_PRIVATE_KEY requires KASPA_NETWORK=kaspa:testnet-10")
+        return self
 
     @model_validator(mode="after")
     def _treasury_matches_network(self) -> "Settings":

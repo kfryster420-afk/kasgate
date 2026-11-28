@@ -12,7 +12,8 @@ Routes (all under /v1/prepaid):
   ``resolve_inputs`` + ``settle``, then ONE transaction: settlement row (kaspa-exact-v1, fee > 0, treasury), balance
   upsert (credit = merchant share only) and the prepaid_deposits row (unique tx_id and settlement_id).
 * ``POST /challenge`` (public, unpaid rate limit) -> 201 PrepaidChallenge: the exact text to sign for ONE debit.
-* ``GET /balance?slug=&payer_address=`` (public) -> PrepaidBalanceRead.
+* ``GET /balance?slug=&payer_address=`` (public spendable and expiry; everything else only when buyer-signed)
+  -> PrepaidBalanceRead.
 * ``GET /balances``, ``GET /deposits``, ``GET /debits`` [Bearer] -> the merchant's own prepaid ledger.
 
 KasGate never holds the coins: the merchant and the treasury were paid on-chain by the deposit. Unused credit is a
@@ -21,17 +22,20 @@ merchant obligation, never a KasGate liability; there is no withdrawal route.
 
 import json
 import logging
+import re
+import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,7 +43,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.deps import PaymentVerifier, RateProvider, get_db_session, get_engine, get_oracle, get_redis
 from app.kaspa_types import validate_kaspa_address
-from app.ledger import credit_expiry, expire_balance_for, refundable_sompi, spendable_sompi
+from app.ledger import (
+    credit_expiry,
+    expire_balance_for,
+    in_flight_debit_sompi,
+    refundable_sompi,
+    spendable_sompi,
+)
 from app.models import Endpoint, Merchant, PrepaidBalance, PrepaidDebit, PrepaidDeposit, Settlement
 from app.oracle import OracleUnavailableError
 from app.payments import PaymentVerificationError
@@ -63,10 +73,14 @@ from app.proxy import (
     prepaid_deposit_key,
     prepaid_only_error,
     prepaid_price,
+    verify_prepaid_signature,
 )
 from app.schemas import (
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
     HEADER_PAYMENT_RESPONSE,
     HEADER_PAYMENT_SIGNATURE,
+    PREPAID_BALANCE_READ_TOLERANCE_SECONDS,
     PaymentRequired,
     PaymentSignature,
     PrepaidBalanceRead,
@@ -77,10 +91,11 @@ from app.schemas import (
     PrepaidDepositQuoteRequest,
     PrepaidDepositRead,
     PrepaidDepositReceipt,
+    build_prepaid_balance_read_message,
     compute_fee_split,
     new_payment_nonce,
 )
-from app.security import RATE_LIMIT_UNPAID_PROXY, get_current_merchant, limit_by_ip
+from app.security import RATE_LIMIT_UNPAID_PROXY, auth_domain, get_current_merchant, limit_by_ip
 from app.webhooks import enqueue_event
 
 logger = logging.getLogger("kasgate.prepaid")
@@ -128,11 +143,60 @@ async def _balance_of(session: AsyncSession, merchant_id: uuid.UUID, public_key:
     ).scalar_one_or_none()
 
 
+class _CapBackstopError(Exception):
+    """The conditional credit found the balance already at the cap: the settled deposit must not be credited."""
+
+
+async def _lock_balance_row(
+    session: AsyncSession, merchant_id: uuid.UUID, payer_address: str, public_key: str
+) -> tuple[uuid.UUID, int]:
+    """Lock the (merchant, key) balance row FOR UPDATE and return its id and balance.
+
+    A zero row is inserted first (ON CONFLICT DO NOTHING) so a buyer's very first deposits serialize too: a second
+    insert of the same unique key waits for the first transaction. The row is held until the deposit commits or
+    rolls back, so two in-flight deposits for one key can never both pass the cap check.
+    """
+    await session.execute(
+        pg_insert(PrepaidBalance)
+        .values(
+            id=uuid.uuid4(),
+            merchant_id=merchant_id,
+            payer_address=payer_address,
+            payer_public_key=public_key,
+            balance_sompi=0,
+            deposited_sompi=0,
+            debited_sompi=0,
+        )
+        .on_conflict_do_nothing(index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key])
+    )
+    row = (
+        await session.execute(
+            select(PrepaidBalance.id, PrepaidBalance.balance_sompi)
+            .where(PrepaidBalance.merchant_id == merchant_id, PrepaidBalance.payer_public_key == public_key)
+            .with_for_update()
+        )
+    ).one()
+    return row[0], int(row[1])
+
+
+CAP_EXCEEDED_MESSAGE: Final = "deposit would exceed the prepaid balance cap; use a signed balance read for details"
+
+
+def would_exceed_cap(*, balance: int, in_flight: int, credit: int, cap: int) -> bool:
+    """The one cap rule for a deposit (quote and deposit alike): balance + in-flight debits + new credit > cap."""
+    return balance + in_flight + credit > cap
+
+
+def _cap_exceeded() -> JSONResponse:
+    """422 without the balance, the cap or the credit: an unsigned caller must learn nothing beyond "over the cap"."""
+    return _error(422, "prepaid_cap_exceeded", CAP_EXCEEDED_MESSAGE)
+
+
 def _store_unavailable() -> JSONResponse:
     return _error(503, "service_unavailable", "prepaid store is temporarily unavailable")
 
 
-def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDepositReceipt:
+def _receipt(deposit: PrepaidDeposit, slug: str) -> PrepaidDepositReceipt:
     return PrepaidDepositReceipt(
         deposit_id=deposit.id,
         tx_id=deposit.tx_id,
@@ -142,12 +206,30 @@ def _receipt(deposit: PrepaidDeposit, slug: str, balance: int) -> PrepaidDeposit
         deposit_sompi=str(deposit.deposit_sompi),
         fee_sompi=str(deposit.fee_sompi),
         credit_sompi=str(deposit.credit_sompi),
-        balance_sompi=str(balance),
         created_at=deposit.created_at,
     )
 
 
-def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None) -> PrepaidBalanceRead:
+def _balance_read(
+    merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBalance | None, *, totals: bool = True
+) -> PrepaidBalanceRead:
+    """`totals=False` (the unsigned public read) returns only `spendable_sompi` and `expires_at`; everything else
+    is null. A signed read and merchant views fill every field.
+    """
+    if not totals:
+        return PrepaidBalanceRead(
+            merchant_id=None,
+            payer_address=None,
+            balance_sompi=None,
+            deposited_sompi=None,
+            debited_sompi=None,
+            updated_at=None,
+            refunded_sompi=None,
+            expired_sompi=None,
+            refund_hold_sompi=None,
+            spendable_sompi=str(spendable_sompi(balance)),
+            expires_at=None if balance is None else balance.expires_at,
+        )
     return PrepaidBalanceRead(
         merchant_id=merchant_id,
         payer_address=payer_address if balance is None else balance.payer_address,
@@ -163,6 +245,71 @@ def _balance_read(merchant_id: uuid.UUID, payer_address: str, balance: PrepaidBa
         credited_sompi=str(0 if balance is None else balance.credited_sompi),
         credit_balance_sompi=str(0 if balance is None else balance.credit_balance_sompi),
         refundable_sompi=str(refundable_sompi(balance)),
+    )
+
+
+_BALANCE_TIMESTAMP_RE: Final = re.compile(r"^[0-9]{1,12}$")
+_BALANCE_SIGNATURE_RE: Final = re.compile(r"^[0-9a-f]{128}$")
+
+
+def buyer_read_signed(
+    request: Request,
+    *,
+    address: str,
+    slug: str,
+    public_key: str,
+    build_message: Callable[..., str],
+    required: bool = False,
+    kind: str = "balance",
+) -> bool | JSONResponse:
+    """False when the request carries no signature (and `required` is False), True when it verifies, else a 401.
+
+    The buyer signs `build_message` (balance-read or refunds-status-read) with the key behind `payer_address`; the
+    timestamp must be within PREPAID_BALANCE_READ_TOLERANCE_SECONDS of now. A read only, so a replay inside the
+    window reveals nothing the signer did not already choose to read. Used by GET /balance (optional) and
+    GET /refunds/status (required). Same headers and 401 `invalid_balance_signature` shape for both.
+    """
+    stamp = request.headers.get(HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(HEADER_BALANCE_SIGNATURE)
+    if stamp is None and signature is None:
+        if required:
+            return _error(
+                401,
+                "invalid_balance_signature",
+                f"send both {HEADER_BALANCE_TIMESTAMP} and {HEADER_BALANCE_SIGNATURE}",
+            )
+        return False
+    if stamp is None or signature is None:
+        return _error(
+            401,
+            "invalid_balance_signature",
+            f"send both {HEADER_BALANCE_TIMESTAMP} and {HEADER_BALANCE_SIGNATURE}, or neither",
+        )
+    if not _BALANCE_TIMESTAMP_RE.fullmatch(stamp) or not _BALANCE_SIGNATURE_RE.fullmatch(signature.lower()):
+        return _error(
+            401,
+            "invalid_balance_signature",
+            f"{HEADER_BALANCE_TIMESTAMP} must be unix seconds and {HEADER_BALANCE_SIGNATURE} 128 hex characters",
+        )
+    timestamp = int(stamp)
+    if abs(int(time.time()) - timestamp) > PREPAID_BALANCE_READ_TOLERANCE_SECONDS:
+        return _error(401, "invalid_balance_signature", f"{kind} signature timestamp is outside the allowed window")
+    message = build_message(domain=auth_domain(), address=address, slug=slug, timestamp=timestamp)
+    if not verify_prepaid_signature(message, signature.lower(), public_key):
+        return _error(401, "invalid_balance_signature", f"{kind} signature does not verify for payer_address")
+    return True
+
+
+def _balance_read_signed(request: Request, *, address: str, slug: str, public_key: str) -> bool | JSONResponse:
+    """False when the request carries no balance signature (public read), True when it verifies, otherwise a 401."""
+    return buyer_read_signed(
+        request,
+        address=address,
+        slug=slug,
+        public_key=public_key,
+        build_message=build_prepaid_balance_read_message,
+        required=False,
+        kind="balance",
     )
 
 
@@ -195,14 +342,16 @@ async def quote_deposit(
         return _store_unavailable()
     current = 0 if balance is None else balance.balance_sompi
     split = compute_fee_split(payload.amount_sompi)
-    if current + split.merchant_sompi > settings.prepaid_max_balance_sompi:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"this deposit would take the prepaid balance above the {settings.prepaid_max_balance_sompi} sompi "
-                f"cap (current balance {current} sompi)"
-            ),
-        )
+    try:
+        # Same rule as deposit(): debits whose upstream call is still in flight count against the cap.
+        in_flight = 0 if balance is None else await in_flight_debit_sompi(session, balance.id)
+    except SQLAlchemyError:
+        logger.exception("prepaid in-flight lookup failed")
+        return _store_unavailable()
+    if would_exceed_cap(
+        balance=current, in_flight=in_flight, credit=split.merchant_sompi, cap=settings.prepaid_max_balance_sompi
+    ):
+        return _cap_exceeded()
     expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=settings.payment_max_age_seconds)
     required = PaymentRequired.for_endpoint(payload.amount_sompi, merchant_address, new_payment_nonce(), expires_at)
     record = json.dumps(
@@ -225,7 +374,6 @@ async def quote_deposit(
         deposit_sompi=str(split.total_sompi),
         fee_sompi=str(split.fee_sompi),
         credit_sompi=str(split.merchant_sompi),
-        balance_sompi=str(current),
         required=required,
         deposit_url=f"{settings.public_base_url}{DEPOSIT_PATH}",
     )
@@ -272,14 +420,11 @@ async def _existing_deposit_response(
         or deposit.payer_address != signature.payerAddress
     ):
         return _error(409, "payment_replayed", "this transaction or payment nonce was already used")
-    balance = (
-        await session.execute(select(PrepaidBalance.balance_sompi).where(PrepaidBalance.id == deposit.balance_id))
-    ).scalar_one()
     slug = (await session.execute(select(Endpoint.slug).where(Endpoint.id == existing.endpoint_id))).scalar_one()
     usd = existing.usd_value_at_settlement
     return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content=_receipt(deposit, slug, int(balance)).model_dump(mode="json"),
+        content=_receipt(deposit, slug).model_dump(mode="json"),
         headers={
             HEADER_PAYMENT_RESPONSE: _payment_response_header(existing.tx_id, usd if usd is not None else Decimal(0))
         },
@@ -372,13 +517,47 @@ async def deposit(
     if not tx_locked:
         return _error(409, "payment_replayed", "this transaction or payment nonce is already being processed")
 
+    # Cap re-check under a row lock on the (merchant, key) balance, BEFORE anything reaches the node: quotes only
+    # checked the balance of their own moment, so N quotes taken together would otherwise all be credited. The cap
+    # is read *after* the lock so a mid-queue drop is a 422, not a settled-then-DLQ 503. In-flight debits (already
+    # subtracted from the balance, still refundable if the upstream fails) are reserved so a later 5xx refund cannot
+    # land the balance past the cap.
+    try:
+        balance_id, current = await _lock_balance_row(session, endpoint.merchant_id, signature.payerAddress, public_key)
+        # Paid refunds and expiry lower balance_sompi (a refund hold stays in the balance until payout). Expire
+        # overdue credit under this same row lock so the cap sees the post-expiry balance.
+        await expire_balance_for(session, endpoint.merchant_id, public_key)
+        current = int(
+            (
+                await session.execute(
+                    select(PrepaidBalance.balance_sompi).where(
+                        PrepaidBalance.merchant_id == endpoint.merchant_id,
+                        PrepaidBalance.payer_public_key == public_key,
+                    )
+                )
+            ).scalar_one()
+        )
+        in_flight = await in_flight_debit_sompi(session, balance_id)
+        cap = get_settings().prepaid_max_balance_sompi
+    except SQLAlchemyError:
+        await session.rollback()
+        await _release_payment_locks(redis, tx_id, nonce)
+        logger.exception("prepaid balance lock failed")
+        return _store_unavailable()
+    if would_exceed_cap(balance=current, in_flight=in_flight, credit=required.merchant_amount_sompi, cap=cap):
+        await session.rollback()
+        await _release_payment_locks(redis, tx_id, nonce)
+        return _cap_exceeded()
+
     try:
         await engine.resolve_inputs(signature, tx)
         verified = await engine.settle(tx, pre_verified, required)
     except PaymentVerificationError as exc:
+        await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         return _verification_failure(exc, required)
     except Exception:
+        await session.rollback()
         await _release_payment_locks(redis, tx_id, nonce)
         logger.exception("unexpected failure while settling deposit tx %s", tx_id)
         return _error(503, "service_unavailable", "payment verification is temporarily unavailable")
@@ -391,34 +570,33 @@ async def deposit(
     try:
         session.add(settlement)
         await session.flush()
-        # CONTRACT v2.13: overdue credit expires before new credit lands, and the new credit gets the policy expiry.
+        # CONTRACT v2.13: overdue credit expires before new credit lands (idempotent if already expired under the
+        # cap lock; also catches an expiry that matured during settle), and the new credit gets the policy expiry.
         await expire_balance_for(session, endpoint.merchant_id, public_key)
-        new_expiry, next_expiry = await credit_expiry(session, endpoint)
-        balance_id, balance = (
+        _new_expiry, next_expiry = await credit_expiry(session, endpoint)
+        # Backstop: the credit only applies while it keeps the balance (plus in-flight debits) within the cap. The
+        # row is locked above, so a miss means the cap moved under a settled deposit: it is dead-lettered below,
+        # never silently credited.
+        credited = (
             await session.execute(
-                pg_insert(PrepaidBalance)
-                .values(
-                    id=uuid.uuid4(),
-                    merchant_id=endpoint.merchant_id,
-                    payer_address=signature.payerAddress,
-                    payer_public_key=public_key,
-                    balance_sompi=credit,
-                    deposited_sompi=credit,
-                    debited_sompi=0,
-                    expires_at=new_expiry,
+                update(PrepaidBalance)
+                .where(
+                    PrepaidBalance.merchant_id == endpoint.merchant_id,
+                    PrepaidBalance.payer_public_key == public_key,
+                    PrepaidBalance.balance_sompi + credit + in_flight <= get_settings().prepaid_max_balance_sompi,
                 )
-                .on_conflict_do_update(
-                    index_elements=[PrepaidBalance.merchant_id, PrepaidBalance.payer_public_key],
-                    set_={
-                        "balance_sompi": PrepaidBalance.balance_sompi + credit,
-                        "deposited_sompi": PrepaidBalance.deposited_sompi + credit,
-                        "expires_at": next_expiry,
-                        "updated_at": func.now(),
-                    },
+                .values(
+                    balance_sompi=PrepaidBalance.balance_sompi + credit,
+                    deposited_sompi=PrepaidBalance.deposited_sompi + credit,
+                    expires_at=next_expiry,
+                    updated_at=func.now(),
                 )
                 .returning(PrepaidBalance.id, PrepaidBalance.balance_sompi)
             )
-        ).one()
+        ).one_or_none()
+        if credited is None:
+            raise _CapBackstopError
+        balance_id, balance = credited
         record = PrepaidDeposit(
             id=uuid.uuid4(),
             balance_id=balance_id,
@@ -451,6 +629,17 @@ async def deposit(
             source_id=str(record.id),
         )
         await session.commit()
+    except _CapBackstopError:
+        await session.rollback()
+        logger.error("deposit tx %s settled but would exceed the prepaid cap; dead-lettered, not credited", tx_id)
+        await _dead_letter_settlement(
+            redis,
+            json.dumps(
+                {"prepaidDeposit": json.loads(unrecorded), "reason": "prepaid_cap_exceeded", "creditSompi": credit},
+                sort_keys=True,
+            ),
+        )
+        return _error(503, "service_unavailable", "payment was accepted but could not be credited; contact support")
     except IntegrityError:
         await session.rollback()
         logger.error("deposit tx %s (nonce %s) conflicts with an existing settlement", tx_id, nonce, exc_info=True)
@@ -468,7 +657,7 @@ async def deposit(
     usd = settlement.usd_value_at_settlement
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
-        content=_receipt(record, endpoint.slug, int(balance)).model_dump(mode="json"),
+        content=_receipt(record, endpoint.slug).model_dump(mode="json"),
         headers={
             HEADER_PAYMENT_RESPONSE: _payment_response_header(verified.tx_id, usd if usd is not None else Decimal(0))
         },
@@ -577,6 +766,7 @@ async def debit_challenge(
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
 async def read_balance(
+    request: Request,
     session: DbSession,
     slug: Annotated[str, Query(min_length=3, max_length=64, pattern=r"^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$")],
     payer_address: Annotated[str, Query(min_length=10, max_length=100)],
@@ -588,6 +778,9 @@ async def read_balance(
     public_key = payer_public_key(address)
     if public_key is None:
         return _not_p2pk()
+    signed = _balance_read_signed(request, address=address, slug=slug, public_key=public_key)
+    if isinstance(signed, JSONResponse):
+        return signed
     try:
         found = await _active_endpoint(session, slug)
         if found is None:
@@ -598,8 +791,8 @@ async def read_balance(
         logger.exception("prepaid balance lookup failed")
         return _store_unavailable()
     return JSONResponse(
-        content=_balance_read(endpoint.merchant_id, address, balance).model_dump(mode="json"),
-        headers={"Cache-Control": "no-store"},
+        content=_balance_read(endpoint.merchant_id, address, balance, totals=signed).model_dump(mode="json"),
+        headers={"Cache-Control": "no-store", "Vary": f"{HEADER_BALANCE_TIMESTAMP}, {HEADER_BALANCE_SIGNATURE}"},
     )
 
 

@@ -635,18 +635,13 @@ def build_server(
             "deposit_kas": sompi_to_kas(int(receipt.deposit_sompi)),
             "platform_fee_kas": sompi_to_kas(int(receipt.fee_sompi)),
             "credit_kas": sompi_to_kas(int(receipt.credit_sompi)),
-            "balance_kas": sompi_to_kas(int(receipt.balance_sompi)),
-            "balance_sompi": int(receipt.balance_sompi),
             "budget": budget.snapshot(),
         }
 
     @server.tool()
     async def prepaid_balance(slug: str) -> dict[str, Any]:
-        """Show this buyer key's prepaid balance at the merchant behind `slug`.
-
-        A buyer-signed read (it signs a timestamped balance-read text that authorises no payment, debit or refund),
-        so the gateway includes the balance and ledger totals. `spendable_sompi` is what calls can pay now; a total
-        the gateway does not return is null (never guessed from another field)."""
+        """Show this buyer key's prepaid balance at the merchant behind `slug`, including ledger totals
+        (a read only: it signs a balance-read message that authorises no payment)."""
         slug = validate_slug(slug)
         try:
             balance = await paying_client().prepaid_balance(cfg.gateway_url, slug)
@@ -811,10 +806,8 @@ def build_server(
     ) -> dict[str, Any]:
         """This buyer key's refund requests at the merchant behind `slug`, newest first.
 
-        By default a buyer-signed read (the same timestamp and signature headers as prepaid_balance, Purpose
-        `kasgate:v1:refunds-status-read`; the gateway refuses unsigned, invalid or cross-purpose reads with 401
-        `invalid_balance_signature`), with the merchant's reject reasons withheld. With include_reasons it signs one
-        single-use `status` challenge instead (moves no coins) and returns the reasons too."""
+        The default list is buyer-signed (same scheme as prepaid_balance; reasons stay withheld). With
+        include_reasons it signs one `status` challenge (moves no coins) and returns the reasons too."""
         slug = validate_slug(slug)
         try:
             refunds = await paying_client().prepaid_refunds(

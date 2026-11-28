@@ -58,6 +58,21 @@ def signed_read_ok(request: httpx.Request, purpose: str) -> bool:
     )
 
 
+def challenge_read_is_signed(request: httpx.Request, body: dict[str, Any]) -> bool:
+    """What the gateway checks on POST /refunds/challenge when no amount is sent: a balance-read signature."""
+    stamp = request.headers.get(gw.HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(gw.HEADER_BALANCE_SIGNATURE)
+    if stamp is None or signature is None:
+        return False
+    message = gw.build_prepaid_balance_read_message(
+        domain=request.url.netloc.decode("ascii").lower(),
+        address=body["payer_address"],
+        slug=body["slug"],
+        timestamp=int(stamp),
+    )
+    return bool(kaspa.verify_message(message, signature, kaspa.PrivateKey(PAYER_KEY).to_public_key()))
+
+
 class RefundGateway:
     """Fake /v1/prepaid/refunds*: validates the SDK's bodies with the gateway's strict models and builds the
     challenge text with the gateway's builder, so a drifting SDK fails here."""
@@ -76,7 +91,7 @@ class RefundGateway:
         self.requests.append(request)
         path = request.url.path
         if path == "/v1/prepaid/refunds/challenge":
-            return self.challenge(json.loads(request.content))
+            return self.challenge(json.loads(request.content), request)
         if path == "/v1/prepaid/refunds/status" and request.method == "POST":
             body = gw.PrepaidRefundSigned.model_validate(json.loads(request.content))
             assert self.last is not None and self.last["action"] == "status"
@@ -102,8 +117,10 @@ class RefundGateway:
             return self.signed(request)
         return httpx.Response(404, json={"detail": "not found"})
 
-    def challenge(self, body: dict[str, Any]) -> httpx.Response:
+    def challenge(self, body: dict[str, Any], request: httpx.Request) -> httpx.Response:
         parsed = gw.PrepaidRefundChallengeRequest.model_validate(body)
+        if parsed.action == "request" and parsed.amount_sompi is None and not challenge_read_is_signed(request, body):
+            return httpx.Response(422, json={"error": "refund_amount_required", "message": "sign or send an amount"})
         if self.challenge_error is not None:
             status, code = self.challenge_error
             return httpx.Response(status, json={"error": code, "message": "no"})
@@ -191,6 +208,25 @@ async def test_request_all_spendable_credit(rgw, make_client) -> None:
     assert paths(rgw) == ["/v1/prepaid/refunds/challenge", "/v1/prepaid/refunds"]
     body = json.loads(rgw.requests[0].content)
     assert body == {"slug": "weather", "payer_address": PAYER, "action": "request"}
+    # no amount: the challenge request carries a balance-read signature (the gateway derives the default only then)
+    assert gw.HEADER_BALANCE_SIGNATURE in rgw.requests[0].headers
+    assert challenge_read_is_signed(rgw.requests[0], body)
+
+
+async def test_an_explicit_amount_sends_no_balance_signature(rgw, make_client) -> None:
+    client: KasGateClient = make_client(rgw)
+    await client.prepaid_refund_request("http://gateway.test", "weather", 25_000_000)
+    assert gw.HEADER_BALANCE_SIGNATURE not in rgw.requests[0].headers
+
+
+async def test_refunds_reads_never_reuse_a_timestamp(rgw, make_client) -> None:
+    """The gateway accepts each refunds-status signature once, so two reads in the same second differ."""
+    client: KasGateClient = make_client(rgw)
+    await client.prepaid_refunds("http://gateway.test", "weather")
+    await client.prepaid_refunds("http://gateway.test", "weather")
+    stamps = [r.headers[gw.HEADER_BALANCE_TIMESTAMP] for r in rgw.requests]
+    sigs = [r.headers[gw.HEADER_BALANCE_SIGNATURE] for r in rgw.requests]
+    assert len(set(stamps)) == 2 and len(set(sigs)) == 2
 
 
 async def test_request_a_partial_amount_and_list_and_cancel(rgw, make_client) -> None:

@@ -119,7 +119,9 @@ async def register(client: httpx.AsyncClient, index: int) -> int:
 # ---------------------------------------------------------------- limits come from settings
 
 
-async def test_v1_429_keeps_the_detail_body(client: httpx.AsyncClient, override_settings: SettingsOverride) -> None:
+async def test_v1_429_uses_the_rate_limited_error_body(
+    client: httpx.AsyncClient, override_settings: SettingsOverride
+) -> None:
     override_settings(rl_merchant_create_per_hour=1)
     assert await register(client, 1) == 201
     key = PrivateKey(f"{2:02x}" * 32)
@@ -127,7 +129,28 @@ async def test_v1_429_keeps_the_detail_body(client: httpx.AsyncClient, override_
     body = {"kaspa_address": new_address(2), "display_name": "x", **proof_fields(challenge.challenge, key)}
     blocked = await client.post("/v1/merchants", json=body)
     assert blocked.status_code == 429
-    assert blocked.json() == {"detail": "rate limit exceeded; retry later"}
+    assert blocked.json() == {
+        "error": "rate_limited",
+        "message": "rate limit exceeded; retry later",
+        "k402": None,
+        "accepts": None,
+    }
+    assert "detail" not in blocked.json()
+    assert int(blocked.headers["retry-after"]) > 0
+    assert X402ErrorBody.model_validate(blocked.json()).error == "rate_limited"
+
+
+async def test_auth_challenge_429_uses_the_same_rate_limited_body(
+    client: httpx.AsyncClient, override_settings: SettingsOverride
+) -> None:
+    override_settings(rl_auth_challenge_per_minute=1)
+    assert (await client.post("/v1/auth/challenge", json={"kaspa_address": new_address(1)})).status_code == 200
+    blocked = await client.post("/v1/auth/challenge", json={"kaspa_address": new_address(2)})
+    assert blocked.status_code == 429
+    assert blocked.json()["error"] == "rate_limited"
+    assert blocked.json()["message"] == "rate limit exceeded; retry later"
+    assert "detail" not in blocked.json()
+    assert X402ErrorBody.model_validate(blocked.json()).error == "rate_limited"
     assert int(blocked.headers["retry-after"]) > 0
 
 

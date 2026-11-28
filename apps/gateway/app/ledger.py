@@ -38,6 +38,7 @@ from app.models import (
     PAYOUT_ATTEMPT_DUPLICATE,
     PAYOUT_ATTEMPT_INVALID,
     PAYOUT_ATTEMPT_PENDING,
+    PREPAID_DEBIT_DEBITED,
     PREPAID_REFUND_CANCELLED,
     PREPAID_REFUND_OPEN_STATUSES,
     PREPAID_REFUND_PAID,
@@ -48,6 +49,7 @@ from app.models import (
     Endpoint,
     Merchant,
     PrepaidBalance,
+    PrepaidDebit,
     PrepaidLedgerEntry,
     PrepaidRefund,
     PrepaidRefundPayout,
@@ -141,6 +143,23 @@ def refund_event_data(refund: PrepaidRefund, balance_sompi: int | None = None) -
     if balance_sompi is not None:
         data["balance_sompi"] = str(balance_sompi)
     return data
+
+
+async def in_flight_debit_sompi(session: AsyncSession, balance_id: uuid.UUID) -> int:
+    """Sompi already taken for a debit whose upstream has not been recorded yet (status still debited, no
+    upstream_status_code). Successful completed debits stay `debited` but have a status code; refunded rows do not
+    count. Must be read under the balance row's FOR UPDATE lock, which also serialises refunds of those debits.
+    """
+    total = (
+        await session.execute(
+            select(func.coalesce(func.sum(PrepaidDebit.amount_sompi), 0)).where(
+                PrepaidDebit.balance_id == balance_id,
+                PrepaidDebit.status == PREPAID_DEBIT_DEBITED,
+                PrepaidDebit.upstream_status_code.is_(None),
+            )
+        )
+    ).scalar_one()
+    return int(total)
 
 
 async def expiry_policy_days(session: AsyncSession, endpoint: Endpoint) -> int | None:

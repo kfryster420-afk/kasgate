@@ -5,7 +5,7 @@ import { GITHUB_REPO_URL, NETWORK_LABEL } from "@/lib/config";
 const NAV = [
   { href: "/beta", label: "Beta" },
   { href: "/directory", label: "Directory" },
-  { href: "/onboarding", label: "Onboarding" },
+  { href: "/onboarding", label: "Onboarding", hideOnMobile: true },
   { href: "/dashboard", label: "Dashboard" },
 ] as const;
 
@@ -18,11 +18,15 @@ export function SiteHeader() {
           <span>
             Kas<span className="text-kas-400">Gate</span>
           </span>
-          <span className="badge ml-1 border-zinc-700 bg-zinc-900 font-mono text-zinc-400">{NETWORK_LABEL}</span>
+          <span className="badge ml-1 border-zinc-700 max-sm:hidden bg-zinc-900 font-mono text-zinc-400">{NETWORK_LABEL}</span>
         </Link>
         <nav className="flex items-center gap-1 text-sm">
           {NAV.map((item) => (
-            <Link key={item.href} href={item.href} className="rounded-md px-3 py-1.5 text-zinc-400 transition hover:bg-zinc-800/70 hover:text-zinc-100">
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`rounded-md px-3 py-1.5 text-zinc-400 transition hover:bg-zinc-800/70 hover:text-zinc-100${"hideOnMobile" in item ? " max-sm:hidden" : ""}`}
+            >
               {item.label}
             </Link>
           ))}
@@ -46,6 +50,9 @@ export function SiteFooter() {
           </Link>
           <Link href="/directory" className="hover:text-zinc-300">
             /directory
+          </Link>
+          <Link href="/prepaid/refunds" className="hover:text-zinc-300">
+            /prepaid/refunds
           </Link>
           <a href="/directory/manifest.json" className="hover:text-zinc-300">
             /directory/manifest.json

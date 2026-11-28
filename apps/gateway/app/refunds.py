@@ -19,8 +19,10 @@ returned is never taxed). The gateway only keeps the record:
 3. Merchant may ``reject`` a ``requested``/``paying`` refund with a reason; the buyer may ``cancel`` a ``requested``
    one (or a ``paying`` one whose claim is older than ``prepaid_refund_claim_ttl_seconds``) with a signed challenge,
    never while an attempted payout is pending. Both release the hold. A payout that lands anyway is still recorded.
-4. ``GET /v1/prepaid/refunds/status`` is public without reasons or payout errors; ``POST /v1/prepaid/refunds/status``
-   with a signed ``status`` challenge returns the full rows (a JSON array, unchanged). Failed-delivery credit is
+4. ``GET /v1/prepaid/refunds/status`` is buyer-signed (same headers as the balance read, Purpose
+   ``kasgate:v1:refunds-status-read``) and still withholds reasons and payout errors; unsigned or invalid -> 401
+   ``invalid_balance_signature``. ``POST /v1/prepaid/refunds/status`` with a signed ``status`` challenge returns the
+   full rows (a JSON array, unchanged). Failed-delivery credit is
    read with ``POST /v1/prepaid/credits/challenge`` then a signed ``POST /v1/prepaid/credits/status`` (action
    ``credits``; optional ``before`` / ``limit``, a fresh challenge per page); a refunds ``status`` challenge cannot
    be used there, and the reverse is also refused.
@@ -29,9 +31,11 @@ Every step queues a webhook event (``prepaid.refund.requested|paid|rejected|canc
 """
 
 import binascii
+import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Awaitable, Callable
@@ -61,6 +65,7 @@ from app.ledger import (
     refund_event_data,
     refundable_covers,
     refundable_sompi,
+    spendable_sompi,
 )
 from app.models import (
     CREDIT_REASON_ATTEMPTS_EXHAUSTED,
@@ -87,10 +92,14 @@ from app.models import (
     Settlement,
 )
 from app.payments import PaymentVerificationError, PayoutSighting, RpcUnavailableError
+from app.prepaid import buyer_read_signed
 from app.proxy import REPLAY_LOCK_TTL_SECONDS, _error, payer_public_key, verify_prepaid_signature
 from app.schemas import (
     CREDIT_STATUS_ACTION,
     DEFAULT_CREDIT_STATUS_LIMIT,
+    HEADER_BALANCE_SIGNATURE,
+    HEADER_BALANCE_TIMESTAMP,
+    PREPAID_BALANCE_READ_TOLERANCE_SECONDS,
     SLUG_RE,
     BuyerCreditStatus,
     BuyerCreditStatusItem,
@@ -104,7 +113,9 @@ from app.schemas import (
     PrepaidRefundRead,
     PrepaidRefundReject,
     PrepaidRefundSigned,
+    build_prepaid_balance_read_message,
     build_prepaid_refund_message,
+    build_prepaid_refunds_read_message,
     new_payment_nonce,
     refund_payout_payload,
 )
@@ -418,7 +429,9 @@ async def _consume_challenge(redis: Redis, nonce: str) -> None:
     response_model=PrepaidRefundChallenge,
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
-async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSession, redis: RedisDep) -> Response:
+async def refund_challenge(
+    request: Request, payload: PrepaidRefundChallengeRequest, session: DbSession, redis: RedisDep
+) -> Response:
     """The text to sign to open or cancel a refund of this key's unused credit at the merchant behind `slug`."""
     settings = get_settings()
     public_key = payer_public_key(payload.payer_address)
@@ -438,8 +451,9 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
         logger.exception("refund challenge lookup failed")
         return _store_unavailable()
     # CONTRACT v2.14: failed-delivery credit is call-only, so a refund may take only deposited, unspent credit.
-    # spendable/refundable totals stay off this unsigned response so credit cannot be derived from it.
-    refundable = refundable_sompi(balance)
+    # This response is unsigned: it never names the balance, the credit or the refundable total. A default amount
+    # (all refundable credit) is only derived for a request that carries a buyer-signed balance read; the refundable
+    # cap itself is enforced when the signed request is submitted (POST /refunds).
     if payload.action == "status":
         if balance is None:
             return _error(404, "refund_not_found", "this key has no prepaid balance at this merchant")
@@ -447,20 +461,39 @@ async def refund_challenge(payload: PrepaidRefundChallengeRequest, session: DbSe
     elif payload.action == "request":
         if open_refund is not None:
             return _error(409, "refund_already_open", f"refund {open_refund.id} is still open for this balance")
-        amount = payload.amount_sompi if payload.amount_sompi is not None else refundable
+        if payload.amount_sompi is not None:
+            amount = payload.amount_sompi
+        else:
+            read_signed = buyer_read_signed(
+                request,
+                address=payload.payer_address,
+                slug=payload.slug,
+                public_key=public_key,
+                build_message=build_prepaid_balance_read_message,
+                required=False,
+                kind="balance",
+            )
+            if isinstance(read_signed, JSONResponse):
+                return read_signed
+            if not read_signed:
+                return _error(
+                    422,
+                    "refund_amount_required",
+                    "send amount_sompi, or sign the request with the balance-read headers "
+                    f"({HEADER_BALANCE_TIMESTAMP}, {HEADER_BALANCE_SIGNATURE}) to refund all refundable credit",
+                )
+            amount = refundable_sompi(balance)
         if amount < settings.min_output_sompi:
             return _error(
                 422,
                 "refund_too_small",
-                f"a refund must be at least {settings.min_output_sompi} sompi (the smallest standard Kaspa output); "
-                f"refundable credit is {refundable} sompi (failed-delivery credit is spendable on calls only)",
+                f"a refund must be at least {settings.min_output_sompi} sompi (the smallest standard Kaspa output)",
             )
-        if amount > refundable:
+        if amount > spendable_sompi(balance):
             return _error(
                 409,
                 "insufficient_balance",
-                f"the refundable prepaid credit ({refundable} sompi) does not cover a {amount} sompi refund "
-                "(failed-delivery credit is spendable on calls only)",
+                "the prepaid balance does not cover this refund; use a signed balance read for details",
             )
         refund_id = None
     else:
@@ -538,7 +571,10 @@ async def create_refund(signed: PrepaidRefundSigned, session: DbSession, redis: 
             await session.rollback()
             await _consume_challenge(redis, signed.nonce)
             return _error(
-                409, "insufficient_balance", "the refundable prepaid credit no longer covers this refund; ask again"
+                409,
+                "insufficient_balance",
+                "the refundable prepaid credit does not cover this refund (failed-delivery credit is for calls only); "
+                "use a signed balance read for details",
             )
         balance_id, balance = held
         refund = PrepaidRefund(
@@ -746,18 +782,49 @@ async def _release_hold(session: AsyncSession, refund: PrepaidRefund) -> int:
     )
 
 
+SIGNATURE_REPLAY_PREFIX: Final = "kasgate:sigreplay:refunds-status:"
+
+
+async def _claim_read_signature(redis: Redis, request: Request) -> JSONResponse | None:
+    """Single use for a verified GET /refunds/status signature: SETNX a key made from the signature's SHA-256.
+
+    The key lives exactly as long as the signature could still verify (its timestamp + the +-300 s window, so at
+    most 601 s: a future-dated signature stays covered), so a replay inside the window is refused with the same 401
+    as a bad signature. Redis down -> 503 (fail closed, like the limiter): an unrecorded signature is never accepted.
+    """
+    signature = request.headers[HEADER_BALANCE_SIGNATURE].lower()
+    timestamp = int(request.headers[HEADER_BALANCE_TIMESTAMP])
+    ttl = max(1, timestamp + PREPAID_BALANCE_READ_TOLERANCE_SECONDS - int(time.time()) + 1)
+    key = f"{SIGNATURE_REPLAY_PREFIX}{hashlib.sha256(signature.encode('ascii')).hexdigest()}"
+    try:
+        fresh = await redis.set(key, "1", nx=True, ex=ttl)
+    except RedisError:
+        logger.exception("signature replay store unavailable")
+        return _error(503, "service_unavailable", "prepaid refund status is temporarily unavailable")
+    if not fresh:
+        return _error(
+            401,
+            "invalid_balance_signature",
+            "this refunds-status signature was already used; sign every request with a fresh timestamp",
+        )
+    return None
+
+
 @router.get(
     "/refunds/status",
     response_model=list[PrepaidRefundRead],
     dependencies=[Depends(limit_by_ip(RATE_LIMIT_UNPAID_PROXY))],
 )
 async def refund_status(
+    request: Request,
     session: DbSession,
+    redis: RedisDep,
     slug: Annotated[str, Query(min_length=3, max_length=64, pattern=SLUG_RE)],
     payer_address: Annotated[str, Query(min_length=10, max_length=100)],
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> Response:
-    """Public: this key's refunds at the merchant behind `slug`, newest first (like GET /balance, no signature).
+    """This key's refunds at the merchant behind `slug`, newest first. Buyer-signed (same headers as the
+    balance read, Purpose `kasgate:v1:refunds-status-read`); unsigned or invalid is 401.
 
     The merchant's `reason` and the payout `last_error` are withheld (null) here; POST /refunds/status with a
     signed `status` challenge returns them to the buyer.
@@ -769,6 +836,20 @@ async def refund_status(
     public_key = payer_public_key(address)
     if public_key is None:
         return _error(400, "invalid_payer", "payer_address must be a P2PK Schnorr address (kaspa:q...)")
+    signed = buyer_read_signed(
+        request,
+        address=address,
+        slug=slug,
+        public_key=public_key,
+        build_message=build_prepaid_refunds_read_message,
+        required=True,
+        kind="refunds",
+    )
+    if isinstance(signed, JSONResponse):
+        return signed
+    replayed = await _claim_read_signature(redis, request)
+    if replayed is not None:
+        return replayed
     try:
         endpoint = await _endpoint_merchant(session, slug)
         if endpoint is None:
@@ -791,7 +872,7 @@ async def refund_status(
         return _store_unavailable()
     return JSONResponse(
         content=[PrepaidRefundRead.model_validate(row).public().model_dump(mode="json") for row in rows],
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store", "Vary": f"{HEADER_BALANCE_TIMESTAMP}, {HEADER_BALANCE_SIGNATURE}"},
     )
 
 

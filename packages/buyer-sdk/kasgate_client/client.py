@@ -275,6 +275,7 @@ class KasGateClient:
             utxo_provider = self._rpc_provider
         self._utxo_provider: UtxoProvider = utxo_provider
         self._ledger = UtxoLedger(utxo_quarantine_seconds)
+        self._last_refunds_read_timestamp = 0
         self._pay_lock = asyncio.Lock()
         self._owns_http = http_client is None
         self._http = (
@@ -632,15 +633,17 @@ class KasGateClient:
         return receipt
 
     def _signed_read_headers(
-        self, url: httpx.URL, slug: str, *, purpose: str
+        self, url: httpx.URL, slug: str, *, purpose: str, timestamp: int | None = None
     ) -> dict[str, str]:
         """Headers for a buyer-signed read (X-KasGate-Balance-Timestamp + X-KasGate-Balance-Signature).
 
         Signs `build_prepaid_signed_read_message` for this gateway's domain, this address, `slug`, the time and
         `purpose`: a read only, it authorises no payment, debit or refund. `purpose` is
         `PREPAID_BALANCE_READ_PURPOSE` for GET /balance and `PREPAID_REFUNDS_READ_PURPOSE` for GET /refunds/status;
-        a signature for one cannot be reused on the other."""
-        timestamp = int(time.time())
+        a signature for one cannot be reused on the other. `timestamp` defaults to now (callers that must never
+        repeat one, like the single-use refunds-status read, pass their own)."""
+        if timestamp is None:
+            timestamp = int(time.time())
         message = build_prepaid_signed_read_message(
             domain=url.netloc.decode("ascii").lower(),
             address=self.address,
@@ -1132,11 +1135,14 @@ class KasGateClient:
         else:
             url = self._absolute(gateway_url)
             origin = self._origin(url)
+            # The gateway accepts each refunds-status signature once: never reuse a timestamp within this client.
+            timestamp = max(int(time.time()), self._last_refunds_read_timestamp + 1)
+            self._last_refunds_read_timestamp = timestamp
             response = await self._http.get(
                 origin + REFUND_STATUS_PATH,
                 params={"slug": slug, "payer_address": self.address},
                 headers=self._signed_read_headers(
-                    url, slug, purpose=PREPAID_REFUNDS_READ_PURPOSE
+                    url, slug, purpose=PREPAID_REFUNDS_READ_PURPOSE, timestamp=timestamp
                 ),
             )
         if response.status_code != 200:
@@ -1203,7 +1209,12 @@ class KasGateClient:
             body["amount_sompi"] = amount_sompi
         if refund_id is not None:
             body["refund_id"] = str(refund_id)
-        challenged = await self._http.post(origin + REFUND_CHALLENGE_PATH, json=body)
+        headers: dict[str, str] = {}
+        if action == "request" and amount_sompi is None:
+            # "Refund everything refundable": the gateway derives that amount only for a buyer-signed balance read,
+            # because the unsigned challenge never reveals (or acts on) the balance.
+            headers = self._signed_read_headers(url, slug, purpose=PREPAID_BALANCE_READ_PURPOSE)
+        challenged = await self._http.post(origin + REFUND_CHALLENGE_PATH, json=body, headers=headers)
         if challenged.status_code != 201:
             code, message = error_details(challenged)
             if code == "insufficient_balance":

@@ -23,20 +23,22 @@ import logging
 import secrets
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
 import httpx
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import and_, func, or_, select, update
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from redis.asyncio import Redis
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
-from app.deps import get_db_session, get_sessionmaker
+from app.deps import get_db_session, get_redis, get_sessionmaker
 from app.models import (
     WEBHOOK_DELIVERY_DEAD,
     WEBHOOK_DELIVERY_DELIVERING,
@@ -67,7 +69,7 @@ from app.schemas import (
     WebhookRead,
     WebhookUpdate,
 )
-from app.security import get_current_merchant, get_fernet
+from app.security import RATE_LIMIT_WEBHOOK_TEST, enforce_rate_limit, get_current_merchant, get_fernet
 
 logger = logging.getLogger("kasgate.webhooks")
 
@@ -87,15 +89,62 @@ def generate_webhook_secret() -> str:
     return f"{SECRET_PREFIX}{secrets.token_urlsafe(32)}"
 
 
+class _SecretEnvelope(BaseModel):
+    """What `webhooks.secret_encrypted` decrypts to after a rotation: the new secret plus the replaced one and the
+    unix second its overlap ends. A webhook never rotated stores the bare secret string (no schema change)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    v: Literal[1]
+    current: str = Field(min_length=1)
+    previous: str = Field(min_length=1)
+    previous_until: int = Field(ge=0)
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookSecrets:
+    current: str
+    previous: str | None = None
+    previous_until: int | None = None  # unix seconds
+
+    def signing_secrets(self, now: int) -> list[str]:
+        """The secrets a delivery made at `now` is signed with: the current one first, then the previous one while
+        its overlap lasts."""
+        if self.previous is not None and self.previous_until is not None and now < self.previous_until:
+            return [self.current, self.previous]
+        return [self.current]
+
+
 def encrypt_secret(secret: str) -> bytes:
     return get_fernet().encrypt(secret.encode("utf-8"))
 
 
-def decrypt_secret(token: bytes) -> str:
+def encrypt_secrets(secrets_: WebhookSecrets) -> bytes:
+    if secrets_.previous is None or secrets_.previous_until is None:
+        return encrypt_secret(secrets_.current)
+    envelope = _SecretEnvelope(
+        v=1, current=secrets_.current, previous=secrets_.previous, previous_until=secrets_.previous_until
+    )
+    return get_fernet().encrypt(envelope.model_dump_json().encode("utf-8"))
+
+
+def decrypt_secrets(token: bytes) -> WebhookSecrets:
     try:
-        return get_fernet().decrypt(bytes(token)).decode("utf-8")
+        plain = get_fernet().decrypt(bytes(token)).decode("utf-8")
     except InvalidToken as exc:
         raise ValueError("webhook secret cannot be decrypted with the configured ENCRYPTION_KEY") from exc
+    if not plain.startswith("{"):  # a bare whsec_ secret (never rotated, or rotated with no overlap)
+        return WebhookSecrets(current=plain)
+    try:
+        envelope = _SecretEnvelope.model_validate_json(plain)
+    except ValidationError as exc:
+        raise ValueError("stored webhook secret envelope is malformed") from exc
+    return WebhookSecrets(current=envelope.current, previous=envelope.previous, previous_until=envelope.previous_until)
+
+
+def decrypt_secret(token: bytes) -> str:
+    """The current signing secret."""
+    return decrypt_secrets(token).current
 
 
 def compute_signature(secret: str, timestamp: int, body: bytes) -> str:
@@ -104,8 +153,12 @@ def compute_signature(secret: str, timestamp: int, body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
 
 
-def signature_header(secret: str, timestamp: int, body: bytes) -> str:
-    return f"t={timestamp},v1={compute_signature(secret, timestamp, body)}"
+def signature_header(secret: str, timestamp: int, body: bytes, *, also: Sequence[str] = ()) -> str:
+    """`t=<unix>,v1=<hex>`; with `also` (the previous secret during a rotation overlap) one more `v1=` per extra
+    secret, current first, Stripe-style. Receivers accept the delivery when any `v1=` verifies."""
+    parts = [f"t={timestamp}"]
+    parts.extend(f"v1={compute_signature(key, timestamp, body)}" for key in (secret, *also))
+    return ",".join(parts)
 
 
 def verify_signature(
@@ -122,9 +175,10 @@ def verify_signature(
     candidates: list[str] = []
     for part in header.split(","):
         key, _, value = part.strip().partition("=")
-        if key == "t" and value.isdigit():
+        # ASCII only: str.isdigit() accepts "²" (int() then raises) and compare_digest raises on non-ASCII str.
+        if key == "t" and value.isascii() and value.isdigit() and len(value) <= 12:
             timestamp = int(value)
-        elif key == "v1" and value:
+        elif key == "v1" and value and value.isascii():
             candidates.append(value)
     if timestamp is None or not candidates:
         return False
@@ -326,6 +380,7 @@ async def send_webhook(
     *,
     url: str,
     secret: str,
+    previous_secrets: Sequence[str] = (),
     delivery_id: uuid.UUID,
     event_id: str,
     event_type: str,
@@ -342,7 +397,7 @@ async def send_webhook(
         WEBHOOK_EVENT_TYPE_HEADER: event_type,
         WEBHOOK_DELIVERY_ID_HEADER: str(delivery_id),
         WEBHOOK_TIMESTAMP_HEADER: str(stamp),
-        WEBHOOK_SIGNATURE_HEADER: signature_header(secret, stamp, body),
+        WEBHOOK_SIGNATURE_HEADER: signature_header(secret, stamp, body, also=previous_secrets),
     }
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -477,13 +532,17 @@ async def attempt(client: httpx.AsyncClient, claimed: ClaimedDelivery, settings:
     if not claimed.webhook_active:
         return AttemptResult(ok=False, status_code=None, error="webhook is disabled", retry=False)
     try:
-        secret = decrypt_secret(claimed.secret_encrypted)
+        stored = decrypt_secrets(claimed.secret_encrypted)
     except ValueError as exc:
         return AttemptResult(ok=False, status_code=None, error=str(exc), retry=False)
+    stamp = int(time.time())
+    current, *previous = stored.signing_secrets(stamp)
     return await send_webhook(
         client,
         url=claimed.url,
-        secret=secret,
+        secret=current,
+        previous_secrets=previous,
+        timestamp=stamp,
         delivery_id=claimed.id,
         event_id=claimed.event_id,
         event_type=claimed.event_type,
@@ -708,13 +767,28 @@ async def delete_webhook(webhook_id: uuid.UUID, merchant: CurrentMerchant, sessi
 
 @router.post("/{webhook_id}/rotate-secret", response_model=WebhookCreated)
 async def rotate_secret(webhook_id: uuid.UUID, merchant: CurrentMerchant, session: DbSession) -> WebhookCreated:
+    """New secret, shown once. The replaced secret keeps signing too (a second `v1=`) for
+    `webhook_secret_overlap_seconds` (default 24 h) so receivers can switch over without dropping deliveries.
+    Rotating again inside the window replaces the previous secret with the one being rotated out now."""
     hook = await _owned_webhook(session, merchant, webhook_id)
+    try:
+        replaced = decrypt_secret(bytes(hook.secret_encrypted))
+    except ValueError:
+        replaced = None  # undecryptable (ENCRYPTION_KEY changed): nothing usable to keep, rotate without overlap
     secret = generate_webhook_secret()
-    hook.secret_encrypted = encrypt_secret(secret)
+    overlap = get_settings().webhook_secret_overlap_seconds
+    expires_at: datetime | None = None
+    stored = WebhookSecrets(current=secret)
+    if replaced is not None and overlap > 0:
+        expires_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=overlap)
+        stored = WebhookSecrets(current=secret, previous=replaced, previous_until=int(expires_at.timestamp()))
+    hook.secret_encrypted = encrypt_secrets(stored)
     hook.secret_prefix = _secret_prefix(secret)
     await session.commit()
     await session.refresh(hook)
-    return WebhookCreated(webhook=WebhookRead.model_validate(hook), secret=secret)
+    return WebhookCreated(
+        webhook=WebhookRead.model_validate(hook), secret=secret, previous_secret_expires_at=expires_at
+    )
 
 
 @router.post("/{webhook_id}/test", response_model=WebhookDeliveryRead)
@@ -724,8 +798,14 @@ async def test_webhook(
     session: DbSession,
     maker: Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)],
     client: Annotated[httpx.AsyncClient, Depends(get_webhook_client)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> WebhookDeliveryRead:
-    """Queue a `webhook.test` event for this webhook only and attempt it once right away."""
+    """Queue a `webhook.test` event for this webhook only and attempt it once right away.
+
+    Rate-limited per merchant (`rl_webhook_test_per_minute`); only the newest `webhook_test_events_kept` finished
+    test events per webhook are kept, older ones (and their deliveries) are deleted.
+    """
+    await enforce_rate_limit(redis, RATE_LIMIT_WEBHOOK_TEST, f"merchant:{merchant.id}")
     hook = await _owned_webhook(session, merchant, webhook_id)
     event_id = await enqueue_event(
         session,
@@ -747,7 +827,27 @@ async def test_webhook(
     ).scalar_one()
     await session.commit()
     await deliver_one_now(maker, client, delivery_id)
+    await _prune_test_events(session, merchant.id, hook.id, get_settings().webhook_test_events_kept)
     return await _read_delivery(session, delivery_id)
+
+
+async def _prune_test_events(session: AsyncSession, merchant_id: uuid.UUID, webhook_id: uuid.UUID, keep: int) -> None:
+    """Delete this webhook's test events beyond the newest `keep` (deliveries cascade). Events whose delivery is
+    still pending or in flight are never touched, so a retrying test delivery keeps its rows."""
+    stale = (
+        select(WebhookEvent.id)
+        .join(WebhookDelivery, WebhookDelivery.event_pk == WebhookEvent.id)
+        .where(
+            WebhookEvent.merchant_id == merchant_id,
+            WebhookEvent.event_type == WEBHOOK_TEST_EVENT,
+            WebhookDelivery.webhook_id == webhook_id,
+            WebhookDelivery.status.not_in((WEBHOOK_DELIVERY_PENDING, WEBHOOK_DELIVERY_DELIVERING)),
+        )
+        .order_by(WebhookEvent.created_at.desc(), WebhookEvent.id.desc())
+        .offset(keep)
+    )
+    await session.execute(delete(WebhookEvent).where(WebhookEvent.id.in_(stale.scalar_subquery())))
+    await session.commit()
 
 
 @router.get("/{webhook_id}/deliveries", response_model=list[WebhookDeliveryRead])

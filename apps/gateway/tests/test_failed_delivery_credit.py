@@ -55,6 +55,7 @@ from tests.conftest import (
     seed_endpoint,
 )
 from tests.test_prepaid import CREDIT_SOMPI, DEPOSIT_SOMPI, SECOND_MERCHANT_ADDRESS, add_endpoint, fund, prepaid_call
+from tests.test_prepaid_balance_privacy import signed_headers
 
 TX = "cd" * 32
 TX2 = "ce" * 32
@@ -215,8 +216,13 @@ async def test_last_failed_delivery_credits_the_merchant_share(
     )
     assert balance.payer_address == PAYER_ADDRESS
 
-    # the buyer's public balance shows the credit, and it is spendable through prepaid debits
-    read = await client.get("/v1/prepaid/balance", params={"slug": "weather", "payer_address": PAYER_ADDRESS})
+    # the buyer's signed balance read shows the credit; the unsigned one only shows what is spendable
+    params = {"slug": "weather", "payer_address": PAYER_ADDRESS}
+    unsigned = await client.get("/v1/prepaid/balance", params=params)
+    assert unsigned.status_code == 200
+    assert unsigned.json()["credited_sompi"] is None and unsigned.json()["credit_balance_sompi"] is None
+    assert unsigned.json()["spendable_sompi"] == str(SPLIT.merchant_sompi)
+    read = await client.get("/v1/prepaid/balance", params=params, headers=signed_headers(slug="weather"))
     assert read.status_code == 200
     assert read.json()["credited_sompi"] == str(SPLIT.merchant_sompi)
     assert read.json()["spendable_sompi"] == str(SPLIT.merchant_sompi)
@@ -872,6 +878,32 @@ async def test_credit_is_clamped_to_prepaid_max_balance_and_the_shortfall_is_rec
     )
     assert envelope["data"]["merchant_share_sompi"] == str(SPLIT.merchant_sompi)
     assert envelope["data"]["max_balance_sompi"] == str(cap)
+
+
+async def test_in_flight_debits_count_against_the_cap_for_a_failed_delivery_credit(
+    client: httpx.AsyncClient,
+    seeded: Seed,
+    upstream: Upstream,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    override_settings: SettingsOverride,
+) -> None:
+    """Same rule as deposit() and quote: balance + in-flight debits + credit <= cap. A debit whose upstream call is
+    still in flight may be refunded later, so its amount is reserved and the credit is clamped (shortfall recorded)."""
+    from tests.test_privacy_residuals_and_sweeper import add_debit
+
+    await add_endpoint(sessionmaker, seeded.merchant_id, "cheap")
+    await fund(client)  # balance CREDIT_SOMPI
+    in_flight = 10_000_000
+    await add_debit(sessionmaker, amount=in_flight)  # balance CREDIT_SOMPI - 10M, 10M in flight
+    cap = DEPOSIT_SOMPI
+    override_settings(prepaid_max_balance_sompi=cap)
+    _fail_upstream(upstream)
+    receipt = _receipt((await _exhaust(client))[-1])
+    room = cap - CREDIT_SOMPI  # the balance row alone would leave room + in_flight
+    assert (int(receipt.creditSompi), receipt.shortfallSompi) == (room, str(SPLIT.merchant_sompi - room))
+    row = await _balance(sessionmaker, seeded.merchant_id)
+    assert row is not None
+    assert row.balance_sompi + in_flight == cap  # a later refund of the in-flight debit lands exactly on the cap
 
 
 async def test_a_full_balance_gets_a_zero_credit_row_and_only_the_shortfall_event(

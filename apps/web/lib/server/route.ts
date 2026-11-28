@@ -22,6 +22,11 @@ export function fromGatewayFailure(result: Extract<GatewayResult<unknown>, { ok:
     return jsonError(KASPA_UNAVAILABLE_MESSAGE, 503, "rpc_unavailable");
   }
   const status = result.status >= 500 && result.status !== 502 ? 502 : result.status;
+  if (result.retryAfter !== undefined) {
+    const body: ApiErrorBody = { error: result.message, retry_after: result.retryAfter };
+    if (result.code) body.code = result.code;
+    return NextResponse.json(body, { status, headers: { ...NO_STORE, "Retry-After": String(result.retryAfter) } });
+  }
   return jsonError(result.message, status, result.code);
 }
 
