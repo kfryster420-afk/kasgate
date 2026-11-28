@@ -15,10 +15,10 @@ from pydantic import (
     EmailStr,
     Field,
     HttpUrl,
+    SerializerFunctionWrapHandler,
     ValidationError,
     computed_field,
     field_validator,
-    SerializerFunctionWrapHandler,
     model_serializer,
     model_validator,
 )
