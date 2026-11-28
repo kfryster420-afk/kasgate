@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.deps import get_db_session
 from app.kaspa_types import payer_public_key, validate_kaspa_address
-from app.ledger import credit_expiry, expire_balance_for
+from app.ledger import credit_expiry, expire_balance_for, in_flight_debit_sompi
 from app.models import (
     CREDIT_POLICY_ERRORS,
     CREDIT_POLICY_ERRORS_AND_TIMEOUTS,
@@ -257,8 +257,11 @@ async def credit_failed_delivery(
             .with_for_update()
         )
     ).one()
-    # CONTRACT v2.14: credits respect the prepaid balance cap; what does not fit is recorded as the shortfall.
-    credit = max(0, min(share, settings.prepaid_max_balance_sompi - int(current)))
+    # CONTRACT v2.14: credits respect the prepaid balance cap; what does not fit is recorded as the shortfall. Same
+    # rule as a deposit (v2.12.1): debits whose upstream call is still in flight count, because a 5xx refund would
+    # put them back above the cap. Read under the balance row lock taken just above.
+    in_flight = await in_flight_debit_sompi(session, balance_id)
+    credit = max(0, min(share, settings.prepaid_max_balance_sompi - int(current) - in_flight))
     shortfall = share - credit
     balance = int(current)
     if credit > 0:

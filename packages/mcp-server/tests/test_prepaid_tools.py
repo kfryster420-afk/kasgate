@@ -23,6 +23,21 @@ MERCHANT_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
 DEBIT_NONCE = "abcdef0123456789" * 2
 
 
+
+def balance_read_is_signed(request: httpx.Request) -> bool:
+    """What the gateway checks on GET /v1/prepaid/balance before it shows the deposited/debited totals."""
+    stamp = request.headers.get(gw.HEADER_BALANCE_TIMESTAMP)
+    signature = request.headers.get(gw.HEADER_BALANCE_SIGNATURE)
+    if stamp is None or signature is None:
+        return False
+    message = gw.build_prepaid_balance_read_message(
+        domain=request.url.netloc.decode("ascii").lower(),
+        address=request.url.params["payer_address"],
+        slug=request.url.params["slug"],
+        timestamp=int(stamp),
+    )
+    return bool(kaspa.verify_message(message, signature, kaspa.PrivateKey(PAYER_KEY).to_public_key()))
+
 class Gateway:
     def __init__(self) -> None:
         self.balance = 0
@@ -51,10 +66,7 @@ class Gateway:
                     "deposit_sompi": str(body.amount_sompi),
                     "fee_sompi": str(fee),
                     "credit_sompi": str(merchant),
-                    "balance_sompi": str(self.balance),
-                    "required": json.loads(
-                        challenge(body.amount_sompi).model_dump_json()
-                    ),
+                    "required": json.loads(challenge(body.amount_sompi).model_dump_json()),
                     "deposit_url": "http://gateway.test/v1/prepaid/deposits",
                 },
             )
@@ -83,7 +95,6 @@ class Gateway:
                     "deposit_sompi": str(credit + fee),
                     "fee_sompi": str(fee),
                     "credit_sompi": str(credit),
-                    "balance_sompi": str(self.balance),
                     "created_at": datetime.now(UTC).isoformat(),
                 },
             )
@@ -107,6 +118,10 @@ class Gateway:
                     "balance_sompi": str(self.balance),
                     "deposited_sompi": str(self.balance),
                     "debited_sompi": "0",
+                    "refunded_sompi": "0",
+                    "expired_sompi": "0",
+                    "refund_hold_sompi": "0",
+                    "spendable_sompi": str(self.balance),
                     "updated_at": None,
                 },
             )
@@ -235,6 +250,7 @@ async def test_deposit_then_prepaid_calls_and_balance() -> None:
             balance["balance_sompi"] == merchant - 1000
             and balance["payer_address"] == PAYER
         )
+        assert balance["deposited_sompi"] == merchant - 1000 and balance["debited_sompi"] == 0  # signed read
         budget = structured(await client.call_tool("get_budget", {}))
     assert (
         budget["spent_sompi"] == KAS

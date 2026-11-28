@@ -336,5 +336,13 @@ def test_verify_webhook_signature_matches_the_gateway_signer() -> None:
     assert not sdk.verify_webhook_signature("whsec_other", header, body, now=now)
     assert not sdk.verify_webhook_signature(secret, header, body, now=now + 301)
     assert not sdk.verify_webhook_signature(secret, "t=1,v1=", body, now=now)
+    for bad_timestamp in ("\u00b2", "\u0661", "9" * 5000):  # non-ASCII digits / absurd length: False, no crash
+        assert not sdk.verify_webhook_signature(secret, f"t={bad_timestamp},v1={'0' * 64}", body, now=now)
+    assert not sdk.verify_webhook_signature(secret, f"t={now},v1=\u00e9", body, now=now)
+    # rotation overlap: the gateway sends one v1= per signing secret; either secret verifies on the SDK side
+    rotated = gw_webhooks.signature_header("whsec_new", now, body, also=[secret])
+    assert sdk.verify_webhook_signature("whsec_new", rotated, body, now=now)
+    assert sdk.verify_webhook_signature(secret, rotated, body, now=now)
+    assert not sdk.verify_webhook_signature("whsec_other", rotated, body, now=now)
     assert sdk.WEBHOOK_SIGNATURE_HEADER == gw.WEBHOOK_SIGNATURE_HEADER
     assert sdk.WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS == gw.WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS
