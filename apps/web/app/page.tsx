@@ -1,6 +1,7 @@
 import { ArrowRight, Bot, ExternalLink, FileSpreadsheet, Gauge, Hexagon, Lock, Wallet, Zap } from "lucide-react";
 import Link from "next/link";
 import { CodeBlock } from "@/components/code-block";
+import { FaucetBox } from "@/components/faucet-box";
 import { TryItNow } from "@/components/try-it-now";
 import { ADDRESS_PREFIX, DEMO_ENDPOINT_SLUG, GATEWAY_PUBLIC_URL, IS_TESTNET, KASPA_NETWORK, KASWARE_URL, NETWORK_LABEL, TESTNET_FAUCET_URL } from "@/lib/config";
 import { getMinOutputSompi } from "@/lib/server/gateway";
@@ -124,9 +125,9 @@ function Metric({ value, label }: { value: string; label: string }) {
 }
 
 const PAY_STEPS = [
-  { title: "Install KasWare", body: "The browser wallet that signs Kaspa payments.", href: KASWARE_URL, link: "kasware.xyz" },
-  { title: `Switch to ${NETWORK_LABEL}`, body: "Open KasWare, choose the network menu and pick Testnet 10.", href: null, link: null },
-  { title: "Get test KAS from the faucet", body: "Paste your kaspatest: address; test coins are free and worth nothing.", href: TESTNET_FAUCET_URL, link: "faucet-tn10.kaspanet.io" },
+  { title: "Install KasWare", body: "The browser wallet that signs Kaspa payments.", href: KASWARE_URL, link: "kasware.xyz", note: null },
+  { title: `Switch to ${NETWORK_LABEL}`, body: "Open KasWare, choose the network menu and pick Testnet 10.", href: null, link: null, note: null },
+  { title: "Get test KAS from the faucet", body: "Paste your kaspatest: address; test coins are free and worth nothing.", href: TESTNET_FAUCET_URL, link: "faucet-tn10.kaspanet.io", note: "Faucet empty? Ask for free test KAS in the Kaspa Discord #testnet, or reply to our X post and we'll send you some." },
 ] as const;
 
 function PayForReal() {
@@ -151,10 +152,12 @@ function PayForReal() {
                   <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
                 </a>
               )}
+              {step.note && <p className="mt-1 text-xs text-zinc-500">{step.note}</p>}
             </div>
           </li>
         ))}
       </ol>
+      {IS_TESTNET && <FaucetBox />}
       <p className="mt-4 text-sm text-zinc-400">Then connect KasWare and pay: the beta guide walks through it, and the directory lists endpoints to call.</p>
       <div className="mt-4 flex flex-wrap gap-3">
         <Link href="/beta" className="btn-primary px-5 py-2.5">
