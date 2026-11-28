@@ -3,7 +3,7 @@
 # (gateway + web on loopback, published through a Cloudflare Tunnel).
 #
 #   sudo ./bootstrap.sh --repo-dir /opt/kasgate \
-#     [--repo-url https://github.com/kfryster420-afk/kasgate.git] \
+#     [--repo-url https://github.com/kasgate/kasgate.git] \
 #     [--user kasgate] [--ssh-port 22] [--domain kasgate.io]
 #
 # What it does (safe to re-run):
@@ -35,7 +35,7 @@ else
 fi
 
 REPO_DIR=""
-REPO_URL="https://github.com/kfryster420-afk/kasgate.git"
+REPO_URL="https://github.com/kasgate/kasgate.git"
 APP_USER="kasgate"
 SSH_PORT="22"
 DOMAIN=""

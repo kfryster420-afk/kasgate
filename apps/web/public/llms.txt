@@ -129,4 +129,4 @@ paying (use_free_trials=True), plus trial_request and trial_status; MCP call_fre
 the paying tools try a trial first. Webhook receivers can verify signatures with
 kasgate_client.verify_webhook_signature.
 
-Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kfryster420-afk/kasgate).
+Protocol details: docs/CONTRACTS.md in the KasGate repository (https://github.com/kasgate/kasgate).

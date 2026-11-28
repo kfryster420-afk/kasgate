@@ -33,7 +33,7 @@ From this repository, as root on the VPS:
 # After the repo is on the host, or copy bootstrap.sh first and let it clone:
 sudo ./infra/deploy/bootstrap.sh \
   --repo-dir /opt/kasgate \
-  --repo-url https://github.com/kfryster420-afk/kasgate.git \
+  --repo-url https://github.com/kasgate/kasgate.git \
   --user kasgate \
   --domain kasgate.io
 ```

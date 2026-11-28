@@ -17,7 +17,7 @@ If you are a merchant tester, also register with KasWare, create at least one pa
 
 ## What to record for every scenario
 
-Write these down as you go. If something fails, file a [bug report](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml) with the same fields. Report security problems only through [private vulnerability reporting](https://github.com/kfryster420-afk/kasgate/security/advisories/new), not a public issue (see [SECURITY.md](https://github.com/kfryster420-afk/kasgate/blob/main/SECURITY.md)).
+Write these down as you go. If something fails, file a [bug report](https://github.com/kasgate/kasgate/issues/new?template=bug_report.yml) with the same fields. Report security problems only through [private vulnerability reporting](https://github.com/kasgate/kasgate/security/advisories/new), not a public issue (see [SECURITY.md](https://github.com/kasgate/kasgate/blob/main/SECURITY.md)).
 
 - Scenario name and whether it passed or failed
 - Role (buyer or merchant) and network (`kaspa:testnet-10`)
@@ -151,6 +151,6 @@ Merchant: edit an endpoint and set **Free trial calls per buyer** to 2 (leave th
 
 ## When you are done
 
-File one bug report per distinct failure, using the [bug report form](https://github.com/kfryster420-afk/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.
+File one bug report per distinct failure, using the [bug report form](https://github.com/kasgate/kasgate/issues/new?template=bug_report.yml). If every scenario passed, you can open a single issue summarising the run (which scenarios, network, one example `txId`, browser and KasWare versions) or send that summary to whoever invited you to the beta.
 
-Product ideas go in a [feature request](https://github.com/kfryster420-afk/kasgate/issues/new?template=feature_request.yml). Overall impressions, confusing steps, and suggestions can go in a [beta feedback](https://github.com/kfryster420-afk/kasgate/issues/new?template=beta_feedback.yml) report. Payment-verification bypasses, replay holes, key leaks, and similar issues go only to private vulnerability reporting.
+Product ideas go in a [feature request](https://github.com/kasgate/kasgate/issues/new?template=feature_request.yml). Overall impressions, confusing steps, and suggestions can go in a [beta feedback](https://github.com/kasgate/kasgate/issues/new?template=beta_feedback.yml) report. Payment-verification bypasses, replay holes, key leaks, and similar issues go only to private vulnerability reporting.

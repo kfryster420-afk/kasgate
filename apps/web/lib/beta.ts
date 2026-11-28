@@ -12,7 +12,7 @@ export const BETA_LINKS = {
   kaswareDocs: "https://docs.kasware.xyz/wallet",
   tn10Faucet: "https://faucet-tn10.kaspanet.io/",
   kaspaWikiTestnets: "https://wiki.kaspa.org/en/testnets",
-  buyerSdk: "https://github.com/kfryster420-afk/kasgate/tree/main/packages/buyer-sdk",
-  runbook: "https://github.com/kfryster420-afk/kasgate/blob/main/docs/RUNBOOK.md",
-  newIssue: "https://github.com/kfryster420-afk/kasgate/issues/new/choose",
+  buyerSdk: "https://github.com/kasgate/kasgate/tree/main/packages/buyer-sdk",
+  runbook: "https://github.com/kasgate/kasgate/blob/main/docs/RUNBOOK.md",
+  newIssue: "https://github.com/kasgate/kasgate/issues/new/choose",
 } as const;

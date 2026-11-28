@@ -83,7 +83,7 @@ export default async function BetaPage() {
 
         <Step n={6} title="Report bugs">
           <p>
-            Open an issue at <Ext href={BETA_LINKS.newIssue}>github.com/kfryster420-afk/kasgate/issues</Ext>. Include the page or endpoint slug, what you expected, what
+            Open an issue at <Ext href={BETA_LINKS.newIssue}>github.com/kasgate/kasgate/issues</Ext>. Include the page or endpoint slug, what you expected, what
             happened, and the transaction ID if a payment was involved. Never paste private keys, seed phrases or API keys into an issue.
           </p>
         </Step>
