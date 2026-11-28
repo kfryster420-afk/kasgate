@@ -60,7 +60,7 @@ async def test_public_read_shows_only_spendable_and_expiry(
     assert body.deposited_sompi is None and body.debited_sompi is None
     assert body.refunded_sompi is None and body.expired_sompi is None and body.refund_hold_sompi is None
     assert HEADER_BALANCE_SIGNATURE in response.headers["Vary"]
-    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Cache-Control"] == "no-store, private"
 
 
 async def test_buyer_signed_read_shows_the_totals(

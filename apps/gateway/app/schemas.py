@@ -18,6 +18,8 @@ from pydantic import (
     ValidationError,
     computed_field,
     field_validator,
+    SerializerFunctionWrapHandler,
+    model_serializer,
     model_validator,
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
@@ -923,6 +925,14 @@ class X402ErrorBody(StrictModel):
     accepts: list[PaymentOffer] | None = None
     trial: "TrialOffer | None" = None
     """Present on a 402 from an endpoint with free trial calls; mirrors X-KasGate-Trial-Offer."""
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_trial(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """``trial`` is additive: leave it out of every error body that carries no offer (keeps the v2.x bodies)."""
+        data: dict[str, Any] = handler(self)
+        if data.get("trial") is None:
+            data.pop("trial", None)
+        return data
 
 
 # ---------------------------------------------------------------- merchants
