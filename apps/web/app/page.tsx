@@ -44,6 +44,9 @@ export default async function LandingPage() {
             Try it now, no wallet
             <ArrowRight className="h-4 w-4" aria-hidden />
           </a>
+          <Link href="/quickstart" className="btn-secondary px-6 py-3 text-base">
+            Quickstart
+          </Link>
           <Link href="/onboarding" className="btn-secondary px-6 py-3 text-base">
             Monetize an API
           </Link>
