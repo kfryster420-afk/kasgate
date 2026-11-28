@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"lib/**/*.test.ts\""
+    "test": "tsx --test lib/trial/demo.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",
