@@ -10,18 +10,32 @@ const TX_ID_RE = /^[0-9a-f]{64}$/;
 type FaucetState =
   | { kind: "idle" }
   | { kind: "sending" }
-  | { kind: "sent"; txId: string }
+  | { kind: "sent"; txId: string; amount: string | null }
   | { kind: "error"; message: string };
 
-function detailOf(payload: unknown): string | null {
-  if (payload && typeof payload === "object" && "detail" in payload) {
-    const detail = (payload as { detail: unknown }).detail;
-    if (typeof detail === "string" && detail.trim()) return detail.trim().slice(0, 300);
+function messageOf(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  for (const key of ["message", "detail"] as const) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim().slice(0, 300);
   }
   return null;
 }
 
-/** Testnet-10 only: asks the KasGate faucet (POST /v1/faucet/claim {address} -> {tx_id}) to send free test KAS. */
+function waitText(response: Response): string {
+  const seconds = Number(response.headers.get("Retry-After"));
+  if (!Number.isFinite(seconds) || seconds <= 0) return "about 24 hours";
+  if (seconds < 120) return `${Math.ceil(seconds)} seconds`;
+  if (seconds < 7200) return `${Math.ceil(seconds / 60)} minutes`;
+  return `${Math.ceil(seconds / 3600)} hours`;
+}
+
+function formatTestKas(sompi: number): string {
+  return `${(sompi / 100_000_000).toLocaleString("en-US", { maximumFractionDigits: 8 })} test KAS`;
+}
+
+/** Testnet-10 only: KasGate faucet, POST /v1/faucet/claim {address} -> {tx_id, amount_sompi, address} (broadcast, not yet confirmed). */
 export function FaucetBox() {
   const [address, setAddress] = useState("");
   const [state, setState] = useState<FaucetState>({ kind: "idle" });
@@ -53,21 +67,31 @@ export function FaucetBox() {
       payload = null;
     }
     if (response.ok) {
-      const txId = payload && typeof payload === "object" && "tx_id" in payload ? (payload as { tx_id: unknown }).tx_id : null;
+      const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+      const txId = record["tx_id"];
+      const amount = record["amount_sompi"];
       if (typeof txId === "string" && TX_ID_RE.test(txId)) {
-        setState({ kind: "sent", txId });
+        setState({ kind: "sent", txId, amount: Number.isSafeInteger(amount) && (amount as number) > 0 ? formatTestKas(amount as number) : null });
       } else {
         setState({ kind: "error", message: "The faucet answered without a transaction id. Check your wallet before trying again." });
       }
       return;
     }
-    const detail = detailOf(payload);
+    const message = messageOf(payload);
     if (response.status === 429) {
-      setState({ kind: "error", message: detail ?? "You have already claimed recently. Try again later." });
-    } else if (response.status === 400) {
-      setState({ kind: "error", message: detail ?? "That address was not accepted." });
+      setState({ kind: "error", message: `This address or network already claimed in the last 24 hours. Try again in ${waitText(response)}.` });
+    } else if (response.status === 422 || response.status === 400) {
+      setState({ kind: "error", message: "That address was not accepted. Use a testnet-10 address that starts with kaspatest:" });
+    } else if (response.status === 503) {
+      const exhausted = message !== null && message.includes("faucet_exhausted");
+      setState({
+        kind: "error",
+        message: exhausted
+          ? "Today's faucet budget is used up. It resets at 00:00 UTC; the Discord and X options above still work."
+          : "The faucet could not send right now. Try again in a moment.",
+      });
     } else {
-      setState({ kind: "error", message: detail ?? `The faucet is unavailable right now (HTTP ${response.status}).` });
+      setState({ kind: "error", message: message ?? `The faucet is unavailable right now (HTTP ${response.status}).` });
     }
   }
 
@@ -95,7 +119,7 @@ export function FaucetBox() {
       <div aria-live="polite">
         {state.kind === "sent" && (
           <p className="mt-2 text-sm text-emerald-300">
-            Sent.{" "}
+            {state.amount ? `Sent ${state.amount}.` : "Sent."} It can take a minute to show in KasWare.{" "}
             <a href={`${TESTNET_EXPLORER_URL}/transactions/${state.txId}`} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 break-all font-mono text-kas-300 hover:text-kas-200">
               {state.txId.slice(0, 16)}...
               <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
