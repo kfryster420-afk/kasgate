@@ -24,6 +24,7 @@ from app.kaspa_engine import engine as kaspa_engine
 from app.ledger import LedgerWorker
 from app.oracle import KasUsdOracle
 from app.prepaid import router as prepaid_router
+from app.proxy import NoStorePaidMiddleware
 from app.proxy import router as proxy_router
 from app.refunds import router as refunds_router
 from app.schema_guard import check_database_schema
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
         ],
         max_age=600,
     )
+    app.add_middleware(NoStorePaidMiddleware)
     app.include_router(api_router)
     app.include_router(well_known_router)
     app.include_router(refunds_router)

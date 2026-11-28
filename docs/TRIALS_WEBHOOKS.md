@@ -34,7 +34,8 @@ private key ever reaches KasGate). The key, not the IP, is what the per-buyer co
 
 Flow:
 1. `/p/{slug}` without payment -> the usual 402, plus `X-KasGate-Trial-Offer: Base64(JSON{scheme:"kasgate-trial-v1",
-   freeTrialCalls, challengeUrl, statusUrl})` when the endpoint has trials.
+   freeTrialCalls, challengeUrl, statusUrl})` when the endpoint has trials. The same object is also in the 402 JSON
+   body as `trial` (omitted when the endpoint has no trial).
 2. `POST /v1/trials/challenge {slug, payer_address, method, path, body_hash}` (public, unpaid-IP rate limit) -> 201
    TrialChallenge `{nonce, message, ..., free_trial_calls, calls_used, remaining, expires_at}`; stored as
    `kasgate:trial:challenge:{nonce}` EX `payment_max_age_seconds`. No trial / used up / today's cap reached -> 402

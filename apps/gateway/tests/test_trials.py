@@ -142,12 +142,15 @@ async def test_402_advertises_the_trial_offer(client: httpx.AsyncClient, trial_s
     assert offer.freeTrialCalls == 2
     assert offer.challengeUrl == "http://gateway.test/v1/trials/challenge"
     assert offer.statusUrl == "http://gateway.test/v1/trials/status?slug=weather"
+    body_offer = TrialOffer.model_validate(response.json()["trial"])
+    assert body_offer == offer
 
 
 async def test_no_trial_offer_without_free_calls(client: httpx.AsyncClient, seeded: Seed) -> None:
     response = await client.get("/p/weather")
     assert response.status_code == 402
     assert HEADER_TRIAL_OFFER not in response.headers
+    assert "trial" not in response.json()
     challenge = await trial_challenge(client)
     assert challenge.status_code == 402
     assert challenge.json()["error"] == "trial_exhausted"

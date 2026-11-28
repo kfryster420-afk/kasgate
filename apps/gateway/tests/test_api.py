@@ -417,7 +417,8 @@ async def test_quote_returns_a_payable_nonce_bound_payment_required(
 ) -> None:
     response = await client.get("/v1/quote/weather")
     assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     required = PaymentRequired.model_validate(response.json())
     assert required.payTo == MERCHANT_ADDRESS
     assert required.amount == str(PRICE_SOMPI)

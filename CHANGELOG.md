@@ -4,6 +4,18 @@ All notable changes to KasGate. Contract versions refer to [docs/CONTRACTS.md](d
 
 ## Unreleased
 
+### Fixed: no-store on paywalled responses
+
+- Every `/p/*` response now sends `Cache-Control: no-store, private` and `Pragma: no-cache`, and strips upstream
+  `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Age`, `Surrogate-Control`, `CDN-Cache-Control` and
+  `Cloudflare-CDN-Cache-Control`. This is defence in depth so a CDN cannot cache a paid body and serve it unpaid.
+  The same no-store policy applies to `/v1/quote/*`, `GET /v1/prepaid/balance` and `/v1/prepaid/refunds/status`.
+
+### Added: trial offer on the 402 JSON body
+
+- A 402 from an endpoint with free trial calls already carried `X-KasGate-Trial-Offer`. The same object
+  (`scheme`, `freeTrialCalls`, `challengeUrl`, `statusUrl`) is now also present as the additive JSON field `trial`.
+
 ### Changed: privacy residuals, in-flight cap, orphan sweeper, single-use refunds-status signatures (PR #6)
 
 - **Unsigned deposit responses no longer carry the balance.** `PrepaidDepositQuote` and `PrepaidDepositReceipt`

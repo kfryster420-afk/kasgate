@@ -71,8 +71,8 @@ on X-KasGate-Credit. The unsigned credits and refunds challenges do not include 
 
 ## Free trial calls (kasgate-trial-v1)
 
-Some endpoints give each buyer key a few free calls. Their 402 carries X-KasGate-Trial-Offer and the catalog
-lists kasgate-trial-v1. On the gateway host:
+Some endpoints give each buyer key a few free calls. Their 402 carries X-KasGate-Trial-Offer (and the same
+object as the JSON field trial) and the catalog lists kasgate-trial-v1. On the gateway host:
 
 - POST /v1/trials/challenge {slug, payer_address, method, path, body_hash} (P2PK address). Sign the returned
   message (Purpose kasgate:v1:trial-call, no amount) with that key and send X-KasGate-Trial:
