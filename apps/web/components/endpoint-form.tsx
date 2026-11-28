@@ -6,8 +6,8 @@ import { ADDRESS_PREFIX } from "@/lib/config";
 import { microsToUsdPlain, parseUsdToMicros } from "@/lib/format";
 import { formatKas, formatSompi, meetsOutputFloor, minPriceReason, parseKasToSompi, sompiToKasPlain } from "@/lib/sompi";
 import { usePricing } from "@/lib/use-pricing";
-import { HTTP_METHODS, TRIAL_DAILY_CAP_DEFAULT, TRIAL_DAILY_CAP_MAX, TRIAL_MAX_CALLS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod, type PriceCurrency } from "@/lib/types";
-import { checkEndpointName, checkFreeTrialCalls, checkOptionalSlug, checkTrialDailyCap, checkUpstreamUrl } from "@/lib/validation";
+import { HTTP_METHODS, PREPAID_EXPIRY_DAYS_MAX, TRIAL_DAILY_CAP_DEFAULT, TRIAL_DAILY_CAP_MAX, TRIAL_MAX_CALLS, type EndpointCreate, type EndpointRead, type EndpointUpdate, type HttpMethod, type PriceCurrency } from "@/lib/types";
+import { checkEndpointName, checkFreeTrialCalls, checkOptionalSlug, checkTrialDailyCap, checkUpstreamUrl, parseExpiryDaysInput } from "@/lib/validation";
 import { FeeSplitView } from "./fee-split";
 import { CurrencyToggle, ErrorBanner, Field, Toggle } from "./ui";
 
@@ -47,6 +47,7 @@ export function EndpointForm(props: Props) {
   const [prepaidOnly, setPrepaidOnly] = useState(initial?.prepaid_only ?? false);
   const [freeTrials, setFreeTrials] = useState(String(initial?.free_trial_calls ?? 0));
   const [dailyCap, setDailyCap] = useState(String(initial?.trial_daily_cap ?? TRIAL_DAILY_CAP_DEFAULT));
+  const [expiryDays, setExpiryDays] = useState(initial?.prepaid_expiry_days == null ? "" : String(initial.prepaid_expiry_days));
   const [slug, setSlug] = useState("");
   const [headerName, setHeaderName] = useState("");
   const [headerValue, setHeaderValue] = useState("");
@@ -56,7 +57,9 @@ export function EndpointForm(props: Props) {
   const micros = useMemo(() => parseUsdToMicros(priceUsd), [priceUsd]);
 
   const errors = useMemo(() => {
-    const out: Partial<Record<"name" | "url" | "price" | "methods" | "slug" | "header" | "trials" | "cap", string>> = {};
+    const out: Partial<Record<"name" | "url" | "price" | "methods" | "slug" | "header" | "trials" | "cap" | "expiry", string>> = {};
+    const expiry = parseExpiryDaysInput(expiryDays);
+    if (!expiry.ok) out.expiry = expiry.error;
     const trials = checkFreeTrialCalls(/^\d{1,3}$/.test(freeTrials.trim()) ? Number(freeTrials.trim()) : NaN);
     if (!trials.ok) out.trials = trials.error;
     const cap = checkTrialDailyCap(/^\d{1,6}$/.test(dailyCap.trim()) ? Number(dailyCap.trim()) : NaN);
@@ -84,7 +87,7 @@ export function EndpointForm(props: Props) {
       else if (headerValue === "" || /[\r\n]/.test(headerValue)) out.header = "Enter a single-line header value";
     }
     return out;
-  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing, prepaidOnly, freeTrials, dailyCap]);
+  }, [name, upstreamUrl, currency, sompi, micros, methods, slug, headerName, headerValue, props.mode, pricing, prepaidOnly, freeTrials, dailyCap, expiryDays]);
 
   const minPriceHint = prepaidOnly
     ? currency === "USD"
@@ -110,6 +113,8 @@ export function EndpointForm(props: Props) {
     setTouched(true);
     if (hasErrors || !priceReady) return;
     const headers = headerName.trim() !== "" ? { [headerName.trim()]: headerValue } : undefined;
+    const expiry = parseExpiryDaysInput(expiryDays);
+    if (!expiry.ok) return;
     const priceFields =
       currency === "USD"
         ? { price_currency: "USD" as const, price_usd_micros: micros!.toString() }
@@ -126,6 +131,7 @@ export function EndpointForm(props: Props) {
         free_trial_calls: Number(freeTrials.trim()),
         trial_daily_cap: Number(dailyCap.trim()),
       };
+      if (expiry.value !== null) payload.prepaid_expiry_days = expiry.value;
       if (category.trim()) payload.category = category.trim();
       if (description.trim()) payload.description = description.trim();
       if (slug.trim()) payload.slug = slug.trim().toLowerCase();
@@ -140,6 +146,7 @@ export function EndpointForm(props: Props) {
         prepaid_only: prepaidOnly,
         free_trial_calls: Number(freeTrials.trim()),
         trial_daily_cap: Number(dailyCap.trim()),
+        prepaid_expiry_days: expiry.value,
         category: category.trim() === "" ? null : category.trim(),
         description: description.trim() === "" ? null : description.trim(),
       };
@@ -260,6 +267,15 @@ export function EndpointForm(props: Props) {
           <input id={`${uid}-cap`} className="input font-mono" value={dailyCap} onChange={(e) => setDailyCap(e.target.value)} inputMode="numeric" autoComplete="off" />
         </Field>
       </div>
+
+      <Field
+        label="Prepaid credit expiry (days)"
+        htmlFor={`${uid}-expiry`}
+        error={show("expiry")}
+        hint={`Blank = use your default credit expiry (set under Refund requests). Otherwise 1–${PREPAID_EXPIRY_DAYS_MAX.toLocaleString("en-US")} days after the buyer's latest deposit through this endpoint. Never retroactive.`}
+      >
+        <input id={`${uid}-expiry`} className="input font-mono sm:w-60" value={expiryDays} onChange={(e) => setExpiryDays(e.target.value)} inputMode="numeric" placeholder="merchant default" autoComplete="off" />
+      </Field>
 
       <ErrorBanner message={props.error} />
 

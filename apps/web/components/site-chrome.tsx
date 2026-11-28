@@ -51,6 +51,9 @@ export function SiteFooter() {
           <Link href="/directory" className="hover:text-zinc-300">
             /directory
           </Link>
+          <Link href="/prepaid/refunds" className="hover:text-zinc-300">
+            /prepaid/refunds
+          </Link>
           <a href="/directory/manifest.json" className="hover:text-zinc-300">
             /directory/manifest.json
           </a>

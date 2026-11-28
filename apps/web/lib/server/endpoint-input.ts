@@ -5,6 +5,7 @@ import {
   checkMethods,
   checkOptionalSlug,
   checkOptionalText,
+  checkPrepaidExpiryDays,
   checkPrepaidPriceSompi,
   checkPriceCurrency,
   checkPriceSompi,
@@ -46,6 +47,7 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
   if (typeof listed !== "boolean") errors.push("is_public_listed must be a boolean");
   const freeTrialCalls = collect(checkFreeTrialCalls(body.free_trial_calls === undefined ? 0 : body.free_trial_calls), errors);
   const trialDailyCap = body.trial_daily_cap === undefined ? undefined : collect(checkTrialDailyCap(body.trial_daily_cap), errors);
+  const expiryDays = body.prepaid_expiry_days === undefined ? undefined : collect(checkPrepaidExpiryDays(body.prepaid_expiry_days), errors);
   let priceSompi: string | undefined;
   let priceUsdMicros: string | undefined;
   if (currency === "USD") {
@@ -72,6 +74,7 @@ export async function buildCreatePayload(body: Payload): Promise<PayloadResult> 
     free_trial_calls: freeTrialCalls,
   };
   if (trialDailyCap !== undefined) payload.trial_daily_cap = trialDailyCap;
+  if (expiryDays !== undefined && expiryDays !== null) payload.prepaid_expiry_days = expiryDays;
   if (currency === "USD") payload.price_usd_micros = priceUsdMicros;
   else payload.price_sompi = priceSompi;
   if (slug) payload.slug = slug;
@@ -157,6 +160,12 @@ export async function buildUpdatePayload(body: Payload): Promise<PayloadResult> 
   if (body.trial_daily_cap !== undefined) {
     const v = collect(checkTrialDailyCap(body.trial_daily_cap), errors);
     if (v !== undefined) payload.trial_daily_cap = v;
+  }
+  if (body.prepaid_expiry_days !== undefined) {
+    // null is meaningful here: fall back to the merchant default.
+    const check = checkPrepaidExpiryDays(body.prepaid_expiry_days);
+    if (check.ok) payload.prepaid_expiry_days = check.value;
+    else errors.push(check.error);
   }
   for (const flag of ["is_active", "is_public_listed", "prepaid_only"] as const) {
     const v = body[flag];
