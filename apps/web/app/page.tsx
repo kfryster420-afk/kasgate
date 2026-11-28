@@ -124,9 +124,9 @@ function Metric({ value, label }: { value: string; label: string }) {
 }
 
 const PAY_STEPS = [
-  { title: "Install KasWare", body: "The browser wallet that signs Kaspa payments.", href: KASWARE_URL, link: "kasware.xyz" },
-  { title: `Switch to ${NETWORK_LABEL}`, body: "Open KasWare, choose the network menu and pick Testnet 10.", href: null, link: null },
-  { title: "Get test KAS from the faucet", body: "Paste your kaspatest: address; test coins are free and worth nothing.", href: TESTNET_FAUCET_URL, link: "faucet-tn10.kaspanet.io" },
+  { title: "Install KasWare", body: "The browser wallet that signs Kaspa payments.", href: KASWARE_URL, link: "kasware.xyz", note: null },
+  { title: `Switch to ${NETWORK_LABEL}`, body: "Open KasWare, choose the network menu and pick Testnet 10.", href: null, link: null, note: null },
+  { title: "Get test KAS from the faucet", body: "Paste your kaspatest: address; test coins are free and worth nothing.", href: TESTNET_FAUCET_URL, link: "faucet-tn10.kaspanet.io", note: "Faucet empty? Ask for free test KAS in the Kaspa Discord #testnet, or reply to our X post and we'll send you some." },
 ] as const;
 
 function PayForReal() {
@@ -151,6 +151,7 @@ function PayForReal() {
                   <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
                 </a>
               )}
+              {step.note && <p className="mt-1 text-xs text-zinc-500">{step.note}</p>}
             </div>
           </li>
         ))}
